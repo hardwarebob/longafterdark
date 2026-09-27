@@ -1,0 +1,4 @@
+// test_ui.exe: the manifest (Common Controls 6, per-monitor DPI v2).
+#include <winresrc.h>
+
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "test_ui.manifest"

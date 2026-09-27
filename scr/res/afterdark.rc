@@ -1,0 +1,112 @@
+// LongAfterDark.scr resources: the name Screen Saver Settings lists, the
+// settings dialog (its controls and tab order; laid out in code), the
+// per-module settings panel it hosts, icon, manifest, version.
+#pragma code_page(65001)
+#include <windows.h>
+#include <commctrl.h>
+#include "resource.h"
+#include "adw_version.h"
+
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "afterdark.manifest"
+
+// Generated at build time by gen_icon.cc (our own artwork, no After Dark bits).
+IDI_APP ICON "afterdark.ico"
+
+// String 1 is the name Windows lists in Screen Saver Settings (without it,
+// the file name would be shown).
+STRINGTABLE
+BEGIN
+  IDS_DESCRIPTION "Long After Dark"
+END
+
+// The settings dialog. Controls are listed in tab order (and a label right
+// before the control it names, for mnemonics and screen readers); their
+// places are computed at run time for the window's size and DPI
+// (config_dialog.cc, ui_model.h: layout_window), so the coordinates here are
+// placeholders. The window is resizable; its first size is chosen at run time.
+IDD_SETTINGS DIALOGEX 0, 0, 520, 340
+STYLE DS_SHELLFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CLIPCHILDREN
+EXSTYLE WS_EX_CONTROLPARENT
+CAPTION "Long After Dark"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+  // The box-cover strip: its tiles are made at run time, one per release
+  // (hidden with fewer than two). Its status line is a polite live region.
+  CONTROL         "Filter by release", IDC_COVER_STRIP, "AdwCoverStrip", WS_CHILD | WS_CLIPCHILDREN | NOT WS_VISIBLE,
+                  0, 0, 10, 10, WS_EX_CONTROLPARENT
+  PUSHBUTTON      "Sho&w all", IDC_STRIP_SHOW_ALL, 0, 0, 10, 10, NOT WS_VISIBLE
+  PUSHBUTTON      "&Get the covers", IDC_STRIP_GET_COVERS, 0, 0, 10, 10, NOT WS_VISIBLE
+  LTEXT           "", IDC_STRIP_STATUS, 0, 0, 10, 8, SS_NOPREFIX | NOT WS_VISIBLE
+  AUTORADIOBUTTON "&Single module", IDC_MODE_SINGLE, 0, 0, 60, 14, WS_GROUP | WS_TABSTOP
+  AUTORADIOBUTTON "&Random", IDC_MODE_RANDOM, 60, 0, 60, 14
+  LTEXT           "", IDC_MODULES_COUNT, 0, 0, 10, 8, SS_NOPREFIX | SS_RIGHT | WS_GROUP
+  LTEXT           "&Modules", IDC_MODULES_LABEL, 0, 0, 10, 8
+  CONTROL         "", IDC_MODULE_LIST, "SysListView32",
+                  LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOCOLUMNHEADER | WS_TABSTOP,
+                  0, 0, 10, 10
+  LTEXT           "", IDC_ROTATION_SUMMARY, 0, 0, 10, 8, SS_NOPREFIX
+  PUSHBUTTON      "Select &all", IDC_CHECK_ALL, 0, 0, 10, 10
+  PUSHBUTTON      "C&lear", IDC_CHECK_NONE, 0, 0, 10, 10
+  LTEXT           "Change module &every", IDC_DURATION_LABEL, 0, 0, 10, 8, SS_CENTERIMAGE | SS_ENDELLIPSIS
+  COMBOBOX        IDC_DURATION, 0, 0, 10, 80, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+  LTEXT           "", IDC_MODULE_BADGE, 0, 0, 10, 8, SS_OWNERDRAW
+  LTEXT           "", IDC_MODULE_TITLE, 0, 0, 10, 8, SS_OWNERDRAW
+  EDITTEXT        IDC_ABOUT, 0, 0, 10, 10, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | NOT WS_BORDER | WS_TABSTOP
+  PUSHBUTTON      "Import After Dark…", IDC_WELCOME_IMPORT, 0, 0, 10, 10, NOT WS_VISIBLE
+  LTEXT           "", IDC_CREDITS, 0, 0, 10, 8, SS_NOPREFIX
+  PUSHBUTTON      "Restore &defaults", IDC_PANEL_DEFAULTS, 0, 0, 10, 10, NOT WS_VISIBLE
+  LTEXT           "Res&olution", IDC_SCALE_LABEL, 0, 0, 10, 8
+  COMBOBOX        IDC_SCALE, 0, 0, 10, 80, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+  LTEXT           "Moni&tors", IDC_MONITORS_LABEL, 0, 0, 10, 8
+  COMBOBOX        IDC_MONITORS, 0, 0, 10, 80, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+  LTEXT           "So&und", IDC_SOUND_LABEL, 0, 0, 10, 8
+  COMBOBOX        IDC_SOUND, 0, 0, 10, 80, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+  LTEXT           "&Volume", IDC_VOLUME_LABEL, 0, 0, 10, 8
+  CONTROL         "Volume", IDC_VOLUME, "msctls_trackbar32", TBS_HORZ | TBS_NOTICKS | TBS_BOTH | WS_TABSTOP, 0, 0, 10, 10
+  LTEXT           "", IDC_VOLUME_VALUE, 0, 0, 10, 8, SS_NOPREFIX | SS_RIGHT
+  LTEXT           "Sound plays from the primary monitor’s screen saver.", IDC_SOUND_NOTE, 0, 0, 10, 8, SS_NOPREFIX | SS_ENDELLIPSIS
+  PUSHBUTTON      "&Import…", IDC_IMPORT, 0, 0, 10, 10
+  LTEXT           "", IDC_ASSETS_STATUS, 0, 0, 10, 8, SS_NOPREFIX
+  PUSHBUTTON      "&Preview", IDC_PREVIEW, 0, 0, 10, 10
+  DEFPUSHBUTTON   "OK", IDOK, 0, 0, 10, 10
+  PUSHBUTTON      "Cancel", IDCANCEL, 0, 0, 10, 10
+END
+
+// Child dialog in the details card holding the selected module's controls;
+// they are generated from its catalog entry (ui_model.h: layout_panel).
+IDD_PANEL DIALOGEX 0, 0, 196, 137
+STYLE DS_SHELLFONT | DS_CONTROL | WS_CHILD | WS_CLIPCHILDREN
+EXSTYLE WS_EX_CONTROLPARENT
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+END
+
+// The version and copyright line of every shipped program, from one place
+// (the top-level CMakeLists.txt project(VERSION) and LICENSE; adw_version.h).
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     ADW_VERSION_RC
+PRODUCTVERSION  ADW_VERSION_RC
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "FileDescription", "Long After Dark screen saver"
+      VALUE "FileVersion", ADW_VERSION_RC_STRING
+      VALUE "InternalName", "LongAfterDark"
+      VALUE "LegalCopyright", ADW_COPYRIGHT
+      VALUE "OriginalFilename", "LongAfterDark.scr"
+      VALUE "ProductName", "Long After Dark"
+      VALUE "ProductVersion", ADW_VERSION_RC_STRING
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END

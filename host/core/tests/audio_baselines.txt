@@ -1,0 +1,10 @@
+# Sound-on baselines for core.audio_assets (test_e2e.cc read_baselines): <case> <frames> <FBHASH stream
+# digest> <WAV capture digest> <MIDI log digest>, FNV-1a 64. Record anew with AD_AUDIO_BASELINE_WRITE=1 after
+# an intended change to pacing, drawing or sound.
+bungee 1800 228e4e4f9211d946 a97ca2dafaf8219a 0acb077029a4e375
+burns 1800 7cbe2511db8b71b1 8752c611678971d2 0acb077029a4e375
+fish 1800 1f7f986087e1b546 774332fec581086e abe16bebd76db3f4
+halloffa 1800 6847885b9b80f24f afbe329821676c7a e5944e714b418143
+toast3 18000 d6928ec8d91e860e 58e46986db78b7da 94006361d1a154a2
+toaster2 1800 8de47714360f99fd fc8018bfd986433e f30d9af3dce6f0ff
+toasters 1800 177b06154aef20dc 282a0f34561db4a2 530c7686653cb5f3

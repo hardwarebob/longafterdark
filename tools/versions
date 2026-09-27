@@ -1,0 +1,22 @@
+# The pinned versions of the build's dependencies, in one place:
+# tools/bootstrap.sh reads all of them, and cmake/llvm-mingw.cmake
+# reads LLVM_MINGW_VER to use exactly that toolchain. Plain NAME=value lines.
+# Bumping one is enough: bootstrap.sh fetches (and checks) the new zips and
+# rebuilds zlib and phosg when their revisions or the toolchain change.
+
+# https://github.com/mstorsjo/llvm-mingw/releases (UCRT, x86_64); the sha256
+# is the release asset's (GitHub's published digest).
+LLVM_MINGW_VER=20260922
+LLVM_MINGW_SHA256=e3ad77d117a4bea19a7a3b333341824d79a5a371004a10e25b8504e7b3047666
+
+# https://github.com/ninja-build/ninja/releases (ninja-win.zip)
+NINJA_VER=v1.13.2
+NINJA_SHA256=07fc8261b42b20e71d1720b39068c2e14ffcee6396b76fb7a795fb460b78dc65
+
+# https://github.com/madler/zlib
+ZLIB_REV=767c4c947852e143f582c85f14cf573411df1b35
+
+# https://github.com/fuzziqersoftware/phosg. Master after 782785d drops a
+# transitive <functional> include that resource_dasm's EmulatorBase.hh relies
+# on under libc++; pinned until that settles.
+PHOSG_REV=782785d14d5fe19dda3af71d21d2792e71c5df1d

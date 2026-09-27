@@ -1,0 +1,88 @@
+// SourceFs — one read-only view over every kind of source the importer
+// takes (PACKAGES.md §3): an ISO-9660/Joliet image, a FAT12/16 floppy image,
+// a flat ZIP of install files (the Internet Archive's Simpsons copies), a
+// host folder (a CD drive, a copy of a disc or floppies), or several images
+// unioned into one tree (split floppies).
+//
+// Names are what the importer installs under: 8.3 upper case as the source
+// lists them (an ISO entry's primary-volume name when its Joliet name could
+// be paired with one; a folder entry's listed name, upper-cased — never the
+// volume's generated "~1" alias). Lookups are case-insensitive and also
+// accept an entry's alternative (Joliet) name. Every failure to read is an
+// ImportError(source_invalid): a damaged or unreadable source.
+#pragma once
+
+#include <windows.h>
+
+#include <cstdint>
+#include <filesystem>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "status.h"
+
+namespace adw::import {
+
+using Sink = std::function<void(const uint8_t*, size_t)>;
+
+struct SourceNode {
+  std::string name;      // installed name (upper case); "" for a root
+  std::string alt_name;  // another name the entry answers to (a Joliet long name), "" = none
+  bool is_dir = false;
+  uint64_t size = 0;
+  std::optional<FILETIME> mtime;     // UTC; nothing when the source has none or it is unrepresentable
+  std::shared_ptr<const void> impl;  // the reader's own handle for the entry
+};
+
+class SourceFs {
+ public:
+  virtual ~SourceFs() = default;
+  virtual SourceNode root() const = 0;
+  // Children of a directory, in the source's order.
+  virtual std::vector<SourceNode> list(const SourceNode& dir) const = 0;
+  // Streams a file's bytes in order.
+  virtual void read(const SourceNode& file, const Sink& sink) const = 0;
+  // "iso9660", "iso9660+joliet", "fat12", "fat16", "zip" or "folder".
+  virtual std::string format() const = 0;
+  virtual std::string volume_id() const { return {}; }
+  // What a directory is, independent of the name it was reached by: an ISO
+  // directory's extent, a FAT subdirectory's first cluster, a folder's file
+  // id. Two directory entries with the same key are one directory listed
+  // twice, which no real disc does (a crafted image can, at every level, and
+  // would multiply the files an import plans). "" when the source cannot
+  // tell; such a directory is never counted as seen.
+  virtual std::string dir_key(const SourceNode& dir) const { (void)dir; return {}; }
+
+  // Case-insensitive lookup of a '/'- or '\'-separated path from the root.
+  std::optional<SourceNode> find(std::string_view path) const;
+  std::optional<SourceNode> child(const SourceNode& dir, std::string_view name) const;
+  // The whole file; ImportError(source_invalid) when it is larger than `max_bytes`.
+  std::vector<uint8_t> read_all(const SourceNode& file, uint64_t max_bytes = 64ull << 20) const;
+};
+
+// A DOS date/time (FAT directory entries, ZIP members: local time of the
+// machine that wrote it) as UTC, interpreted in this machine's time zone
+// with that date's daylight rules — what Windows shows for a floppy's files.
+// Nothing for a zero or unrepresentable date.
+std::optional<FILETIME> dos_filetime(uint16_t date, uint16_t time);
+
+// An image file, sniffed by content: ISO-9660 (cooked or raw sectors) first,
+// then a ZIP (a local file header at byte 0: its members are the root's
+// files; bare names only, none password-protected), then FAT12/16. Throws
+// ImportError(source_invalid) when it is none of them.
+std::unique_ptr<SourceFs> open_image(const std::filesystem::path& path);
+// A folder (or drive root). The root of a CD drive is read as the disc
+// itself (raw ISO-9660, so a Joliet disc keeps its 8.3 names), falling back
+// to the listing when the volume cannot be opened; `note`, when given, says
+// which. Throws ImportError(source_invalid) when it is not a directory.
+std::unique_ptr<SourceFs> open_folder(const std::filesystem::path& dir, std::string* note = nullptr);
+// Several sources seen as one tree: directories merge, a file present in
+// more than one must have the same size (checked when listed) and the same
+// bytes (checked when read), else the source is invalid.
+std::unique_ptr<SourceFs> union_of(std::vector<std::unique_ptr<SourceFs>> parts);
+
+}  // namespace adw::import

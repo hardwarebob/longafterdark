@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="LongAfterDark.adhostwin" version="1.0.0.0" processorArchitecture="*"/>
+  <description>Long After Dark emulator host</description>
+  <!-- Deliberately without dpiAwareness or Common Controls 6: the lanes were
+       built and verified with the process defaults (DPI unaware, the classic
+       controls), and the module dialogs set their own thread's DPI context
+       (win32/realui.cc, win16/dialogs16.cc). Whether the configure dialogs
+       should get either is the module-interaction stage's decision
+       (docs/INTERACTION.md). -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 and 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+  <!-- asInvoker: keeps Windows' installer-detection heuristics from asking to elevate. -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>

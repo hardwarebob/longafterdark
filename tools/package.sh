@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# Build the three programs (Release) and stage Long After Dark, ready to run:
+#   build/dist/LongAfterDark/{LongAfterDark.scr, adhostwin.exe, adimport.exe,
+#                             README.txt, LICENSE.txt, licenses/}
+#   bash tools/package.sh
+# Env: AD_BUILD_DIR (default build/win-release), AD_DIST_DIR (default
+# build/dist/LongAfterDark; replaced whole on every run), AD_COMPONENTS.
+# Only what ships is built (no test programs, no tests run): build.sh builds
+# and tests the whole tree. The binaries carry no link timestamp, so the same
+# source gives the same bytes. The new folder is staged beside the old one
+# and swapped in only when complete; if the old one is in use (a running
+# screen saver or settings window), nothing is replaced.
+# No After Dark file is ever staged: the user imports their own discs (or the
+# Internet Archive copies) with adimport.
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BUILD="${AD_BUILD_DIR:-$ROOT/build/win-release}"
+DIST="${AD_DIST_DIR:-$ROOT/build/dist/LongAfterDark}"
+# Both lanes: pe32 (the 32-bit modules) and ne16 (the 16-bit ones).
+COMPONENTS="${AD_COMPONENTS:-host/core;host/cpu;host/loader;common/ui;host/win32;host/pe32;host/win16;host/ne16;importer;scr}"
+eval "$(tr -d '\r' < "$ROOT/tools/versions" | grep -E '^[A-Z0-9_]+=[^ ]*$')"
+LLVM_DIR="$ROOT/third_party/toolchains/llvm-mingw-$LLVM_MINGW_VER-ucrt-x86_64"
+
+AD_BUILD_DIR="$BUILD" AD_COMPONENTS="$COMPONENTS" AD_NO_TESTS=1 \
+  bash "$ROOT/tools/build.sh" --target adhostwin adimport LongAfterDark
+
+# The saver: the build above makes LongAfterDark.scr (target LongAfterDark).
+SCR="$BUILD/scr/LongAfterDark.scr"
+for f in "$SCR" "$BUILD/host/core/adhostwin.exe" "$BUILD/importer/adimport.exe"; do
+  [ -f "$f" ] || { echo "package.sh: missing $f" >&2; exit 1; }
+done
+
+FINAL="$DIST"
+DIST="$FINAL.staging-$$"
+rm -rf "$DIST"
+trap 'rm -rf "$DIST"' EXIT
+mkdir -p "$DIST/licenses"
+cp "$SCR" "$DIST/LongAfterDark.scr"
+cp "$BUILD/host/core/adhostwin.exe" "$BUILD/importer/adimport.exe" "$DIST/"
+
+# Windows line endings for Notepad on older systems: every text file staged.
+crlf() { sed -i 's/\r*$/\r/' "$@"; }
+
+# The licences: this project's (LICENSE.txt), and in licenses\ the full text
+# of everything built into the programs, with NOTICE.txt saying which file is
+# whose (THIRD_PARTY_LICENSES.md is the repository's account of the same).
+cp "$ROOT/LICENSE" "$DIST/LICENSE.txt"
+L="$DIST/licenses"
+cp "$ROOT/host/cpu/LICENSE.resource_dasm" "$L/resource_dasm.LICENSE.txt"
+cp "$ROOT/third_party/win/phosg/src/LICENSE" "$L/phosg.LICENSE.txt"
+cp "$ROOT/third_party/win/zlib/LICENSE" "$L/zlib.LICENSE.txt"
+cp "$LLVM_DIR/LICENSE.TXT" "$L/LLVM.LICENSE.txt"
+cp "$LLVM_DIR/x86_64-w64-mingw32/share/mingw32/COPYING.MinGW-w64-runtime.txt" "$L/mingw-w64-runtime.COPYING.txt"
+cat > "$L/NOTICE.txt" <<EOF
+Long After Dark: third-party software
+=====================================
+
+The three programs (LongAfterDark.scr, adhostwin.exe, adimport.exe) are
+linked statically, so each carries inside it the parts of the code below
+that it uses. The full licence texts are in this folder.
+
+  resource_dasm.LICENSE.txt       MIT
+    The x86 emulator in adhostwin.exe is derived from resource_dasm
+    (https://github.com/fuzziqersoftware/resource_dasm, through the fork
+    https://github.com/swannman/resource_dasm, branch afterdark-perf,
+    commit 02d8ea9a58eaf559a9194601b33d98723c9d4f60), modified.
+
+  phosg.LICENSE.txt               MIT
+    phosg (https://github.com/fuzziqersoftware/phosg), commit
+    $PHOSG_REV,
+    in adhostwin.exe and LongAfterDark.scr.
+
+  zlib.LICENSE.txt                zlib
+    zlib (https://zlib.net/), commit
+    $ZLIB_REV,
+    in adimport.exe (the After Dark 3.x installers' archives).
+
+  LLVM.LICENSE.txt                Apache-2.0 WITH LLVM-exception
+    The LLVM runtimes (libc++, libc++abi, libunwind, compiler-rt) of
+    llvm-mingw $LLVM_MINGW_VER (https://github.com/mstorsjo/llvm-mingw), in all
+    three programs.
+
+  mingw-w64-runtime.COPYING.txt   the mingw-w64 runtime licence
+    The mingw-w64 runtime (start-up code and import libraries,
+    https://www.mingw-w64.org/), as built by llvm-mingw $LLVM_MINGW_VER,
+    in all three programs.
+
+Everything else the programs use comes with Windows. No After Dark file is
+included.
+EOF
+
+cat > "$DIST/README.txt" <<'EOF'
+Long After Dark
+===============
+
+Long After Dark is a screen saver for Windows that runs the original Windows
+After Dark modules, unchanged, under x86 emulation. It knows five releases:
+
+  id        Release                              Internet Archive download
+  deluxe    After Dark 4.0 Deluxe (1996)         CD image, 381.7 MB
+  ad10      After Dark 10th Anniversary (1999)   CD image, 143.3 MB
+  ad32      After Dark 3.2 (1995)                CD image, 58.8 MB
+  tt        Totally Twisted After Dark (1995)    CD image, 37.9 MB
+  simpsons  The Simpsons Screen Saver (1994)     install files (ZIP), 2.6 MB
+
+No After Dark files are included: you import them from your own copies (and
+are responsible for sourcing them legally). Requires 64-bit Windows on an x64
+PC.
+
+This folder holds three programs. Keep them together: the screen saver looks
+for the other two next to itself.
+
+  LongAfterDark.scr   the screen saver and its settings window
+  adhostwin.exe       the emulator; the screen saver starts one per monitor
+  adimport.exe        copies the After Dark modules from your discs
+
+
+1. Import your After Dark releases
+
+   Double-click adimport.exe, or click Import... in the screen saver's
+   settings. Then pick a source:
+     - A disc or floppy image: .iso, .bin, .img, .ima, .vfd or .flp, or a
+       .zip of the install files. For the two Simpsons floppies, select both.
+     - A drive or folder: the CD itself, or a folder copied from it.
+     - A download from the Internet Archive: the five releases with their
+       sizes, plus one entry that fetches every release not imported yet.
+       Downloads resume if interrupted, and each one is checked against its
+       published MD5 before it is used.
+   The importer works out which release it was given, checks every file
+   against that release's known MD5s and installs it beside the releases
+   already imported. Import as many as you like.
+
+   From a command prompt, with the ids above:
+     adimport --image "C:\Images\After Dark 3.2.iso"
+     adimport --image disk1.img --image disk2.img
+     adimport --from E:\
+     adimport --download ad10
+     adimport --download all
+     adimport --list-packages
+     adimport --remove tt
+   adimport --help lists every option.
+
+2. Covers
+
+   With two or more releases imported, the settings window shows their box
+   covers above the module list; click covers to list only those releases.
+   An import fetches the cover picture (checked against its published MD5)
+   or uses the art on the disc. While a release still shows a plain
+   generated cover, "Get the covers" (in the settings window or the
+   importer) fetches the pictures. To use a picture of your own, choose
+   "Change cover..." (right-click the cover in the settings window, or next
+   to the release in the importer) and pick any picture Windows can read; it
+   stays on this computer.
+
+3. Install the screen saver
+
+   For yourself: right-click LongAfterDark.scr -> Install. Windows makes it
+   the current screen saver where it is and opens Screen Saver Settings, so
+   leave this folder where it is.
+
+   For every user: copy LongAfterDark.scr, adhostwin.exe and adimport.exe to
+   C:\Windows\System32, then choose "Long After Dark" in Screen Saver
+   Settings (Settings -> Personalization -> Lock screen -> Screen saver).
+
+   Right-click -> Test (or double-click the .scr) runs it full screen.
+
+4. Choose what it shows
+
+   Settings... in Screen Saver Settings (or right-click LongAfterDark.scr ->
+   Configure) picks one module or Random, the modules it rotates through,
+   how often it changes, the resolution, the monitors to use and the sound,
+   with a live preview of the selected module.
+
+   Sound is on by default. Only the primary monitor's screen saver plays
+   it, at After Dark's own volume (50): the modules' wave effects, their
+   MIDI music (through Windows' MIDI synthesizer) and the Simpsons' speech.
+   In the settings window, Sound (Primary monitor / Off) and Volume (0-100)
+   change that. Preview plays sound with the values you have not saved yet;
+   the small live preview never does.
+
+   Any key except Shift, Ctrl, Caps Lock and Num Lock, a click, the mouse
+   wheel or moving the mouse ends the screen saver. Caps Lock never does:
+   in some modules it changes something or starts a game. While a game is
+   playing, press Caps Lock again to stop playing, or Alt to end the screen
+   saver at once. Locking the computer (Win+L) always ends it.
+
+Where your files are
+
+   Everything is in %LOCALAPPDATA%\LongAfterDark (paste that into Explorer's
+   address bar): the imported modules (assets\win), Internet Archive
+   downloads (downloads), the screen saver's settings (settings.ini), what
+   the modules save themselves (state), the settings window's module
+   pictures (thumbs) and the last run's log (logs).
+
+Updating
+
+   Close the settings window, make sure the screen saver is not running, and
+   replace the three programs with the new ones. Imported releases, downloads
+   and settings are kept.
+
+Status
+
+   202 modules from the five releases run, with their sound, their Caps
+   Lock games and their own option buttons. Still being finished:
+     - Speed: each module's pace follows a model of a mid-1990s PC; not
+       every module has been compared with the original yet.
+   There is no installer or code signing yet. "adimport --version" says
+   which version you have (and so does each program's Properties -> Details
+   in Explorer).
+
+Licences
+
+   LICENSE.txt is the project's licence. The licences of the code built
+   into the programs are in licenses\ (NOTICE.txt there says which is
+   whose).
+EOF
+crlf "$DIST/README.txt" "$DIST/LICENSE.txt" "$L"/*.txt
+
+# Swap it in: the old folder aside first (refused while a program in it
+# runs, which leaves it as it was), then the new one in its place.
+if [ -e "$FINAL" ]; then
+  if ! mv "$FINAL" "$FINAL.old-$$" 2>/dev/null; then
+    echo "package.sh: $FINAL is in use (close the screen saver and its settings window); nothing was replaced" >&2
+    exit 1
+  fi
+fi
+mv "$DIST" "$FINAL"
+trap - EXIT
+rm -rf "$FINAL.old-$$"
+ls -la "$FINAL" "$FINAL/licenses"

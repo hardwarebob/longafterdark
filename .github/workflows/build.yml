@@ -1,0 +1,97 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request supersedes a run still going.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # The portable llvm-mingw toolchain that tools/bootstrap.sh fetches, and
+    # the tools/*.sh scripts: on a Windows runner, `shell: bash` is Git Bash.
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      # No test opens a sound device, and a runner has none; this makes sure
+      # no host started here tries to.
+      ADAUDIOLIVE: '0'
+    steps:
+      - uses: actions/checkout@v7
+
+      # llvm-mingw, ninja, and the static zlib + phosg that bootstrap.sh
+      # builds, keyed on their pins in tools/versions (bump the suffix to
+      # start over). The downloaded zips and the build trees of zlib and
+      # phosg are left out: bootstrap.sh marks an unpacked toolchain complete
+      # and records the revisions it built, so it needs neither again.
+      # Restored and saved as two steps, so a run whose tests fail still
+      # keeps the bootstrap for the next one.
+      - name: Restore third_party
+        id: third-party
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            third_party
+            !third_party/toolchains/*.zip
+            !third_party/win/build-*
+          key: third-party-${{ runner.os }}-${{ hashFiles('tools/versions') }}-v1
+
+      - name: Bootstrap (toolchain, zlib, phosg)
+        run: bash tools/bootstrap.sh
+
+      - name: Save third_party
+        if: steps.third-party.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            third_party
+            !third_party/toolchains/*.zip
+            !third_party/win/build-*
+          key: ${{ steps.third-party.outputs.cache-primary-key }}
+
+      # Into build/win-release, package.sh's build directory, so the package
+      # step reuses this build instead of compiling the programs again.
+      #
+      # -LE gui leaves out the tests that open real windows on the desktop:
+      # scr_smoke_* (with the opt-in scr_smoke_e2e-*) and import.gui_flow.
+      # The runner has no After Dark modules, so the suites that need them
+      # skip themselves (exit 77): core.lane_detect_assets, loader_corpus,
+      # win16.assets, pe32.assets, pe32.packages, ne16.assets, ne16.pkg,
+      # ne16.interaction and import.catalog_real; so do the opt-in ones
+      # (core.audio_assets, import.e2e, import.pkg_real, import.download_real,
+      # import.covers_real) and cpu_perf (no upstream resource_dasm clone to
+      # compare with). The download and cover tests serve their files from a
+      # loopback server and need no network.
+      - name: Build and test
+        run: AD_BUILD_DIR="$PWD/build/win-release" AD_CTEST_ARGS="-LE gui -j4" bash tools/build.sh
+
+      - name: Upload the test log
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-log
+          path: build/win-release/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+
+      # build/dist/LongAfterDark: the three programs, README.txt, LICENSE.txt
+      # and licenses\.
+      - name: Package
+        run: bash tools/package.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: LongAfterDark-x64
+          path: build/dist/LongAfterDark
+          if-no-files-found: error

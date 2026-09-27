@@ -1,0 +1,522 @@
+// FILE_ID_INFO (Windows 8 and later; the importer needs Windows 10) for the
+// folder reader's directory ids. Before any header.
+#if !defined(_WIN32_WINNT) || _WIN32_WINNT < 0x0602
+#undef _WIN32_WINNT
+#define _WIN32_WINNT 0x0602
+#endif
+#include "source.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <cwctype>
+#include <map>
+
+#include "fat.h"
+#include "iso9660.h"
+#include "md5.h"
+#include "names.h"
+#include "winutil.h"
+#include "zip.h"
+
+namespace adw::import {
+
+namespace fs = std::filesystem;
+
+// ---- common ----------------------------------------------------------------------
+
+std::optional<SourceNode> SourceFs::child(const SourceNode& dir, std::string_view name) const {
+  if (!dir.is_dir) return std::nullopt;
+  for (SourceNode& n : list(dir))
+    if (iequals(n.name, name) || (!n.alt_name.empty() && iequals(n.alt_name, name))) return std::move(n);
+  return std::nullopt;
+}
+
+std::optional<SourceNode> SourceFs::find(std::string_view path) const {
+  SourceNode cur = root();
+  size_t i = 0;
+  while (i <= path.size()) {
+    size_t j = path.find_first_of("/\\", i);
+    if (j == std::string_view::npos) j = path.size();
+    std::string_view comp = path.substr(i, j - i);
+    i = j + 1;
+    if (comp.empty() || comp == ".") continue;
+    auto next = child(cur, comp);
+    if (!next) return std::nullopt;
+    cur = std::move(*next);
+  }
+  return cur;
+}
+
+std::vector<uint8_t> SourceFs::read_all(const SourceNode& file, uint64_t max_bytes) const {
+  if (file.size > max_bytes)
+    throw ImportError(Status::source_invalid, file.name + " is implausibly large (" + std::to_string(file.size) + " bytes)");
+  std::vector<uint8_t> out;
+  out.reserve(size_t(file.size));
+  read(file, [&](const uint8_t* p, size_t n) {
+    if (out.size() + n > max_bytes) throw ImportError(Status::source_invalid, file.name + " is implausibly large");
+    out.insert(out.end(), p, p + n);
+  });
+  return out;
+}
+
+namespace {
+
+[[noreturn]] void invalid(const std::string& what) { throw ImportError(Status::source_invalid, what); }
+
+// ---- ISO-9660 -------------------------------------------------------------------------
+
+// The recording time as a UTC FILETIME, or nothing when the record holds a
+// time Windows cannot represent (hour 25, 30 February…): a damaged timestamp
+// should leave the copy with its import time, not 1601-01-01.
+std::optional<FILETIME> iso_filetime(const IsoTime& t) {
+  SYSTEMTIME st{};
+  st.wYear = WORD(t.year);
+  st.wMonth = WORD(t.month);
+  st.wDay = WORD(t.day);
+  st.wHour = WORD(t.hour);
+  st.wMinute = WORD(t.minute);
+  st.wSecond = WORD(t.second);
+  FILETIME ft{};
+  if (!SystemTimeToFileTime(&st, &ft)) return std::nullopt;
+  // The recorded time is local to the mastering site; subtract its GMT offset
+  // (ECMA-119 allows -48..+52 quarter hours).
+  if (t.gmt_offset_15min < -48 || t.gmt_offset_15min > 52) return std::nullopt;
+  ULARGE_INTEGER u{};
+  u.LowPart = ft.dwLowDateTime;
+  u.HighPart = ft.dwHighDateTime;
+  u.QuadPart -= int64_t(t.gmt_offset_15min) * 15 * 60 * 10000000LL;
+  ft.dwLowDateTime = u.LowPart;
+  ft.dwHighDateTime = u.HighPart;
+  return ft;
+}
+
+class IsoFs : public SourceFs {
+ public:
+  explicit IsoFs(std::unique_ptr<IsoImage> iso) : iso_(std::move(iso)) {}
+
+  SourceNode root() const override { return node(iso_->root(), true); }
+
+  std::vector<SourceNode> list(const SourceNode& dir) const override {
+    try {
+      std::vector<SourceNode> out;
+      for (IsoEntry& e : iso_->list(entry(dir))) out.push_back(node(std::move(e), false));
+      return out;
+    } catch (const IsoError& e) {
+      invalid(e.what());
+    }
+  }
+
+  void read(const SourceNode& file, const Sink& sink) const override {
+    try {
+      iso_->read(entry(file), sink);
+    } catch (const IsoError& e) {
+      invalid(e.what());
+    }
+  }
+
+  std::string format() const override { return iso_->joliet() ? "iso9660+joliet" : "iso9660"; }
+  std::string volume_id() const override { return iso_->volume_id(); }
+  // The first extent: where the directory's records are. The tree matters
+  // too (a Joliet directory and its primary twin are different records).
+  std::string dir_key(const SourceNode& dir) const override {
+    const IsoEntry& e = entry(dir);
+    if (!e.is_dir || e.extents.empty()) return {};
+    return std::string(e.in_joliet ? "j:" : "p:") + std::to_string(e.extents[0].lba);
+  }
+
+ private:
+  std::unique_ptr<IsoImage> iso_;
+
+  static const IsoEntry& entry(const SourceNode& n) { return *static_cast<const IsoEntry*>(n.impl.get()); }
+
+  static SourceNode node(IsoEntry e, bool is_root) {
+    SourceNode n;
+    if (!is_root) {
+      n.name = ascii_upper(e.short_name.empty() ? e.name : e.short_name);
+      if (!e.short_name.empty() && !iequals(e.short_name, e.name)) n.alt_name = e.name;
+    }
+    n.is_dir = e.is_dir;
+    n.size = e.size;
+    if (e.mtime.valid) n.mtime = iso_filetime(e.mtime);
+    n.impl = std::make_shared<IsoEntry>(std::move(e));
+    return n;
+  }
+};
+
+// ---- FAT --------------------------------------------------------------------------------
+
+class FatFs : public SourceFs {
+ public:
+  explicit FatFs(std::unique_ptr<FatImage> fat) : fat_(std::move(fat)) {}
+
+  SourceNode root() const override { return node(fat_->root()); }
+
+  std::vector<SourceNode> list(const SourceNode& dir) const override {
+    try {
+      std::vector<SourceNode> out;
+      for (FatEntry& e : fat_->list(entry(dir))) out.push_back(node(std::move(e)));
+      return out;
+    } catch (const FatError& e) {
+      invalid(e.what());
+    }
+  }
+
+  void read(const SourceNode& file, const Sink& sink) const override {
+    try {
+      fat_->read(entry(file), sink);
+    } catch (const FatError& e) {
+      invalid(e.what());
+    }
+  }
+
+  std::string format() const override { return fat_->fat_bits() == 12 ? "fat12" : "fat16"; }
+  std::string volume_id() const override { return fat_->volume_label(); }
+  // A subdirectory is its cluster chain, which starts at its first cluster.
+  std::string dir_key(const SourceNode& dir) const override {
+    const FatEntry& e = entry(dir);
+    if (!e.is_dir) return {};
+    return e.root ? std::string("root") : std::to_string(e.first_cluster);
+  }
+
+ private:
+  std::unique_ptr<FatImage> fat_;
+
+  static const FatEntry& entry(const SourceNode& n) { return *static_cast<const FatEntry*>(n.impl.get()); }
+
+  static SourceNode node(FatEntry e) {
+    SourceNode n;
+    n.name = e.root ? std::string() : e.name;
+    n.is_dir = e.is_dir;
+    n.size = e.size;
+    if (!e.root) n.mtime = dos_filetime(e.dos_date, e.dos_time);
+    n.impl = std::make_shared<FatEntry>(std::move(e));
+    return n;
+  }
+};
+
+// ---- folder -----------------------------------------------------------------------------
+
+class FolderFs : public SourceFs {
+ public:
+  explicit FolderFs(fs::path dir) : dir_(std::move(dir)) {}
+
+  SourceNode root() const override {
+    SourceNode n;
+    n.is_dir = true;
+    n.impl = std::make_shared<fs::path>(dir_);
+    return n;
+  }
+
+  // The name as listed, upper-cased. Not the file system's short alias:
+  // "LEVEL2~1.AFI" is never the disc's own name, and whether a volume makes
+  // aliases at all is a per-volume setting (8dot3name), so the same copy
+  // would import under different names from different drives.
+  std::vector<SourceNode> list(const SourceNode& dir) const override {
+    const fs::path& d = path(dir);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileExW((d / L"*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr,
+                                FIND_FIRST_EX_LARGE_FETCH);
+    if (h == INVALID_HANDLE_VALUE) invalid("cannot list " + to_utf8(d.wstring()) + ": " + win_error_string(GetLastError()));
+    std::vector<SourceNode> out;
+    do {
+      if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+      SourceNode n;
+      n.name = ascii_upper(to_utf8(fd.cFileName));
+      n.is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+      n.size = n.is_dir ? 0 : (uint64_t(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
+      n.mtime = fd.ftLastWriteTime;
+      n.impl = std::make_shared<fs::path>(d / fd.cFileName);
+      out.push_back(std::move(n));
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return out;
+  }
+
+  void read(const SourceNode& file, const Sink& sink) const override {
+    const fs::path& p = path(file);
+    Handle in(CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN,
+                          nullptr));
+    if (!in.valid()) invalid("cannot read " + to_utf8(p.wstring()) + ": " + win_error_string(GetLastError()));
+    std::vector<uint8_t> buf(1 << 20);
+    for (;;) {
+      DWORD got = 0;
+      if (!ReadFile(in.get(), buf.data(), DWORD(buf.size()), &got, nullptr))
+        invalid("read error on " + to_utf8(p.wstring()) + ": " + win_error_string(GetLastError()));
+      if (!got) break;
+      sink(buf.data(), got);
+    }
+  }
+
+  std::string format() const override { return "folder"; }
+
+  // The volume and file id: a junction or directory symlink back up the tree
+  // (or across it) reaches a directory already seen under another name. A
+  // file system that reports no id (all zero) gives no key.
+  std::string dir_key(const SourceNode& dir) const override {
+    if (!dir.is_dir) return {};
+    Handle h(CreateFileW(path(dir).c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+    if (!h.valid()) return {};
+    char buf[64];
+    FILE_ID_INFO id{};
+    if (GetFileInformationByHandleEx(h.get(), FileIdInfo, &id, sizeof(id))) {
+      bool zero = true;
+      for (BYTE b : id.FileId.Identifier) zero = zero && !b;
+      if (zero) return {};
+      std::string key = std::to_string(id.VolumeSerialNumber) + ":";
+      for (BYTE b : id.FileId.Identifier) {
+        snprintf(buf, sizeof(buf), "%02x", b);
+        key += buf;
+      }
+      return key;
+    }
+    BY_HANDLE_FILE_INFORMATION bh{};
+    if (!GetFileInformationByHandle(h.get(), &bh) || (!bh.nFileIndexHigh && !bh.nFileIndexLow)) return {};
+    snprintf(buf, sizeof(buf), "%lu:%08lx%08lx", (unsigned long)bh.dwVolumeSerialNumber, (unsigned long)bh.nFileIndexHigh,
+             (unsigned long)bh.nFileIndexLow);
+    return buf;
+  }
+
+ private:
+  fs::path dir_;
+  static const fs::path& path(const SourceNode& n) { return *static_cast<const fs::path*>(n.impl.get()); }
+};
+
+// ---- ZIP ---------------------------------------------------------------------------------
+
+// A ZIP of an install folder (the Internet Archive's Simpsons copies): a flat
+// archive whose members are the files at the source's root. It is held in
+// memory (the known ones are under 3 MB), and a member is inflated and its
+// size and CRC-32 checked as it is read. The outer archive is only a
+// container, so a password-protected member is refused rather than guessed
+// at; the installer's own encrypted archives are members like any other file.
+class ZipFs : public SourceFs {
+ public:
+  explicit ZipFs(std::unique_ptr<ZipArchive> zip) : zip_(std::move(zip)) {}
+
+  SourceNode root() const override {
+    SourceNode n;
+    n.is_dir = true;
+    return n;
+  }
+
+  std::vector<SourceNode> list(const SourceNode& dir) const override {
+    std::vector<SourceNode> out;
+    if (!dir.is_dir) return out;
+    for (const ZipMember& m : zip_->members()) {
+      SourceNode n;
+      n.name = ascii_upper(m.name);
+      n.size = m.usize;
+      n.mtime = dos_filetime(m.mod_date, m.mod_time);
+      n.impl = std::make_shared<ZipMember>(m);
+      out.push_back(std::move(n));
+    }
+    return out;
+  }
+
+  void read(const SourceNode& file, const Sink& sink) const override {
+    try {
+      zip_->extract(*static_cast<const ZipMember*>(file.impl.get()), "", sink);
+    } catch (const ZipError& e) {
+      invalid(e.what());
+    }
+  }
+
+  std::string format() const override { return "zip"; }
+  // Flat: the root is the only directory.
+  std::string dir_key(const SourceNode& dir) const override { return dir.is_dir ? "root" : ""; }
+
+ private:
+  std::unique_ptr<ZipArchive> zip_;
+};
+
+bool starts_with_zip_signature(const fs::path& path) {
+  Handle in(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr));
+  uint8_t sig[4] = {};
+  DWORD got = 0;
+  return in.valid() && ReadFile(in.get(), sig, 4, &got, nullptr) && got == 4 && sig[0] == 'P' && sig[1] == 'K' &&
+         sig[2] == 3 && sig[3] == 4;
+}
+
+std::unique_ptr<SourceFs> open_zip(const fs::path& path) {
+  constexpr uint64_t kMaxZip = 256ull << 20;
+  const std::string name = to_utf8(path.filename().wstring());
+  Handle in(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN,
+                        nullptr));
+  if (!in.valid()) invalid("cannot read " + to_utf8(path.wstring()) + ": " + win_error_string(GetLastError()));
+  LARGE_INTEGER size{};
+  if (!GetFileSizeEx(in.get(), &size) || uint64_t(size.QuadPart) > kMaxZip)
+    invalid(name + " is too large for a ZIP of install files");
+  auto data = std::make_shared<std::vector<uint8_t>>(size_t(size.QuadPart));
+  size_t have = 0;
+  while (have < data->size()) {
+    DWORD got = 0;
+    DWORD want = DWORD(std::min<size_t>(data->size() - have, 1 << 20));
+    if (!ReadFile(in.get(), data->data() + have, want, &got, nullptr) || !got)
+      invalid("read error on " + to_utf8(path.wstring()) + ": " + win_error_string(GetLastError()));
+    have += got;
+  }
+  std::unique_ptr<ZipArchive> zip;
+  try {
+    zip = std::make_unique<ZipArchive>(std::move(data), name);
+  } catch (const ZipError& e) {
+    invalid(std::string(e.what()) + " (a ZIP source must hold the install files at its root)");
+  }
+  for (const ZipMember& m : zip->members())
+    if (m.encrypted()) invalid(name + "!" + m.name + " is password-protected");
+  return std::make_unique<ZipFs>(std::move(zip));
+}
+
+// ---- union ------------------------------------------------------------------------------
+
+class UnionFs : public SourceFs {
+ public:
+  explicit UnionFs(std::vector<std::unique_ptr<SourceFs>> parts) : parts_(std::move(parts)) {}
+
+  SourceNode root() const override {
+    auto copies = std::make_shared<Copies>();
+    for (size_t i = 0; i < parts_.size(); i++) copies->push_back({i, parts_[i]->root()});
+    SourceNode n;
+    n.is_dir = true;
+    n.impl = copies;
+    return n;
+  }
+
+  std::vector<SourceNode> list(const SourceNode& dir) const override {
+    std::vector<SourceNode> out;
+    std::map<std::string, size_t> index;  // upper-case name -> out[]
+    for (const auto& [part, node] : copies(dir)) {
+      for (SourceNode& c : parts_[part]->list(node)) {
+        auto it = index.find(c.name);
+        if (it == index.end()) {
+          index[c.name] = out.size();
+          SourceNode u = c;
+          u.impl = std::make_shared<Copies>(Copies{{part, std::move(c)}});
+          out.push_back(std::move(u));
+          continue;
+        }
+        SourceNode& u = out[it->second];
+        if (u.is_dir != c.is_dir) invalid(c.name + " is a file in one image and a folder in another; they are not the disks of one release");
+        if (!u.is_dir && u.size != c.size) invalid(c.name + " differs between the images (size); they are not the disks of one release");
+        const_cast<Copies&>(copies(u)).push_back({part, std::move(c)});
+      }
+    }
+    return out;
+  }
+
+  // Every other copy is hashed first, then the first one streams while it
+  // is hashed too: the same bytes everywhere, or the source is invalid.
+  void read(const SourceNode& file, const Sink& sink) const override {
+    const Copies& c = copies(file);
+    std::string other;
+    for (size_t i = 1; i < c.size(); i++) {
+      Md5 h;
+      parts_[c[i].first]->read(c[i].second, [&](const uint8_t* p, size_t n) { h.update(p, n); });
+      std::string m = h.finish_hex();
+      if (!other.empty() && m != other) invalid(file.name + " differs between the images; they are not the disks of one release");
+      other = m;
+    }
+    if (other.empty()) {
+      parts_[c[0].first]->read(c[0].second, sink);
+      return;
+    }
+    Md5 h;
+    parts_[c[0].first]->read(c[0].second, [&](const uint8_t* p, size_t n) {
+      h.update(p, n);
+      sink(p, n);
+    });
+    if (h.finish_hex() != other) invalid(file.name + " differs between the images; they are not the disks of one release");
+  }
+
+  std::string format() const override {
+    std::string f = parts_.front()->format();
+    for (auto& p : parts_)
+      if (p->format() != f) return "mixed";
+    return f;
+  }
+  std::string volume_id() const override { return parts_.front()->volume_id(); }
+  // Every copy's key, with its image: the same directory only when it is the
+  // same one in each image that has it.
+  std::string dir_key(const SourceNode& dir) const override {
+    std::string key;
+    for (const auto& [part, node] : copies(dir)) {
+      std::string k = parts_[part]->dir_key(node);
+      if (k.empty()) return {};
+      key += std::to_string(part) + "=" + k + ";";
+    }
+    return key;
+  }
+
+ private:
+  using Copies = std::vector<std::pair<size_t, SourceNode>>;
+  std::vector<std::unique_ptr<SourceFs>> parts_;
+  static const Copies& copies(const SourceNode& n) { return *static_cast<const Copies*>(n.impl.get()); }
+};
+
+}  // namespace
+
+std::optional<FILETIME> dos_filetime(uint16_t date, uint16_t time) {
+  if (!date) return std::nullopt;
+  SYSTEMTIME local{};
+  local.wYear = WORD(1980 + (date >> 9));
+  local.wMonth = WORD((date >> 5) & 15);
+  local.wDay = WORD(date & 31);
+  local.wHour = WORD(time >> 11);
+  local.wMinute = WORD((time >> 5) & 63);
+  local.wSecond = WORD((time & 31) * 2);
+  SYSTEMTIME utc{};
+  FILETIME ft{};
+  if (!TzSpecificLocalTimeToSystemTime(nullptr, &local, &utc) || !SystemTimeToFileTime(&utc, &ft)) return std::nullopt;
+  return ft;
+}
+
+std::unique_ptr<SourceFs> open_image(const fs::path& path) {
+  std::error_code ec;
+  if (!fs::is_regular_file(path, ec)) invalid("no such image file: " + to_utf8(path.wstring()));
+  std::string iso_why;
+  try {
+    return std::make_unique<IsoFs>(std::make_unique<IsoImage>(path));
+  } catch (const IsoError& e) {
+    iso_why = e.what();
+  }
+  // A local file header at byte 0: a ZIP of install files, never a floppy
+  // (whose boot sector starts with a jump).
+  if (starts_with_zip_signature(path)) return open_zip(path);
+  try {
+    return std::make_unique<FatFs>(std::make_unique<FatImage>(path));
+  } catch (const FatError& e) {
+    invalid(to_utf8(path.filename().wstring()) + " is neither an ISO-9660 disc image (" + iso_why +
+            "), a FAT floppy image (" + e.what() + ") nor a ZIP of install files");
+  }
+}
+
+std::unique_ptr<SourceFs> open_folder(const fs::path& dir, std::string* note) {
+  std::error_code ec;
+  if (!fs::is_directory(dir, ec)) invalid("no such folder: " + to_utf8(dir.wstring()));
+  // The root of a CD drive (a disc, or an image Windows mounted) is read as
+  // the disc itself: Windows lists a Joliet disc by its long names
+  // ("Toaster 2k.ad"), while the ISO reader pairs each with the 8.3 name the
+  // release, its manifest and the catalog ids use (TOASTER2.AD).
+  std::wstring s = dir.wstring();
+  while (s.size() > 2 && (s.back() == L'\\' || s.back() == L'/')) s.pop_back();
+  if (s.size() == 2 && s[1] == L':' && iswalpha(s[0])) {
+    std::wstring root = s + L"\\";
+    if (GetDriveTypeW(root.c_str()) == DRIVE_CDROM) {
+      try {
+        auto iso = std::make_unique<IsoFs>(std::make_unique<IsoImage>(L"\\\\.\\" + s));
+        if (note) *note = "reading " + to_utf8(root) + " as a disc (" + iso->format() + ")";
+        return iso;
+      } catch (const IsoError& e) {
+        if (note) *note = "cannot read " + to_utf8(root) + " as a disc (" + e.what() + "); reading it as a folder";
+      }
+    }
+  }
+  return std::make_unique<FolderFs>(dir);
+}
+
+std::unique_ptr<SourceFs> union_of(std::vector<std::unique_ptr<SourceFs>> parts) {
+  if (parts.size() == 1) return std::move(parts.front());
+  return std::make_unique<UnionFs>(std::move(parts));
+}
+
+}  // namespace adw::import

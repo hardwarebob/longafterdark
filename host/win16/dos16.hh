@@ -1,0 +1,127 @@
+// The machine under Windows that Classic binaries reach directly (ABI.md
+// §3.6): INT 21h (DOS — directly and through KERNEL.DOS3Call), INT 1Ah (BIOS
+// clock), INT 2Fh (multiplex: the Windows/MSCDEX install checks), INT 25h/26h
+// (absolute disk I/O — refused), INT 10h (the VGA palette functions), INT 16h
+// (keyboard — empty), INT 31h (the DPMI descriptor services), and the DOS
+// file handles KERNEL's _lopen/_lread/OpenFile share.
+//
+// Files go through the guest file system (win32::Vfs, INTERACTION.md §7): a
+// guest path outside every mount does not exist. The lane mounts C:\WINDOWS
+// and C:\AFTERDRK as copy-on-write overlays over read-only lower layers
+// (virtual seed files; the module dir), whose upper layer is the per-user
+// state (ADSTATE) or, by default, memory — so a module that saves its state
+// sees it again, the host's files are never modified, and a headless run
+// starts from the same disk every time. DosFiles is the DOS handle table over
+// Vfs::open (VfsFile); KERNEL's _lopen/_lcreat/OpenFile and INT 21h share it.
+#pragma once
+
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "win16/runtime16.hh"
+
+namespace adw::win32 {
+class IniStore;
+class VfsFile;
+}  // namespace adw::win32
+
+namespace adw::win16 {
+
+// DOS error codes the file layer returns.
+namespace doserr {
+constexpr uint16_t kInvalidFunction = 1, kFileNotFound = 2, kPathNotFound = 3, kTooManyFiles = 4,
+                   kAccessDenied = 5, kInvalidHandle = 6, kNoMoreFiles = 18, kFileExists = 80;
+}
+
+class DosFiles : public RuntimeState16 {
+ public:
+  explicit DosFiles(Runtime16& rt) : rt_(rt) {}
+  ~DosFiles() override;
+
+  // mode: 0 read, 1 write, 2 read/write (low bits of the DOS open mode).
+  // create: make/truncate it; exclusive (with create): fail when it exists
+  // (INT 21h 5Bh). Returns a handle (>= 5) or -error (a DOS error code).
+  int open(const std::string& guest_path, int mode, bool create, bool exclusive = false);
+  int close(uint16_t h);                                     // 0 or -error
+  int32_t read(uint16_t h, uint32_t buf_fp, uint32_t n);     // bytes or -error (huge buffers allowed)
+  int32_t write(uint16_t h, uint32_t buf_fp, uint32_t n);    // bytes or -error; n = 0 truncates
+  int64_t seek(uint16_t h, int32_t off, int whence);         // new position or -error
+  int dup(uint16_t h);                                       // shares the file pointer, as DOS does
+  bool is_device(uint16_t h) const { return h < 5; }
+  bool valid(uint16_t h) const { return h < 5 || files_.count(h); }
+  uint32_t size_of(uint16_t h);
+  // A file (not a directory) at this guest path.
+  bool exists(const std::string& guest_path);
+  bool is_dir(const std::string& guest_path);
+  // 0 or -error.
+  int remove(const std::string& guest_path);
+  int rename(const std::string& from, const std::string& to);
+  int make_dir(const std::string& guest_path);
+  int remove_dir(const std::string& guest_path);
+
+  // The directory listing FindFirst/FindNext walk (the merged Vfs listing).
+  struct Found {
+    std::string name;  // 8.3 upper case
+    uint32_t size = 0;
+    uint8_t attr = 0;
+  };
+  std::vector<Found> list(const std::string& guest_pattern, uint8_t attr_mask);
+
+  // A Win32 error from the Vfs as a DOS error code.
+  static uint16_t dos_error(uint32_t win32_error);
+
+ private:
+  struct File {
+    std::string guest;
+    std::shared_ptr<win32::VfsFile> f;  // dup'd handles share it (and its position)
+  };
+  int add(File f);
+
+  Runtime16& rt_;
+  std::map<uint16_t, File> files_;
+  std::string line_;  // text written to stdout/stderr, until its newline
+  friend void register_dos(Runtime16& rt);
+  friend void dos_write_console(Runtime16& rt, const std::string& text);
+};
+
+// The profile store (Get/WritePrivateProfileString…, INTERACTION.md §7.3):
+// seeds ⊕ the file, writes to the upper layer only.
+win32::IniStore& profiles16(Runtime16& rt);
+
+// Installs the INT handlers above on `rt` and seeds the guest disk: C:\WINDOWS
+// and C:\WINDOWS\TEMP as in-memory overlays (the lane mounts its own over
+// them), the INI files After Dark's installer left there as empty virtual
+// files, their settings (and WIN.INI's [Berkeley Systems]) as profile seeds.
+void register_dos(Runtime16& rt);
+// (Re)seeds C:\WINDOWS\MODULES.INI's per-install settings for what the
+// install directory (C:\AFTERDRK) holds now; register_dos seeds it before
+// anything is mounted, the lane again once the module's folder is (PACKAGES.md
+// §7.3). Profile seeds, never written out:
+//   [The Artist] Image = C:\AFTERDRK\BITMAPS\ADLOGO.BMP
+//   [Ray] RaySceneFile = the first of TRACES\ROTCUBE.TRC, DIAMOND.TRC,
+//         ROTPYRA.TRC that exists (ROTCUBE when none does): Deluxe ships
+//         ROTCUBE, AD 3.2 the other two
+//   [Slide Show] CatalogName = BITMAPS
+//   [Logo Section] LogoFile = C:\AFTERDRK\BITMAPS\ADLOGO.BMP (AD 3.2's LOGO
+//         refuses to start without it)
+void seed_modules_ini(Runtime16& rt);
+// A Windows 3.1 Program Manager's files — C:\WINDOWS\PROGMAN.INI [Groups]
+// naming five .GRP files in C:\WINDOWS (Main, Accessories, Games, StartUp,
+// After Dark) — which the desktop-icon gatherers of ADXPL40 and ADXPL310 read
+// (PACKAGES.md §7.3). Virtual lower files of the C:\WINDOWS overlay.
+// Idempotent; user16's synthetic desktop seeds them when it first comes into
+// being (EnumWindows).
+void seed_program_manager(Runtime16& rt);
+// A Win 3.1 group file (GROUPDEF, "PMCC") holding just a name: pName at 0x16,
+// no items, checksum making the words of the file sum to 0.
+std::string progman_group_file(const std::string& name);
+// INT 21h with the current registers (KERNEL.DOS3Call uses it too).
+void dos_int21(Runtime16& rt);
+// Text a guest wrote to its console handles, to the log (by line).
+void dos_write_console(Runtime16& rt, const std::string& text);
+
+}  // namespace adw::win16

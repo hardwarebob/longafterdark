@@ -1,0 +1,34 @@
+{ "version": 1,
+  "generator": "hand-written fixture for the LongAfterDark.scr tests",
+  "modules": [
+    { "id": "test.rings", "displayName": "Test Rings", "lane": "pe32",
+      "path": "FILES/AD40/TESTRING.AD",
+      "controls": [
+        { "index": 2, "name": "Palette", "type": "popup", "items": ["Warm", "Cool", "Rainbow"], "default": 0 },
+        { "index": 0, "name": "Speed", "type": "slider", "min": 0, "max": 100, "default": 50 },
+        { "index": 1, "name": "Sound", "type": "checkbox", "default": 1 } ],
+      "about": "A synthetic test pattern.\nNot an After Dark module." },
+    { "id": "test.stripes", "displayName": "Test Stripes", "lane": "ne16",
+      "path": "FILES/CLASSIC/TESTSTRP.AD",
+      "controls": [
+        { "index": 0, "name": "Density", "type": "slider", "min": 1, "max": 10, "default": 5 },
+        { "index": 3, "name": "Mystery", "type": "dial", "default": 7 } ] },
+    { "id": "test.plain", "displayName": "Test Plain", "lane": "pe32",
+      "path": "FILES/AD40/TESTPLN.AD",
+      "controls": [] },
+    { "id": "test.stops", "displayName": "Test Stops", "lane": "pe32",
+      "path": "FILES/AD40/TESTSTOP.AD",
+      "controls": [
+        { "index": 0, "name": "Pictures", "kind": "button", "type": "button" },
+        { "index": 1, "name": "Appears:", "kind": "stringslider", "type": "slider",
+          "items": ["Never", "Rarely", "Often", "Always"], "values": [0, 33, 66, 100],
+          "default": 100, "defaultStop": 3 },
+        { "index": 2, "name": "Height:", "kind": "numslider", "type": "slider", "min": 5, "max": 95,
+          "default": 34, "rawDefault": 34, "unit": "%", "unitPos": "suffix" },
+        { "index": 3, "name": "Order:", "kind": "popup", "type": "popup", "items": ["In order", "Random"], "default": 1 } ],
+      "entry": "Module", "needs": ["ADXPL510.DLL"] },
+    { "id": "test.absent", "displayName": "Test Absent", "lane": "ne16",
+      "path": "FILES/CLASSIC/ABSENT.AD",
+      "controls": [] },
+    { "displayName": "No id: skipped", "lane": "pe32", "path": "FILES/AD40/NOID.AD" }
+  ] }

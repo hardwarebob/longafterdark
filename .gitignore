@@ -1,0 +1,19 @@
+# --- build products (tools/build.sh, tools/package.sh) ---
+.DS_Store
+build/
+
+# Imported / extracted original assets:
+assets/
+# Original disc images kept locally for import (adimport):
+source_iso/
+
+# --- research (do not publish) ---
+research/
+tools/scratchpad/
+
+# --- toolchain and dependencies fetched by tools/bootstrap.sh ---
+third_party/
+
+# --- local editor and agent state ---
+.vscode/
+.kilo/

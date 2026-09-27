@@ -1,0 +1,28 @@
+# Line endings. The repository stores text with LF; a checkout converts it to
+# the platform's (Git for Windows' default core.autocrlf=true gives CRLF).
+* text=auto
+
+# Always LF, whatever the checkout: shell scripts, and the NAME=value file
+# bootstrap.sh reads (bash on WSL, Linux or a CI runner stops at a '\r':
+# "set: pipefail\r: invalid option name").
+*.sh text eol=lf
+tools/versions text eol=lf
+
+# Never converted or diffed as text.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.bmp binary
+*.ico binary
+*.icns binary
+*.iso binary
+*.img binary
+*.bin binary
+*.zip binary
+*.exe binary
+*.dll binary
+*.scr binary
+*.pdf binary
+*.wav binary
+*.mid binary
