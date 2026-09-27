@@ -31,6 +31,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # A release tag names the version the programs carry: v<project(VERSION)>,
+      # optionally with a -suffix for a pre-release (v1.2.0-rc1). Checked
+      # first, so a mistyped tag fails before the build.
+      - name: Check the tag against the project version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(sed -nE 's/^project\([^ ]+ VERSION ([0-9.]+).*/\1/p' CMakeLists.txt)
+          tag=${GITHUB_REF_NAME#v}
+          if [ -z "$version" ] || [ "${tag%%-*}" != "$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match project(VERSION ${version:-?}) in CMakeLists.txt"
+            exit 1
+          fi
+
       # llvm-mingw, ninja, and the static zlib + phosg that bootstrap.sh
       # builds, keyed on their pins in tools/versions (bump the suffix to
       # start over). The downloaded zips and the build trees of zlib and
@@ -95,3 +108,59 @@ jobs:
           name: LongAfterDark-x64
           path: build/dist/LongAfterDark
           if-no-files-found: error
+
+  # The build job's dist, zipped, on a GitHub Release:
+  #   a v* tag  the release of that name, "Long After Dark <version>", with
+  #             LongAfterDark-<version>-x64.zip and generated notes; a tag
+  #             with a -suffix (v1.2.0-rc1) is a pre-release.
+  #   main      one pre-release, latest-main, moved to each new commit with
+  #             its LongAfterDark-x64.zip replaced: always the newest build,
+  #             at the same URL. A pre-release is never marked Latest.
+  # Only zips and uploads, so it runs on Linux.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: LongAfterDark-x64
+          path: LongAfterDark
+
+      - name: Publish the release
+        run: |
+          set -euo pipefail
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          about="Unzip it anywhere and keep the three programs together; README.txt inside says what to do next. The programs are not code-signed yet, so Windows SmartScreen may warn before running them."
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version=${GITHUB_REF_NAME#v}
+            zip="LongAfterDark-$version-x64.zip"
+            zip -qr "$zip" LongAfterDark
+            notes=$(printf '%s\n\nSHA-256 of `%s`: `%s`\n' "$about" "$zip" "$(sha256sum "$zip" | cut -d' ' -f1)")
+            pre=()
+            if [[ "$version" == *-* ]]; then pre=(--prerelease); fi
+            # --notes goes before the generated notes.
+            gh release create "$GITHUB_REF_NAME" "$zip" --verify-tag "${pre[@]}" \
+              --title "Long After Dark $version" --generate-notes --notes "$notes"
+          else
+            tag=latest-main
+            zip=LongAfterDark-x64.zip
+            zip -qr "$zip" LongAfterDark
+            notes=$(printf 'The newest build of main: commit %s, built %s by %s. It is replaced on every push to main.\n\n%s\n\nSHA-256 of `%s`: `%s`\n' \
+              "${GITHUB_SHA:0:7}" "$(date -u '+%Y-%m-%d %H:%M UTC')" "$run_url" "$about" "$zip" "$(sha256sum "$zip" | cut -d' ' -f1)")
+            if gh release view "$tag" >/dev/null 2>&1; then
+              # Move the tag to this commit, then replace the zip and the notes.
+              gh api -X PATCH "repos/$GH_REPO/git/refs/tags/$tag" -f sha="$GITHUB_SHA" -F force=true >/dev/null
+              gh release upload "$tag" "$zip" --clobber
+              gh release edit "$tag" --prerelease --title "Latest main build" --notes "$notes"
+            else
+              gh release create "$tag" "$zip" --target "$GITHUB_SHA" --prerelease --latest=false \
+                --title "Latest main build" --notes "$notes"
+            fi
+          fi

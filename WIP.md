@@ -14,7 +14,7 @@ Every planned stage is **done and verified**: audio, the final QA pass, module i
 2. **Replace your copy in `D:\Temp\LongAfterDark`.** Checked read-only at 01:40: its `LongAfterDark.scr` and `adhostwin.exe` are older than the dist (no interaction fixes); only `adimport.exe` matches. Close its settings window and saver, then copy everything in `build\dist\LongAfterDark` over it.
 3. **Run the by-hand release checklist once** (`scr\README.md`, "By hand, before a release"): right-click Install; Settings… and Preview inside Screen Saver Settings (`/p`); the timeout; a System32 install; unplugging and replugging a monitor, and a resolution change; display power-off; uninstall. No test may do these. **Also listen** to 30 minutes or more of Random: no automated test plays sound.
 4. **Smaller decisions:**
-   - **A release job.** CI builds and uploads the dist, but a `v*` tag no longer makes a GitHub Release (the old job needed the Mac build). A Windows one (zip the dist, `gh release create`) needs your go-ahead, as do an installer and code signing.
+   - **Releases.** Done: CI's release job keeps the `latest-main` pre-release current and makes a release for each `v<version>` tag (`docs\BUILDING.md`, "Conventions"). An installer and code signing still need your go-ahead.
 5. **Old research scripts** (`research\win\bringup\census.py`, `research\win\census.py`, `research\win\ne16_census\*.py`, the `research\win\pkg\*` inventories, `api_surface.py`, `make_catalog.py`) hard-code an out-of-date data-folder path. Use `research\win\qa\census.py` (scratch data only), or give them `AD_ASSETS_DIR` and `AD_LOCALAPPDATA`.
 
 ## Cleanup (done 2026-09-27 07:12)

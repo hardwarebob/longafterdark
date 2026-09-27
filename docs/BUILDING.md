@@ -330,4 +330,8 @@ lives in memory and no user state is read or written. Build trees go to
 * CI (`.github/workflows/build.yml`) runs the same steps on a Windows
   runner: `tools/bootstrap.sh`, `tools/build.sh` with `-LE gui` (tests
   that need imported assets skip themselves), then `tools/package.sh`,
-  and uploads `build/dist/LongAfterDark` as an artifact.
+  and uploads `build/dist/LongAfterDark` as an artifact. Its release job
+  zips that onto a GitHub Release: every push to `main` replaces the
+  `latest-main` pre-release, and a `v<version>` tag makes the release of
+  that version (the tag must match `project(VERSION)` in `CMakeLists.txt`;
+  a `-suffix`, as in `v1.1.0-rc1`, makes it a pre-release).
