@@ -16,9 +16,13 @@ Requirements: 64-bit Windows on an x64 PC. It was developed on Windows 11.
 
 ## The programs
 
-There is no prebuilt download yet. Build it from source as
-[BUILDING.md](BUILDING.md) describes: `bash tools/package.sh` stages these
-files in `build/dist/LongAfterDark/`:
+Download `LongAfterDark-<version>-x64.zip` from the
+[latest release](https://github.com/starrlord/longafterdark/releases/latest)
+and unzip it anywhere. The programs aren't code-signed yet, so Windows may
+warn that they come from an unknown publisher: click **More info**, then
+**Run anyway**. Or build it from source as [BUILDING.md](BUILDING.md)
+describes: `bash tools/package.sh` stages the same files in
+`build/dist/LongAfterDark/`. The zip's folder holds:
 
 - **LongAfterDark.scr**: the screen saver and its settings window.
 - **adhostwin.exe**: the emulator. The screen saver starts one for each

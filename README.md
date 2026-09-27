@@ -56,10 +56,13 @@ know you have the real thing.
 
 ## Getting started
 
-1. **Get the programs.** There is no ready-made download yet, so build Long
-   After Dark from source (see [Building from source](#building-from-source)),
-   or use a build someone gave you. It is three programs, which must stay
-   together in one folder:
+1. **Get the programs.** Download `LongAfterDark-<version>-x64.zip` from the
+   [latest release](https://github.com/starrlord/longafterdark/releases/latest)
+   and unzip it anywhere, or build it from source (see
+   [Building from source](#building-from-source)). The programs aren't
+   code-signed yet, so Windows may warn that they come from an unknown
+   publisher: click **More info**, then **Run anyway**. It is three
+   programs, which must stay together in one folder:
    - `LongAfterDark.scr`: the screen saver and its settings window;
    - `adhostwin.exe`: the emulator that runs the modules;
    - `adimport.exe`: the importer.
@@ -111,7 +114,7 @@ know you have the real thing.
 
 ## Status
 
-Long After Dark is new. It has no installer or signed download yet, and not
+Long After Dark is new. It has no installer or code signing yet, and not
 every module's speed has been compared with the original.
 
 ## Building from source
