@@ -20,7 +20,7 @@ Install Wine and X11 libraries:
 ```bash
 # Ubuntu / Debian
 sudo apt update
-sudo apt install wine64 libx11-6 libxext6
+sudo apt install wine wine64 libx11-6 libxext6
 
 # Fedora
 sudo dnf install wine libX11 libXext

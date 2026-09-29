@@ -20,6 +20,5 @@ cmake -S "$ROOT" -B "$BUILD" -G Ninja \
   -DAD_COMPONENTS="${AD_COMPONENTS:-}" >/dev/null
 cmake --build "$BUILD" "$@"
 if [ -z "${AD_NO_TESTS:-}" ]; then
-  # shellcheck disable=SC2086
-  (cd "$BUILD" && ctest --output-on-failure ${AD_CTEST_ARGS:-})
+  (cd "$BUILD" && eval "ctest --output-on-failure ${AD_CTEST_ARGS:-}")
 fi

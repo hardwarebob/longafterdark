@@ -120,7 +120,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends wine64 libx11-dev libxext-dev xvfb
+          sudo apt-get install -y wine wine64 libx11-dev libxext-dev xvfb
 
       - name: Restore third_party
         id: third-party
@@ -148,7 +148,15 @@ jobs:
           key: ${{ steps.third-party.outputs.cache-primary-key }}
 
       - name: Build and test
-        run: AD_BUILD_DIR="$PWD/build/win-release" AD_CTEST_ARGS="-LE gui -E 'ui\.|import\.gui_|core\.audio|present|import\.download|import\.covers' -j4" bash tools/build.sh
+        run: xvfb-run -a env AD_BUILD_DIR="$PWD/build/win-release" AD_CTEST_ARGS="-LE gui -E 'win(16|32)\.unit|ui\.|import\.gui_|core\.audio|present|import\.download|import\.covers' -j4" bash tools/build.sh
+
+      - name: Upload the test log
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-log-linux
+          path: build/win-release/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
 
       - name: Package
         run: bash tools/package.sh

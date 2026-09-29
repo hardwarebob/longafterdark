@@ -124,7 +124,7 @@ You need [CMake](https://cmake.org/) 3.24 or later. Everything else, the compile
 included, is downloaded into `third_party/` and nothing is installed
 system-wide.
 - **On Windows**: Git for Windows (Git Bash).
-- **On Linux**: bash, g++, and X11 development libraries (`sudo apt install wine64 libx11-dev libxext-dev`).
+- **On Linux**: bash, g++, and X11 development libraries (`sudo apt install wine wine64 libx11-dev libxext-dev`).
 
 From the repository folder:
 

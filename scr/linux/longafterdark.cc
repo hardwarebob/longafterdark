@@ -66,6 +66,18 @@ pid_t g_child_pid = 0;
 
 void sig_handler(int) {
   g_shutdown.store(true);
+  if (g_child_pid > 0) {
+    kill(g_child_pid, SIGTERM);
+  }
+}
+
+std::string find_wine_bin() {
+  const char* env_wine = getenv("AD_WINE_BIN");
+  if (env_wine && *env_wine) return env_wine;
+  if (system("which wine >/dev/null 2>&1") == 0) return "wine";
+  if (system("which wine64 >/dev/null 2>&1") == 0) return "wine64";
+  if (fs::exists("/usr/lib/wine/wine64")) return "/usr/lib/wine/wine64";
+  return "wine";
 }
 
 // Convert X11 KeySym to Windows Virtual-Key code for After Dark games
@@ -324,14 +336,17 @@ int main(int argc, char** argv) {
     }
   }
 
+  std::string wine_bin = find_wine_bin();
+
   // Handle --import forwarding
   if (run_import) {
     fs::path adimport = find_adimport_exe(exe_dir);
-    std::vector<const char*> cmd = {"wine", adimport.c_str()};
+    std::string adimport_str = adimport.string();
+    std::vector<const char*> cmd = {wine_bin.c_str(), adimport_str.c_str()};
     for (const auto& a : import_args) cmd.push_back(a.c_str());
     cmd.push_back(nullptr);
-    execvp("wine", const_cast<char* const*>(cmd.data()));
-    std::cerr << "longafterdark: failed to execute wine " << adimport << "\n";
+    execvp(wine_bin.c_str(), const_cast<char* const*>(cmd.data()));
+    std::cerr << "longafterdark: failed to execute " << wine_bin << " " << adimport << "\n";
     return 1;
   }
 
@@ -360,9 +375,9 @@ int main(int argc, char** argv) {
   }
 
   // Check if Wine is installed
-  if (system("which wine >/dev/null 2>&1") != 0) {
+  if (system((wine_bin + " --version >/dev/null 2>&1").c_str()) != 0) {
     std::cerr << "Error: 'wine' is required to run After Dark modules on Linux.\n"
-              << "Please install Wine (e.g. 'sudo apt install wine64' or 'sudo pacman -S wine').\n";
+              << "Please install Wine (e.g. 'sudo apt install wine wine64' or 'sudo pacman -S wine').\n";
     return 1;
   }
 
@@ -469,6 +484,7 @@ int main(int argc, char** argv) {
 #ifdef HAS_XSHM
   bool use_xshm = XShmQueryExtension(display);
   XShmSegmentInfo shminfo{};
+  static bool s_xshm_error = false;
 #else
   bool use_xshm = false;
 #endif
@@ -484,7 +500,6 @@ int main(int argc, char** argv) {
         XShmDetach(display, &shminfo);
         XDestroyImage(ximage);
         shmdt(shminfo.shmaddr);
-        shmctl(shminfo.shmid, IPC_RMID, nullptr);
       } else
 #endif
       {
@@ -498,13 +513,40 @@ int main(int argc, char** argv) {
 
 #ifdef HAS_XSHM
     if (use_xshm) {
+      s_xshm_error = false;
+      auto old_handler = XSetErrorHandler([](Display*, XErrorEvent*) -> int {
+        s_xshm_error = true;
+        return 0;
+      });
       ximage = XShmCreateImage(display, visual, depth, ZPixmap, nullptr, &shminfo, img_w, img_h);
-      shminfo.shmid = shmget(IPC_PRIVATE, ximage->bytes_per_line * ximage->height, IPC_CREAT | 0777);
-      shminfo.shmaddr = ximage->data = (char*)shmat(shminfo.shmid, 0, 0);
-      shminfo.readOnly = False;
-      XShmAttach(display, &shminfo);
-      XSync(display, False);
-    } else
+      if (ximage) {
+        shminfo.shmid = shmget(IPC_PRIVATE, ximage->bytes_per_line * ximage->height, IPC_CREAT | 0777);
+        if (shminfo.shmid != -1) {
+          shminfo.shmaddr = ximage->data = (char*)shmat(shminfo.shmid, 0, 0);
+          if (shminfo.shmaddr != (char*)-1) {
+            shminfo.readOnly = False;
+            XShmAttach(display, &shminfo);
+            XSync(display, False);
+            shmctl(shminfo.shmid, IPC_RMID, nullptr);
+          } else {
+            s_xshm_error = true;
+          }
+        } else {
+          s_xshm_error = true;
+        }
+      } else {
+        s_xshm_error = true;
+      }
+      XSetErrorHandler(old_handler);
+      if (s_xshm_error) {
+        if (ximage) {
+          XDestroyImage(ximage);
+          ximage = nullptr;
+        }
+        use_xshm = false;
+      }
+    }
+    if (!use_xshm)
 #endif
     {
       char* data = (char*)malloc(img_w * img_h * 4);
@@ -563,7 +605,7 @@ int main(int argc, char** argv) {
       }
 
       std::string host_str = adhost.string();
-      std::vector<const char*> c_args = {"wine", host_str.c_str()};
+      std::vector<const char*> c_args = {wine_bin.c_str(), host_str.c_str()};
       if (current_module != "--test-pattern") {
         c_args.push_back(current_module.c_str());
       } else {
@@ -571,7 +613,7 @@ int main(int argc, char** argv) {
       }
       c_args.push_back(nullptr);
 
-      execvp("wine", const_cast<char* const*>(c_args.data()));
+      execvp(wine_bin.c_str(), const_cast<char* const*>(c_args.data()));
       _exit(127);
     }
 
@@ -585,7 +627,8 @@ int main(int argc, char** argv) {
     auto send_command = [&](const std::string& cmd) {
       if (host_stdin_fd >= 0) {
         std::string line = cmd + "\n";
-        (void)write(host_stdin_fd, line.data(), line.size());
+        ssize_t written = write(host_stdin_fd, line.data(), line.size());
+        (void)written;
       }
     };
 
@@ -806,7 +849,22 @@ int main(int argc, char** argv) {
     close(host_stdout_fd);
 
     int status = 0;
-    waitpid(pid, &status, 0);
+    bool reaped = false;
+    for (int w = 0; w < 20; ++w) {
+      if (waitpid(pid, &status, WNOHANG) == pid) {
+        reaped = true;
+        break;
+      }
+      usleep(25000); // 25ms
+    }
+    if (!reaped) {
+      kill(pid, SIGTERM);
+      usleep(50000);
+      if (waitpid(pid, &status, WNOHANG) != pid) {
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+      }
+    }
     g_child_pid = 0;
   }
 
