@@ -1,7 +1,7 @@
 # Long After Dark
 
 The original After Dark screen savers, Flying Toasters and all, running on
-today's Windows.
+today's Windows and Linux.
 
 ![The Long After Dark settings window in dark mode: box covers of four After Dark releases across the top, the module list on the left, and Flying Toasters! in the live preview](docs/images/settings.png)
 
