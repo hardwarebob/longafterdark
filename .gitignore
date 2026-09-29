@@ -17,3 +17,5 @@ third_party/
 # --- local editor and agent state ---
 .vscode/
 .kilo/
+# The working status notes (local only).
+/WIP.md
