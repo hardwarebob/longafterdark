@@ -38,8 +38,9 @@ them; each works on its own.
 
 ## What you need
 
-- **A 64-bit Windows PC** with an x64 (Intel or AMD) processor. Long After
-  Dark is developed on Windows 11.
+- **A 64-bit Windows or Linux PC** with an x64 (Intel or AMD) processor.
+  On Linux, 64-bit Wine and X11 libraries are required to run the original modules
+  (see [docs/LINUX.md](docs/LINUX.md)).
 - **After Dark itself.** It isn't included, and you're responsible for
   sourcing it legally. The importer copies it from any of these:
   - your After Dark CD, or a folder copied from it;
@@ -119,21 +120,27 @@ every module's speed has been compared with the original.
 
 ## Building from source
 
-You need [Git for Windows](https://gitforwindows.org/) (for Git Bash) and
-[CMake](https://cmake.org/) 3.24 or later. Everything else, the compiler
+You need [CMake](https://cmake.org/) 3.24 or later. Everything else, the compiler
 included, is downloaded into `third_party/` and nothing is installed
-system-wide. In Git Bash, from the repository folder:
+system-wide.
+- **On Windows**: Git for Windows (Git Bash).
+- **On Linux**: bash, g++, and X11 development libraries (`sudo apt install wine64 libx11-dev libxext-dev`).
+
+From the repository folder:
 
 ```bash
 bash tools/bootstrap.sh   # once: fetches the compiler and libraries into third_party/
-bash tools/package.sh     # builds the three programs into build/dist/LongAfterDark/
+bash tools/package.sh     # builds the programs into build/dist/LongAfterDark/
 ```
 
 [docs/BUILDING.md](docs/BUILDING.md) covers the rest: how the pieces fit
 together, the tests, and running a module without the screen saver.
+For Linux-specific instructions, see [docs/LINUX.md](docs/LINUX.md).
 
 ## Documentation
 
+- [docs/LINUX.md](docs/LINUX.md): running and configuring Long After Dark on Linux
+  (standalone player and XScreenSaver integration).
 - [docs/INSTALL.md](docs/INSTALL.md): installing and using Long After Dark
   in detail, including the importer's command line.
 - [docs/BUILDING.md](docs/BUILDING.md): building, testing and the source

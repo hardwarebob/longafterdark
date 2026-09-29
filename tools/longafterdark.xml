@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+
+<screensaver name="longafterdark" _label="Long After Dark">
+
+  <command arg="-root"/>
+
+  <video href="https://github.com/hardwarebob/longafterdark"/>
+
+  <number id="cycle" type="spinbutton" low="10" high="3600"
+          _label="Rotate interval (seconds)" default="300"
+          arg="--cycle %"/>
+
+  <boolean id="random" _label="Random module"
+           arg-set="-r"/>
+
+  <boolean id="sound" _label="Sound effects"
+           arg-unset="--no-sound"/>
+
+  <_description>
+Long After Dark brings back the original Berkeley Systems After Dark
+screen savers from the 1990s (Flying Toasters, Boris, Simpsons, and more),
+running original modules under x86 emulation on modern Linux.
+
+Caps Lock starts interactive games (e.g. Rodger Dodger, Trivia).
+
+https://github.com/hardwarebob/longafterdark
+  </_description>
+</screensaver>

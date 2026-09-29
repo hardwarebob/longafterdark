@@ -1,6 +1,7 @@
 # --- build products (tools/build.sh, tools/package.sh) ---
 .DS_Store
 build/
+scr/linux/longafterdark
 
 # Imported / extracted original assets:
 assets/

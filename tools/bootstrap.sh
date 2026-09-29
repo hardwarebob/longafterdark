@@ -30,9 +30,30 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # NAME=value lines; tolerate a CRLF checkout.
 eval "$(tr -d '\r' < "$ROOT/tools/versions" | grep -E '^[A-Z0-9_]+=[^ ]*$')"
-for v in LLVM_MINGW_VER LLVM_MINGW_SHA256 NINJA_VER NINJA_SHA256 ZLIB_REV PHOSG_REV; do
-  [ -n "${!v:-}" ] || { echo "bootstrap: $v is not set in tools/versions" >&2; exit 1; }
-done
+UNAME_S="$(uname -s)"
+if [ "$UNAME_S" = "Linux" ]; then
+  IS_LINUX=1
+  for v in LLVM_MINGW_VER LLVM_MINGW_LINUX_SHA256 NINJA_VER NINJA_LINUX_SHA256 ZLIB_REV PHOSG_REV; do
+    [ -n "${!v:-}" ] || { echo "bootstrap: $v is not set in tools/versions" >&2; exit 1; }
+  done
+  LLVM_ARCHIVE="llvm-mingw-$LLVM_MINGW_VER-ucrt-ubuntu-22.04-x86_64.tar.xz"
+  LLVM_ARCHIVE_SHA="$LLVM_MINGW_LINUX_SHA256"
+  LLVM_INNER="llvm-mingw-$LLVM_MINGW_VER-ucrt-ubuntu-22.04-x86_64"
+  NINJA_ARCHIVE="ninja-linux.zip"
+  NINJA_ARCHIVE_SHA="$NINJA_LINUX_SHA256"
+  EXE_SUFFIX=""
+else
+  IS_LINUX=0
+  for v in LLVM_MINGW_VER LLVM_MINGW_SHA256 NINJA_VER NINJA_SHA256 ZLIB_REV PHOSG_REV; do
+    [ -n "${!v:-}" ] || { echo "bootstrap: $v is not set in tools/versions" >&2; exit 1; }
+  done
+  LLVM_ARCHIVE="llvm-mingw-$LLVM_MINGW_VER-ucrt-x86_64.zip"
+  LLVM_ARCHIVE_SHA="$LLVM_MINGW_SHA256"
+  LLVM_INNER="llvm-mingw-$LLVM_MINGW_VER-ucrt-x86_64"
+  NINJA_ARCHIVE="ninja-win.zip"
+  NINJA_ARCHIVE_SHA="$NINJA_SHA256"
+  EXE_SUFFIX=".exe"
+fi
 
 TP="$ROOT/third_party"
 TC="$TP/toolchains"
@@ -41,7 +62,6 @@ mkdir -p "$TC" "$WD"
 
 LLVM_NAME="llvm-mingw-$LLVM_MINGW_VER-ucrt-x86_64"
 LLVM_DIR="$TC/$LLVM_NAME"
-LLVM_ZIP="$LLVM_NAME.zip"
 
 die() { echo "bootstrap: $*" >&2; exit 1; }
 sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
@@ -95,23 +115,29 @@ adopt_if_whole() {  # adopt_if_whole <zip> <sha256> <dir> [<folder inside the zi
   local zip="$1" sha="$2" dir="$3" inner="${4:-}"
   [ -d "$dir" ] && [ ! -e "$dir/.bootstrap-complete" ] && [ -f "$zip" ] || return 1
   [ "$(sha256_of "$zip")" = "$sha" ] || return 1
-  if [ -z "$(LC_ALL=C comm -23 <(zip_listing "$zip" "$inner") <(dir_listing "$dir") | head -1)" ]; then
-    echo "$sha" > "$dir/.bootstrap-complete"
-    echo "bootstrap: $(basename "$dir") is complete; marked it"
-    return 0
+  if [[ "$zip" == *.zip ]]; then
+    if [ -z "$(LC_ALL=C comm -23 <(zip_listing "$zip" "$inner") <(dir_listing "$dir") | head -1)" ]; then
+      echo "$sha" > "$dir/.bootstrap-complete"
+      echo "bootstrap: $(basename "$dir") is complete; marked it"
+      return 0
+    fi
   fi
   echo "bootstrap: $(basename "$dir") is incomplete; unpacking it again" >&2
   return 1
 }
 
-install_unpacked() {  # install_unpacked <zip> <sha256> <final dir> [<folder inside the zip>]
-  local zip="$1" sha="$2" final="$3" inner="${4:-}"
+install_unpacked() {  # install_unpacked <archive> <sha256> <final dir> [<folder inside the archive>]
+  local archive="$1" sha="$2" final="$3" inner="${4:-}"
   local tmp="$final.unpack-$$" old="$final.old-$$"
   rm -rf "$tmp"
   mkdir -p "$tmp"
-  unzip -q "$zip" -d "$tmp" || { rm -rf "$tmp"; die "cannot unpack $zip"; }
+  if [[ "$archive" == *.tar.xz ]]; then
+    tar -xf "$archive" -C "$tmp" || { rm -rf "$tmp"; die "cannot unpack $archive"; }
+  else
+    unzip -q "$archive" -d "$tmp" || { rm -rf "$tmp"; die "cannot unpack $archive"; }
+  fi
   local src="$tmp${inner:+/$inner}"
-  [ -d "$src" ] || { rm -rf "$tmp"; die "$zip has no $inner folder"; }
+  [ -d "$src" ] || { rm -rf "$tmp"; die "$archive has no $inner folder"; }
   echo "$sha" > "$src/.bootstrap-complete"
   if [ -e "$final" ]; then
     mv "$final" "$old" || { rm -rf "$tmp"; die "cannot replace $final (is a build using it?)"; }
@@ -120,29 +146,42 @@ install_unpacked() {  # install_unpacked <zip> <sha256> <final dir> [<folder ins
   rm -rf "$tmp" "$old"
 }
 
-if ! complete "$LLVM_DIR" "$LLVM_MINGW_SHA256" &&
-   ! adopt_if_whole "$TC/$LLVM_ZIP" "$LLVM_MINGW_SHA256" "$LLVM_DIR" "$LLVM_NAME"; then
-  fetch "$LLVM_ZIP" "https://github.com/mstorsjo/llvm-mingw/releases/download/$LLVM_MINGW_VER/$LLVM_ZIP" "$TC" \
-    "$LLVM_MINGW_SHA256"
-  echo "bootstrap: unpacking $LLVM_ZIP"
-  install_unpacked "$TC/$LLVM_ZIP" "$LLVM_MINGW_SHA256" "$LLVM_DIR" "$LLVM_NAME"
+if ! complete "$LLVM_DIR" "$LLVM_ARCHIVE_SHA" &&
+   ! adopt_if_whole "$TC/$LLVM_ARCHIVE" "$LLVM_ARCHIVE_SHA" "$LLVM_DIR" "$LLVM_INNER"; then
+  fetch "$LLVM_ARCHIVE" "https://github.com/mstorsjo/llvm-mingw/releases/download/$LLVM_MINGW_VER/$LLVM_ARCHIVE" "$TC" \
+    "$LLVM_ARCHIVE_SHA"
+  echo "bootstrap: unpacking $LLVM_ARCHIVE"
+  install_unpacked "$TC/$LLVM_ARCHIVE" "$LLVM_ARCHIVE_SHA" "$LLVM_DIR" "$LLVM_INNER"
 fi
-if ! complete "$TC/ninja" "$NINJA_SHA256" && ! adopt_if_whole "$TC/ninja-win.zip" "$NINJA_SHA256" "$TC/ninja"; then
-  fetch ninja-win.zip "https://github.com/ninja-build/ninja/releases/download/$NINJA_VER/ninja-win.zip" "$TC" \
-    "$NINJA_SHA256"
-  install_unpacked "$TC/ninja-win.zip" "$NINJA_SHA256" "$TC/ninja"
+
+if ! complete "$TC/ninja" "$NINJA_ARCHIVE_SHA" && ! adopt_if_whole "$TC/$NINJA_ARCHIVE" "$NINJA_ARCHIVE_SHA" "$TC/ninja"; then
+  fetch "$NINJA_ARCHIVE" "https://github.com/ninja-build/ninja/releases/download/$NINJA_VER/$NINJA_ARCHIVE" "$TC" \
+    "$NINJA_ARCHIVE_SHA"
+  mkdir -p "$TC/ninja.unpack-$$"
+  unzip -q -o "$TC/$NINJA_ARCHIVE" -d "$TC/ninja.unpack-$$"
+  chmod +x "$TC/ninja.unpack-$$/ninja"* 2>/dev/null || true
+  echo "$NINJA_ARCHIVE_SHA" > "$TC/ninja.unpack-$$/.bootstrap-complete"
+  rm -rf "$TC/ninja"
+  mv "$TC/ninja.unpack-$$" "$TC/ninja"
 fi
-[ -x "$LLVM_DIR/bin/clang++.exe" ] || die "$LLVM_DIR/bin/clang++.exe is missing after unpacking"
-[ -x "$TC/ninja/ninja.exe" ] || die "$TC/ninja/ninja.exe is missing after unpacking"
+
+[ -x "$LLVM_DIR/bin/clang++$EXE_SUFFIX" ] || die "$LLVM_DIR/bin/clang++$EXE_SUFFIX is missing after unpacking"
+[ -x "$TC/ninja/ninja$EXE_SUFFIX" ] || die "$TC/ninja/ninja$EXE_SUFFIX is missing after unpacking"
 for other in "$TC"/llvm-mingw-*-ucrt-x86_64; do
   if [ -d "$other" ] && [ "$other" != "$LLVM_DIR" ]; then
     echo "bootstrap: note: $(basename "$other") is no longer used (the build takes $LLVM_NAME); it can be deleted"
   fi
 done
 
-export PATH="$LLVM_DIR/bin:$TC/ninja:/c/Program Files/CMake/bin:$PATH"
-LOCAL="$WD/local"
-LOCAL_M="$(cygpath -m "$LOCAL")"
+if [ "$IS_LINUX" -eq 1 ]; then
+  export PATH="$LLVM_DIR/bin:$TC/ninja:$PATH"
+  LOCAL="$WD/local"
+  LOCAL_M="$LOCAL"
+else
+  export PATH="$LLVM_DIR/bin:$TC/ninja:/c/Program Files/CMake/bin:$PATH"
+  LOCAL="$WD/local"
+  LOCAL_M="$(cygpath -m "$LOCAL")"
+fi
 DEPS_STAMP="$LOCAL/.bootstrap-deps"
 DEPS_WANT="llvm-mingw=$LLVM_MINGW_VER zlib=$ZLIB_REV phosg=$PHOSG_REV"
 
@@ -162,7 +201,10 @@ if [ "$(cat "$DEPS_STAMP" 2>/dev/null)" != "$DEPS_WANT" ] || [ ! -f "$LOCAL/lib/
 
   clone_at https://github.com/madler/zlib "$WD/zlib" "$ZLIB_REV"
   cmake -S "$WD/zlib" -B "$WD/build-zlib" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_C_COMPILER=clang -DCMAKE_INSTALL_PREFIX="$LOCAL_M" \
+    -DCMAKE_SYSTEM_NAME=Windows \
+    -DCMAKE_C_COMPILER="$LLVM_DIR/bin/x86_64-w64-mingw32-clang$EXE_SUFFIX" \
+    -DCMAKE_RC_COMPILER="$LLVM_DIR/bin/x86_64-w64-mingw32-windres$EXE_SUFFIX" \
+    -DCMAKE_INSTALL_PREFIX="$LOCAL_M" \
     -DZLIB_BUILD_TESTING=OFF -DZLIB_BUILD_SHARED=OFF >/dev/null
   cmake --build "$WD/build-zlib" >/dev/null
   cmake --install "$WD/build-zlib" >/dev/null
@@ -170,7 +212,10 @@ if [ "$(cat "$DEPS_STAMP" 2>/dev/null)" != "$DEPS_WANT" ] || [ ! -f "$LOCAL/lib/
 
   clone_at https://github.com/fuzziqersoftware/phosg "$WD/phosg" "$PHOSG_REV"
   cmake -S "$WD/phosg" -B "$WD/build-phosg" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+    -DCMAKE_SYSTEM_NAME=Windows \
+    -DCMAKE_C_COMPILER="$LLVM_DIR/bin/x86_64-w64-mingw32-clang$EXE_SUFFIX" \
+    -DCMAKE_CXX_COMPILER="$LLVM_DIR/bin/x86_64-w64-mingw32-clang++$EXE_SUFFIX" \
+    -DCMAKE_RC_COMPILER="$LLVM_DIR/bin/x86_64-w64-mingw32-windres$EXE_SUFFIX" \
     -DCMAKE_INSTALL_PREFIX="$LOCAL_M" -DCMAKE_PREFIX_PATH="$LOCAL_M" >/dev/null
   # Build everything: phosg's install rules also copy its small CLI tools.
   cmake --build "$WD/build-phosg" >/dev/null
@@ -181,4 +226,4 @@ fi
 
 echo "toolchain: $LLVM_DIR"
 echo "deps:      $LOCAL ($DEPS_WANT)"
-clang++ --version | head -1
+"$LLVM_DIR/bin/clang++$EXE_SUFFIX" --version | head -1

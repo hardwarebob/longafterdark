@@ -109,7 +109,57 @@ jobs:
           path: build/dist/LongAfterDark
           if-no-files-found: error
 
-  # The build job's dist, zipped, on a GitHub Release:
+  build-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      ADAUDIOLIVE: '0'
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends wine64 libx11-dev libxext-dev xvfb
+
+      - name: Restore third_party
+        id: third-party
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            third_party
+            !third_party/toolchains/*.tar.xz
+            !third_party/toolchains/*.zip
+            !third_party/win/build-*
+          key: third-party-linux-${{ hashFiles('tools/versions') }}-v1
+
+      - name: Bootstrap (toolchain, zlib, phosg)
+        run: bash tools/bootstrap.sh
+
+      - name: Save third_party
+        if: steps.third-party.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            third_party
+            !third_party/toolchains/*.tar.xz
+            !third_party/toolchains/*.zip
+            !third_party/win/build-*
+          key: ${{ steps.third-party.outputs.cache-primary-key }}
+
+      - name: Build and test
+        run: AD_BUILD_DIR="$PWD/build/win-release" AD_CTEST_ARGS="-LE gui -E 'ui\.|import\.gui_|core\.audio|present|import\.download|import\.covers' -j4" bash tools/build.sh
+
+      - name: Package
+        run: bash tools/package.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: LongAfterDark-Linux
+          path: build/dist/LongAfterDark
+          if-no-files-found: error
+
+  # The build jobs' dists, zipped, on a GitHub Release:
   #   a v* tag  the release of that name, "Long After Dark <version>", with
   #             LongAfterDark-<version>-x64.zip and generated notes; a tag
   #             with a -suffix (v1.2.0-rc1) is a pre-release.
@@ -118,7 +168,7 @@ jobs:
   #             at the same URL. A pre-release is never marked Latest.
   # Only zips and uploads, so it runs on Linux.
   release:
-    needs: build
+    needs: [build, build-linux]
     if: startsWith(github.ref, 'refs/tags/v') || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request')
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -133,6 +183,11 @@ jobs:
           name: LongAfterDark-x64
           path: LongAfterDark
 
+      - uses: actions/download-artifact@v8
+        with:
+          name: LongAfterDark-Linux
+          path: LongAfterDark-Linux
+
       - name: Publish the release
         run: |
           set -euo pipefail
@@ -140,27 +195,35 @@ jobs:
           about="Unzip it anywhere and keep the three programs together; README.txt inside says what to do next. The programs are not code-signed yet, so Windows SmartScreen may warn before running them."
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             version=${GITHUB_REF_NAME#v}
-            zip="LongAfterDark-$version-x64.zip"
-            zip -qr "$zip" LongAfterDark
-            notes=$(printf '%s\n\nSHA-256 of `%s`: `%s`\n' "$about" "$zip" "$(sha256sum "$zip" | cut -d' ' -f1)")
+            zip_win="LongAfterDark-$version-x64.zip"
+            zip -qr "$zip_win" LongAfterDark
+            zip_linux="LongAfterDark-$version-Linux.zip"
+            zip -qr "$zip_linux" LongAfterDark-Linux
+            notes=$(printf '%s\n\nSHA-256 of `%s`: `%s`\nSHA-256 of `%s`: `%s`\n' \
+              "$about" "$zip_win" "$(sha256sum "$zip_win" | cut -d' ' -f1)" \
+              "$zip_linux" "$(sha256sum "$zip_linux" | cut -d' ' -f1)")
             pre=()
             if [[ "$version" == *-* ]]; then pre=(--prerelease); fi
             # --notes goes before the generated notes.
-            gh release create "$GITHUB_REF_NAME" "$zip" --verify-tag "${pre[@]}" \
+            gh release create "$GITHUB_REF_NAME" "$zip_win" "$zip_linux" --verify-tag "${pre[@]}" \
               --title "Long After Dark $version" --generate-notes --notes "$notes"
           else
             tag=latest-main
-            zip=LongAfterDark-x64.zip
-            zip -qr "$zip" LongAfterDark
-            notes=$(printf 'The newest build of main: commit %s, built %s by %s. It is replaced on every push to main.\n\n%s\n\nSHA-256 of `%s`: `%s`\n' \
-              "${GITHUB_SHA:0:7}" "$(date -u '+%Y-%m-%d %H:%M UTC')" "$run_url" "$about" "$zip" "$(sha256sum "$zip" | cut -d' ' -f1)")
+            zip_win=LongAfterDark-x64.zip
+            zip -qr "$zip_win" LongAfterDark
+            zip_linux=LongAfterDark-Linux.zip
+            zip -qr "$zip_linux" LongAfterDark-Linux
+            notes=$(printf 'The newest build of main: commit %s, built %s by %s. It is replaced on every push to main.\n\n%s\n\nSHA-256 of `%s`: `%s`\nSHA-256 of `%s`: `%s`\n' \
+              "${GITHUB_SHA:0:7}" "$(date -u '+%Y-%m-%d %H:%M UTC')" "$run_url" "$about" \
+              "$zip_win" "$(sha256sum "$zip_win" | cut -d' ' -f1)" \
+              "$zip_linux" "$(sha256sum "$zip_linux" | cut -d' ' -f1)")
             if gh release view "$tag" >/dev/null 2>&1; then
-              # Move the tag to this commit, then replace the zip and the notes.
+              # Move the tag to this commit, then replace the zips and the notes.
               gh api -X PATCH "repos/$GH_REPO/git/refs/tags/$tag" -f sha="$GITHUB_SHA" -F force=true >/dev/null
-              gh release upload "$tag" "$zip" --clobber
+              gh release upload "$tag" "$zip_win" "$zip_linux" --clobber
               gh release edit "$tag" --prerelease --title "Latest main build" --notes "$notes"
             else
-              gh release create "$tag" "$zip" --target "$GITHUB_SHA" --prerelease --latest=false \
+              gh release create "$tag" "$zip_win" "$zip_linux" --target "$GITHUB_SHA" --prerelease --latest=false \
                 --title "Latest main build" --notes "$notes"
             fi
           fi

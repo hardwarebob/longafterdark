@@ -8,7 +8,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD="${AD_BUILD_DIR:-$ROOT/build/win}"
 TC="$ROOT/third_party/toolchains"
-export PATH="$TC/ninja:/c/Program Files/CMake/bin:$PATH"
+if [ "$(uname -s)" = "Linux" ]; then
+  export PATH="$TC/ninja:$PATH"
+else
+  export PATH="$TC/ninja:/c/Program Files/CMake/bin:$PATH"
+fi
 
 cmake -S "$ROOT" -B "$BUILD" -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE="$ROOT/cmake/llvm-mingw.cmake" \

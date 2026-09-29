@@ -38,6 +38,18 @@ mkdir -p "$DIST/licenses"
 cp "$SCR" "$DIST/LongAfterDark.scr"
 cp "$BUILD/host/core/adhostwin.exe" "$BUILD/importer/adimport.exe" "$DIST/"
 
+# If building on Linux and g++ is available, compile and stage the native Linux runner
+if [ "$(uname -s)" = "Linux" ] && command -v g++ >/dev/null 2>&1; then
+  echo "package.sh: compiling native Linux runner (scr/linux/longafterdark)"
+  g++ -O2 -std=c++20 -DHAS_XSHM "$ROOT/scr/linux/longafterdark.cc" "$ROOT/importer/minijson.cc" \
+    -lX11 -lXext -o "$DIST/longafterdark"
+  chmod +x "$DIST/longafterdark"
+  cp "$ROOT/tools/longafterdark.xml" "$DIST/longafterdark.xml"
+  if [ -f "$ROOT/docs/LINUX.md" ]; then
+    cp "$ROOT/docs/LINUX.md" "$DIST/README-LINUX.md"
+  fi
+fi
+
 # Windows line endings for Notepad on older systems: every text file staged.
 crlf() { sed -i 's/\r*$/\r/' "$@"; }
 
