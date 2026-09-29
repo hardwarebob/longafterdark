@@ -1,6 +1,7 @@
 // Name rules shared by every importer source (internal header): ASCII case
-// mapping and comparison, and the check every name must pass before it
-// becomes a path component under a staging directory.
+// mapping and comparison, the key under which Windows takes two names for
+// one file, and the check every name must pass before it becomes a path
+// component under a staging directory.
 //
 // Every source is untrusted input. A Joliet name such as "..\..\x.dll", a
 // ZIP member "C:EVIL.AD", a FAT entry "CON" — none of them may write outside
@@ -12,6 +13,7 @@
 #include <string_view>
 
 #include "status.h"
+#include "winutil.h"
 
 namespace adw::import {
 
@@ -40,6 +42,27 @@ inline bool iequals(std::string_view a, std::string_view b) {
 
 inline bool ends_with_i(std::string_view s, std::string_view suffix) {
   return s.size() >= suffix.size() && iequals(s.substr(s.size() - suffix.size()), suffix);
+}
+
+// The key two names (UTF-8, as the importer writes them through to_wide)
+// share exactly when Windows takes them for one file: every letter upper-cased
+// by the operating system's own table, the one CompareStringOrdinal's ignore
+// case and the file system use — so code page 437's letters fold as ASCII's
+// do (u-umlaut and U-umlaut, e-acute and E-acute, sigma and Sigma), where
+// ascii_upper would keep them apart and the second file could not be created.
+// Every set of names that must stay apart on disk (archive members, planned
+// files) is keyed by it; paths are still spelt with ascii_upper.
+inline std::string name_key(std::string_view name) {
+  std::wstring w = to_wide(name);
+  if (w.empty()) return {};
+  // Not LCMAP_LINGUISTIC_CASING: the file system's simple case mapping, one
+  // UTF-16 unit for one.
+  std::wstring up(w.size(), L'\0');
+  int n = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_UPPERCASE, w.data(), int(w.size()), up.data(), int(up.size()),
+                        nullptr, nullptr, 0);
+  if (n <= 0) return ascii_upper(std::string(name));
+  up.resize(size_t(n));
+  return to_utf8(up);
 }
 
 // DOS device names ("CON", "NUL.AD", "COM1", …), with or without extension.

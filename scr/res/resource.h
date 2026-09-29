@@ -39,7 +39,7 @@
 #define IDC_CREDITS         1025
 #define IDC_SCALE_LABEL     1026
 #define IDC_MONITORS_LABEL  1027
-#define IDC_WELCOME_IMPORT  1028   // "Import After Dark…" in the not-imported welcome
+#define IDC_WELCOME_IMPORT  1028   // "Import a release…" in the not-imported welcome
 // The box-cover strip (COVERS.md §1.5): a container (first in the tab order)
 // holding one toggle button per installed release, IDC_COVER_TILE_BASE +
 // its index in the catalog's packages[] (the check state is the selection),
@@ -61,6 +61,9 @@
 #define IDC_VOLUME          1039   // msctls_trackbar32, 0..100, page 10; accessible name "Volume"
 #define IDC_VOLUME_VALUE    1040
 #define IDC_SOUND_NOTE      1041
+// The footer's credit (ui_model.h: layout_footer_credit): "Made With Love by
+// StarrLord", one link that opens the project's page in the browser.
+#define IDC_FOOTER_CREDIT   1042
 #define IDC_COVER_TILE_BASE 3000
 
 // Runtime-built controls in the module-settings panel: one block of IDs per

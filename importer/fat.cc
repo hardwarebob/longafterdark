@@ -27,26 +27,28 @@ std::string dos_name(const uint8_t* raw) {
     return std::string(reinterpret_cast<const char*>(n + from), size_t(end - from));
   };
   std::string base = part(0, 8), ext = part(8, 3);
-  std::string oem = ext.empty() ? base : base + "." + ext;
-  bool ascii = std::all_of(oem.begin(), oem.end(), [](char c) { return uint8_t(c) < 0x80; });
-  std::string out;
-  if (ascii) {
-    out = oem;
-  } else {
-    int w = MultiByteToWideChar(437, 0, oem.data(), int(oem.size()), nullptr, 0);
-    std::wstring ws(size_t(w), L'\0');
-    MultiByteToWideChar(437, 0, oem.data(), int(oem.size()), ws.data(), w);
-    out = to_utf8(ws);
-  }
+  std::string out = oem437_to_utf8(ext.empty() ? base : base + "." + ext);
   for (char& c : out)
     if (c >= 'a' && c <= 'z') c = char(c - 'a' + 'A');
   return out;
+}
+
+// A volume label (the root's label entry: eleven characters, space padded,
+// code page 437, a leading 0xE5 escaped as in a name) as UTF-8, its case kept.
+std::string dos_label(const uint8_t* raw) {
+  uint8_t n[11];
+  memcpy(n, raw, 11);
+  if (n[0] == 0x05) n[0] = 0xE5;
+  size_t end = 11;
+  while (end > 0 && n[end - 1] == ' ') end--;
+  return oem437_to_utf8(std::string(reinterpret_cast<const char*>(n), end));
 }
 
 }  // namespace
 
 struct FatImage::Impl {
   Handle file;
+  std::shared_ptr<const std::vector<uint8_t>> mem;  // an image in memory (no file)
   uint64_t size = 0;
   uint32_t bps = 0, spc = 0, reserved = 0, fats = 0, root_entries = 0, total_sectors = 0, spf = 0;
   uint8_t media_byte = 0;
@@ -58,6 +60,10 @@ struct FatImage::Impl {
 
   void read_at(uint64_t off, void* buf, size_t n) const {
     if (off + n > size) throw FatError("read past the end of the image");
+    if (mem) {
+      if (n) memcpy(buf, mem->data() + off, n);
+      return;
+    }
     OVERLAPPED ov{};
     ov.Offset = DWORD(off);
     ov.OffsetHigh = DWORD(off >> 32);
@@ -138,11 +144,7 @@ struct FatImage::Impl {
       uint8_t attr = e[11];
       if ((attr & 0x0F) == 0x0F) continue;  // long-file-name entry
       if (attr & 0x08) {  // volume label
-        if (is_root && label.empty()) {
-          std::string l(reinterpret_cast<const char*>(e), 11);
-          while (!l.empty() && l.back() == ' ') l.pop_back();
-          label = l;
-        }
+        if (is_root && label.empty()) label = dos_label(e);
         continue;
       }
       if (e[0] == '.' && (e[1] == ' ' || (e[1] == '.' && e[2] == ' '))) continue;
@@ -167,6 +169,21 @@ FatImage::FatImage(const fs::path& path) : impl_(std::make_unique<Impl>()) {
   LARGE_INTEGER sz{};
   if (!GetFileSizeEx(m.file.get(), &sz)) throw FatError("cannot size the image: " + win_error_string(GetLastError()));
   m.size = uint64_t(sz.QuadPart);
+  open();
+}
+
+FatImage::FatImage(std::shared_ptr<const std::vector<uint8_t>> bytes) : impl_(std::make_unique<Impl>()) {
+  Impl& m = *impl_;
+  if (!bytes) throw FatError("no image");
+  m.mem = std::move(bytes);
+  m.size = m.mem->size();
+  open();
+}
+
+// The boot sector's BPB, the first FAT and the root directory, whatever holds
+// the image.
+void FatImage::open() {
+  Impl& m = *impl_;
   if (m.size < 512) throw FatError("too small to be a FAT image");
   uint8_t bs[512];
   m.read_at(0, bs, 512);

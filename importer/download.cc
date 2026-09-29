@@ -201,7 +201,7 @@ uint64_t size_limit(const DownloadOptions& o) {
   throw ImportError(Status::verify_failed,
                     host + " sends more than " +
                         (o.expected_size ? "the published " + std::to_string(o.expected_size) + " bytes"
-                                         : std::to_string(size_limit(o)) + " bytes, more than any After Dark file"));
+                                         : std::to_string(size_limit(o)) + " bytes, more than any known release's file"));
 }
 
 // One attempt: GET `url` (following redirects) starting at byte `offset` of
@@ -299,7 +299,7 @@ void fetch_once(const Session& session, const DownloadOptions& o, const std::fil
                                                    " bytes, not the published " + std::to_string(o.expected_size));
     if (total > limit)
       throw ImportError(Status::verify_failed, to_utf8(host) + " serves " + std::to_string(total) +
-                                                   " bytes, more than any After Dark file");
+                                                   " bytes, more than any known release's file");
 
     Handle out(CreateFileW(part.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, nullptr));

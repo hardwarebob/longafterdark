@@ -821,8 +821,11 @@ bool has_strings(HWND h, Ctl16 kind) {
 WPARAM sx(uint16_t v) { return WPARAM(LONG_PTR(int16_t(v))); }
 
 // A directory listing for LB_DIR/CB_DIR/DlgDirList, as Windows 3.1 formatted
-// it: files, then "[dir]" entries (DDL_DIRECTORY), then "[-c-]" drives
-// (DDL_DRIVES); DDL_EXCLUSIVE lists only the special entries.
+// it: files, then "[dir]" entries (DDL_DIRECTORY), then the drives
+// (DDL_DRIVES): "[-c-]", and "[-h-]" when the host's drives are mounted as
+// H: (a module's own folder dialog reaches the user's files so: Sounder's
+// "Sounds.." lists .WAV folders); DDL_EXCLUSIVE lists only the special
+// entries.
 std::vector<std::string> dir_entries(Runtime16& rt, const std::string& spec, uint16_t attr) {
   std::vector<std::string> out;
   win32::Vfs& vfs = rt.vfs();
@@ -845,7 +848,10 @@ std::vector<std::string> dir_entries(Runtime16& rt, const std::string& spec, uin
   }
   out = files;
   out.insert(out.end(), dirs.begin(), dirs.end());
-  if (attr & DDL_DRIVES) out.push_back("[-c-]");
+  if (attr & DDL_DRIVES) {
+    out.push_back("[-c-]");
+    if (vfs.is_dir("H:\\")) out.push_back("[-h-]");
+  }
   return out;
 }
 
@@ -1503,7 +1509,14 @@ void enable_real_dialogs16(Runtime16& rt, Configure16* cfg) {
   });
   // DlgDirList(hDlg, lpPathSpec, nIDListBox, nIDStaticPath, uFileType): the
   // guest's disk (the Vfs), Windows 3.1's formatting; the spec keeps only
-  // its file part, the static shows the directory.
+  // its file part, the static shows the directory. As USER did through DOS,
+  // the listed drive and directory become the current ones (dos16.hh
+  // dos_chdir): "h:*.WAV" lists H:'s own current directory, "c:*.WAV" C:'s,
+  // where the list left it, and a module's getcwd() (INT 21h AH=19h, 47h)
+  // then names the folder the user chose, drive and all. A directory that
+  // does not exist, or is deeper than DOS's current directory could be
+  // (kMaxCurDir), is refused (0): the list, the spec and the current
+  // directory stay as they were.
   replace(r, U, "DlgDirList", [](Call16& c) {
     uint16_t h = c.w();
     uint32_t spec_p = c.ptr();
@@ -1520,14 +1533,21 @@ void enable_real_dialogs16(Runtime16& rt, Configure16* cfg) {
       dir = full;
       pat = "*.*";
     }
-    if (!vfs.is_dir(dir)) return c.ret(0);
-    vfs.set_cwd(dir);
+    if (dos_chdir(c.rt, dir, /*select_drive=*/true) != 0) {
+      trace("dlg16", "DlgDirList refused %s: no such directory, or deeper than DOS's current directory", full.c_str());
+      return c.ret(0);
+    }
     if (lb) {
       HWND list = GetDlgItem(rh, int16_t(lb));
       if (list) {
         SendMessageW(list, LB_RESETCONTENT, 0, 0);
-        for (const std::string& e : dir_entries(c.rt, dir + (dir.back() == '\\' ? "" : "\\") + pat, attr)) {
-          SendMessageW(list, LB_ADDSTRING, 0, LPARAM(w1252(e).c_str()));
+        const std::string listed = dir + (dir.back() == '\\' ? "" : "\\") + pat;
+        std::vector<std::string> entries = dir_entries(c.rt, listed, attr);
+        for (const std::string& e : entries) SendMessageW(list, LB_ADDSTRING, 0, LPARAM(w1252(e).c_str()));
+        if (tracing("dlg16")) {
+          std::string all;
+          for (const std::string& e : entries) all += (all.empty() ? "" : " ") + e;
+          trace("dlg16", "DlgDirList(%s, %04X) into %u: %s", listed.c_str(), attr, lb, all.c_str());
         }
       }
     }
@@ -2282,6 +2302,98 @@ void enable_real_dialogs16(Runtime16& rt, Configure16* cfg) {
   };
   replace(r, "COMMDLG", "GetOpenFileName", [file_dialog](Call16& c) { file_dialog(c, false); });
   replace(r, "COMMDLG", "GetSaveFileName", [file_dialog](Call16& c) { file_dialog(c, true); });
+  // ChooseFont(CHOOSEFONT16*): the real font dialog (SWTEXT's Select Font:
+  // CF_SCREENFONTS | CF_INITTOLOGFONTSTRUCT | CF_LIMITSIZE, 10..100 pt, SWTEXT
+  // 1:0B2E..1:0B5E), started from the guest's LOGFONT; on OK the LOGFONT,
+  // iPointSize, nFontType and (CF_EFFECTS) rgbColors go back. Hooks,
+  // templates, CF_USESTYLE and printer fonts are not supported (the standard
+  // screen-font dialog shows, logged). A hidden run has nothing to answer it
+  // with (the script has no font line): cancelled, logged.
+  replace(r, "COMMDLG", "ChooseFont", [](Call16& c) {
+    uint32_t cf = c.ptr();
+    Runtime16& rt = c.rt;
+    Dialogs16& d = dl(rt);
+    uint16_t owner16 = rt.rd16(cf + 4);
+    uint32_t lf_p = rt.rd32(cf + 8);
+    uint32_t flags = rt.rd32(cf + 0x0E);
+    COLORREF color = rt.rd32(cf + 0x12) & 0xFFFFFF;
+    int16_t size_min = int16_t(rt.rd16(cf + 0x2A)), size_max = int16_t(rt.rd16(cf + 0x2C));
+    d.cfg->shown++;
+    if (flags & (CF_ENABLEHOOK | CF_ENABLETEMPLATE | CF_ENABLETEMPLATEHANDLE | CF_USESTYLE | CF_PRINTERFONTS)) {
+      log("configure: ChooseFont's hook/template/style/printer flags (%08X) are not supported; the screen-font dialog shows",
+          flags);
+    }
+    if (d.cfg->script->hidden()) {
+      log("configure: ChooseFont not shown (ADCONFIGHIDDEN): cancelled");
+      return c.ret(0);
+    }
+    LOGFONTW lf{};
+    if (lf_p && (flags & CF_INITTOLOGFONTSTRUCT)) {
+      LOGFONT16 f = read16<LOGFONT16>(rt, lf_p);
+      lf.lfHeight = f.lfHeight;
+      lf.lfWidth = f.lfWidth;
+      lf.lfEscapement = f.lfEscapement;
+      lf.lfOrientation = f.lfOrientation;
+      lf.lfWeight = f.lfWeight;
+      lf.lfItalic = f.lfItalic;
+      lf.lfUnderline = f.lfUnderline;
+      lf.lfStrikeOut = f.lfStrikeOut;
+      lf.lfCharSet = f.lfCharSet;
+      lf.lfOutPrecision = f.lfOutPrecision;
+      lf.lfClipPrecision = f.lfClipPrecision;
+      lf.lfQuality = f.lfQuality;
+      lf.lfPitchAndFamily = f.lfPitchAndFamily;
+      std::wstring face = w1252(std::string(f.lfFaceName, strnlen(f.lfFaceName, sizeof(f.lfFaceName))));
+      wcsncpy(lf.lfFaceName, face.c_str(), LF_FACESIZE - 1);
+    }
+    CHOOSEFONTW o{};
+    o.lStructSize = sizeof(o);
+    o.hwndOwner = owner_of(d, owner16);
+    o.lpLogFont = &lf;
+    o.Flags = (flags & (CF_INITTOLOGFONTSTRUCT | CF_EFFECTS | CF_ANSIONLY | CF_NOVECTORFONTS | CF_NOSIMULATIONS |
+                        CF_LIMITSIZE | CF_FIXEDPITCHONLY | CF_FORCEFONTEXIST | CF_SCALABLEONLY | CF_TTONLY |
+                        CF_NOFACESEL | CF_NOSTYLESEL | CF_NOSIZESEL)) |
+              CF_SCREENFONTS;
+    if (!lf_p) o.Flags &= ~DWORD(CF_INITTOLOGFONTSTRUCT);
+    o.rgbColors = color;
+    o.nSizeMin = size_min;
+    o.nSizeMax = size_max;
+    Dialogs16* saved = g_dlg;
+    g_dlg = &d;
+    BOOL ok = FALSE;
+    {
+      OwnerLend lend(o.hwndOwner);
+      ok = ChooseFontW(&o);
+    }
+    g_dlg = saved;
+    rethrow(d);
+    if (!ok) {
+      trace("dlg16", "ChooseFont cancelled");
+      return c.ret(0);
+    }
+    LOGFONT16 f{};
+    f.lfHeight = int16_t(lf.lfHeight);
+    f.lfWidth = int16_t(lf.lfWidth);
+    f.lfEscapement = int16_t(lf.lfEscapement);
+    f.lfOrientation = int16_t(lf.lfOrientation);
+    f.lfWeight = int16_t(lf.lfWeight);
+    f.lfItalic = lf.lfItalic;
+    f.lfUnderline = lf.lfUnderline;
+    f.lfStrikeOut = lf.lfStrikeOut;
+    f.lfCharSet = lf.lfCharSet;
+    f.lfOutPrecision = lf.lfOutPrecision;
+    f.lfClipPrecision = lf.lfClipPrecision;
+    f.lfQuality = lf.lfQuality;
+    f.lfPitchAndFamily = lf.lfPitchAndFamily;
+    std::string face = a1252(lf.lfFaceName);
+    memcpy(f.lfFaceName, face.c_str(), std::min<size_t>(face.size(), sizeof(f.lfFaceName) - 1));
+    if (lf_p) write16(rt, lf_p, f);
+    rt.wr16(cf + 0x0C, uint16_t(o.iPointSize));
+    if (flags & CF_EFFECTS) rt.wr32(cf + 0x12, o.rgbColors);
+    rt.wr16(cf + 0x28, uint16_t(o.nFontType));
+    log("configure: font dialog: \"%s\", %d.%d pt", face.c_str(), o.iPointSize / 10, o.iPointSize % 10);
+    c.ret(1);
+  });
   // WinExec("notepad <file>"): NONSENSE's Edit Names hands its word list to
   // Notepad. The file is copied into the upper layer first, so the edits land
   // in the per-user state; the real Notepad opens that copy (not when hidden).

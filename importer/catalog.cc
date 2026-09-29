@@ -322,6 +322,38 @@ std::optional<CatalogControl> parse_control_record(std::string_view d, int slot)
   return c;
 }
 
+std::string ad20_about(std::string_view about) {
+  static constexpr std::string_view kOwner = "Berkeley Systems Authorized User.";
+  auto blank = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+  std::string s(about);
+  // The last line stood for the registered owner (After Dark 2.0 wrote the
+  // name in its place); the disks hold only the stand-in.
+  const size_t nl = s.rfind('\n');
+  std::string_view last = nl == std::string::npos ? std::string_view(s) : std::string_view(s).substr(nl + 1);
+  while (!last.empty() && blank(last.front())) last.remove_prefix(1);
+  while (!last.empty() && blank(last.back())) last.remove_suffix(1);
+  if (last == kOwner) {
+    s.resize(nl == std::string::npos ? 0 : nl);
+    while (!s.empty() && blank(s.back())) s.pop_back();
+  }
+  // Sentences wrapped by hand ("turn off your \ncomputer"): the break goes,
+  // the space before it stays.
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size(); i++) {
+    if (s[i] == '\n' && i > 0 && s[i - 1] == ' ' && i + 1 < s.size() && is_lower(s[i + 1])) continue;
+    out += s[i];
+  }
+  return out;
+}
+
+bool is_system_dll(std::string_view name) {
+  static const std::set<std::string, std::less<>> kSystem = {
+      "KERNEL32.DLL", "USER32.DLL", "GDI32.DLL", "WINMM.DLL", "MSACM32.DLL", "SHELL32.DLL", "COMDLG32.DLL", "KERNEL",
+      "USER",         "GDI",        "MMSYSTEM",  "COMMDLG",   "SHELL",       "KEYBOARD",    "WIN87EM"};
+  return kSystem.count(name) != 0;
+}
+
 std::vector<std::string> parse_stringlist(std::string_view data) {
   std::vector<std::string> out;
   if (data.size() < 2) return out;
@@ -341,10 +373,6 @@ std::vector<std::string> parse_stringlist(std::string_view data) {
 // ---- one module ------------------------------------------------------------------
 
 namespace {
-
-const std::set<std::string> kSystemDlls = {
-    "KERNEL32.DLL", "USER32.DLL", "GDI32.DLL", "WINMM.DLL", "MSACM32.DLL", "SHELL32.DLL", "COMDLG32.DLL", "KERNEL",
-    "USER",         "GDI",        "MMSYSTEM",  "COMMDLG",   "SHELL",       "KEYBOARD",    "WIN87EM"};
 
 // Resource ids compared the way the prototype's reader keys them: integers by
 // value, strings case-insensitively, and an all-digit string type as the
@@ -420,9 +448,45 @@ std::string read_whole_file(const fs::path& p) {
   return data;
 }
 
+// What an NE module is to the ne16 lane, rule for rule as its detect_kind
+// decides (host/ne16/package.cc), so the catalog lists a file exactly as the
+// lane will run it: MODULE makes an After Dark module, whatever else it
+// exports; SAVERINIT and SAVERDRAW make an Intermission IMX module, unless it
+// exports SETCURRSAVER (another product's) or its file is named IMXX_* (an
+// extension) — IMIMXPLY.IMQ's own refusals (its message 10); anything else is
+// no module the lane runs, and `why` says so in the lane's words. Exports
+// are found by name, without case, as the lane looks them up (find_ordinal:
+// no entry-table entry needed).
+enum class NeKind { after_dark, intermission, none };
+
+NeKind ne_kind(const loader::ne::Image& img, const std::string& file_name, std::string* why) {
+  auto exports = [&](const char* name) { return img.find_ordinal(name).has_value(); };
+  if (exports("MODULE")) return NeKind::after_dark;
+  const bool init = exports("SAVERINIT"), draw = exports("SAVERDRAW");
+  if (init && draw) {
+    if (exports("SETCURRSAVER")) {
+      *why = "an Intermission module that exports SETCURRSAVER, which the IMX reader refuses";
+    } else if (ascii_upper(file_name.substr(0, 5)) == "IMXX_") {
+      *why = "an Intermission module named IMXX_*, which the IMX reader refuses";
+    } else {
+      return NeKind::intermission;
+    }
+    return NeKind::none;
+  }
+  if (exports("SAVERMAIN")) {
+    *why = "an Intermission reader (it exports SAVERMAIN), not a module";
+  } else if (init || draw) {
+    *why = std::string("not an Intermission module: it exports ") + (init ? "SAVERINIT" : "SAVERDRAW") + " without " +
+           (init ? "SAVERDRAW" : "SAVERINIT");
+  } else {
+    *why = "not an After Dark or Intermission module (no MODULE, SAVERINIT or SAVERDRAW export)";
+  }
+  return NeKind::none;
+}
+
 void split_dlls(std::set<std::string> dlls, CatalogModule& m) {
   // std::set orders by bytes, as Python's sorted() orders these ASCII names.
-  for (const auto& d : dlls) (kSystemDlls.count(d) ? m.system : m.needs).push_back(d);
+  for (const auto& d : dlls) (is_system_dll(d) ? m.system : m.needs).push_back(d);
 }
 
 void add_controls(CatalogModule& m, const std::function<std::optional<std::string_view>(uint16_t)>& find) {
@@ -465,6 +529,7 @@ CatalogModule catalog_module(const fs::path& file, const std::string& rel_path, 
   if (package) {
     m.package = package->id;
     m.package_title = package->title;
+    if (package->screen) m.screen = package->screen;
   }
   if (fmt == loader::Format::pe32) {
     loader::pe::Image img(std::move(data));
@@ -485,15 +550,38 @@ CatalogModule catalog_module(const fs::path& file, const std::string& rel_path, 
     }
   } else if (fmt == loader::Format::ne) {
     loader::ne::Image img(std::move(data));
+    std::string why;
+    const NeKind kind = ne_kind(img, to_utf8(file.filename().wstring()), &why);
+    // A file the lane would refuse is not offered at all (the catalog logs
+    // why and leaves it out, as it does a module it cannot read).
+    if (kind == NeKind::none) throw ImportError(Status::source_invalid, why);
     m.lane = "ne16";
     m.id = (legacy_ids ? "classic." : std::string(package->id) + ".") + base;
+    std::set<std::string> dlls;
+    for (const auto& ref : img.module_refs()) dlls.insert(ascii_upper(loader::latin1_to_utf8(ref)));
+    if (kind == NeKind::intermission) {
+      // No resource holds an IMX module's name or text: the registry's name
+      // overrides give moduleName; its settings are its own dialog.
+      m.abi = "intermission";
+      m.entry = "SAVERDRAW";
+      m.display_name = base;
+      if (img.find_export("SAVERDLGPROC")) {
+        CatalogControl b;
+        b.index = 0;
+        b.name = kIntermissionConfigure;
+        b.kind = b.type = "button";
+        m.controls.push_back(std::move(b));
+      }
+      split_dlls(std::move(dlls), m);
+      m.module_name = base;
+      return m;
+    }
     if (auto nm = ne_find(img, uint16_t(2000), 20); nm && !nm->empty()) m.display_name = cp1252_to_utf8(c_string(*nm));
     auto about = ne_find(img, uint16_t(2000), 30);
     m.about = about && !about->empty() ? plain_text(*about) : std::string();
+    if (package && package->about == Package::About::ad20) m.about = ad20_about(m.about);
     if (auto credits = ne_find(img, uint16_t(2000), 10); credits && !credits->empty()) m.credits = plain_text(*credits);
     add_controls(m, [&](uint16_t name) { return ne_find(img, uint16_t(1000), name); });
-    std::set<std::string> dlls;
-    for (const auto& ref : img.module_refs()) dlls.insert(ascii_upper(loader::latin1_to_utf8(ref)));
     split_dlls(std::move(dlls), m);
     m.entry = "MODULE";
     if (m.display_name.empty()) {
@@ -517,14 +605,18 @@ bool iequals_w(std::wstring_view a, std::wstring_view b) {
   return CompareStringOrdinal(a.data(), int(a.size()), b.data(), int(b.size()), TRUE) == CSTR_EQUAL;
 }
 
-// <dir>\*.AD, matched case-insensitively (as glob does on Windows) and
-// sorted by name.
-std::vector<std::wstring> modules_in(const fs::path& dir) {
+// <dir>\*.AD (and, with `imx`, *.IMX), matched case-insensitively (as glob
+// does on Windows) and sorted by name together.
+std::vector<std::wstring> modules_in(const fs::path& dir, bool imx) {
   std::vector<std::wstring> names;
   std::error_code ec;
+  auto ends_with = [](std::wstring_view n, std::wstring_view ext) {
+    return n.size() >= ext.size() && iequals_w(n.substr(n.size() - ext.size()), ext);
+  };
   for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
     std::wstring n = it->path().filename().wstring();
-    if (n.size() < 3 || n[0] == L'.' || !iequals_w(std::wstring_view(n).substr(n.size() - 3), L".AD")) continue;
+    if (n.size() < 3 || n[0] == L'.' || !(ends_with(n, L".AD") || (imx && n.size() > 4 && ends_with(n, L".IMX"))))
+      continue;
     std::error_code fe;
     if (it->is_regular_file(fe)) names.push_back(n);
   }
@@ -547,8 +639,11 @@ std::vector<ModuleFile> module_files(const Package& pkg, const fs::path& dir) {
   std::vector<ModuleFile> order;
   std::error_code ec;
   const std::string root = pkg.root;
+  // Deluxe's three fixed places hold *.AD only, so its order and ids stay as
+  // they always were; the other packages' folders may hold IMX modules.
+  const bool imx = !pkg.is_deluxe();
   auto add_dir = [&](const std::string& d) {
-    for (const auto& n : modules_in(dir / to_wide(d)))
+    for (const auto& n : modules_in(dir / to_wide(d), imx))
       order.push_back({dir / to_wide(d) / n, root + "/" + d + "/" + to_utf8(n), d + "/" + to_utf8(n)});
   };
   bool engine_listed = false;
@@ -780,6 +875,12 @@ Json module_json(const CatalogModule& m) {
   }
   if (!m.md5.empty()) j.add("md5", Json::str(m.md5));
   if (!m.same_as.empty()) j.add("sameAs", Json::str(m.same_as));
+  // Last, and only for a module whose ABI is not After Dark's: every After
+  // Dark entry is laid out exactly as before it existed.
+  if (!m.abi.empty()) j.add("abi", Json::str(m.abi));
+  // Last too, and only for a package shown at a fixed screen: every other
+  // entry is laid out as before it existed.
+  if (!m.screen.empty()) j.add("screen", Json::str(m.screen));
   return j;
 }
 

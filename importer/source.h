@@ -1,8 +1,9 @@
 // SourceFs — one read-only view over every kind of source the importer
 // takes (PACKAGES.md §3): an ISO-9660/Joliet image, a FAT12/16 floppy image,
-// a flat ZIP of install files (the Internet Archive's Simpsons copies), a
-// host folder (a CD drive, a copy of a disc or floppies), or several images
-// unioned into one tree (split floppies).
+// a flat ZIP of install files (the Internet Archive's Simpsons copies), the
+// floppy images a ZIP holds (the Internet Archive's ZIP of Star Trek: The
+// Screen Saver's two disks), a host folder (a CD drive, a copy of a disc or
+// floppies), or several images unioned into one tree (split floppies).
 //
 // Names are what the importer installs under: 8.3 upper case as the source
 // lists them (an ISO entry's primary-volume name when its Joliet name could
@@ -75,6 +76,33 @@ std::optional<FILETIME> dos_filetime(uint16_t date, uint16_t time);
 // files; bare names only, none password-protected), then FAT12/16. Throws
 // ImportError(source_invalid) when it is none of them.
 std::unique_ptr<SourceFs> open_image(const std::filesystem::path& path);
+
+// A floppy image a ZIP holds: the member's name and its bytes.
+struct ZippedImage {
+  std::string name;
+  std::shared_ptr<const std::vector<uint8_t>> bytes;
+};
+// The floppy images of a ZIP are held in memory together, at most this many
+// bytes of them (44 high-density floppies; no release came on more than 5).
+inline constexpr uint64_t kMaxZippedImageBytes = 64ull << 20;
+// The floppy images in a ZIP (a local file header at byte 0, at most 256 MB,
+// read as open_image reads a ZIP): every member whose size is a DOS floppy's
+// (a multiple of 512 bytes from 160 KB to 2.88 MB), inflated with its size
+// and CRC-32 checked, that is a FAT12/16 volume. Every other member (a
+// label scan, the metadata of a whole Internet Archive item) is only named in
+// `ignored`, never inflated; nor is a floppy-sized one past its first 64 KiB
+// (the output chunk that completes its first sector) when that sector is no
+// boot sector (55 AA, a sector size FatImage takes). Empty
+// when the file is no ZIP, or holds no floppy image: it is then a ZIP of
+// install files, read by open_image. Throws ImportError(source_invalid) for a
+// floppy-sized member that is password-protected or damaged, and when the
+// members with a boot sector add up to more than `max_bytes`.
+std::vector<ZippedImage> floppy_images_in_zip(const std::filesystem::path& path,
+                                              std::vector<std::string>* ignored = nullptr,
+                                              uint64_t max_bytes = kMaxZippedImageBytes);
+// A FAT12/16 image in memory (`name` for messages). Throws
+// ImportError(source_invalid) when it is not one.
+std::unique_ptr<SourceFs> open_fat_image(std::shared_ptr<const std::vector<uint8_t>> bytes, const std::string& name);
 // A folder (or drive root). The root of a CD drive is read as the disc
 // itself (raw ISO-9660, so a Joliet disc keeps its 8.3 names), falling back
 // to the listing when the volume cannot be opened; `note`, when given, says

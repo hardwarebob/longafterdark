@@ -2,7 +2,7 @@
 // GetAsyncKeyState's bit 0 and the MOUSE button bitmask, the wake flag,
 // KERNEL32's files and profiles through the Vfs overlay, the desktop seed
 // read from a delete-on-close file another handle keeps open, the
-// configure-script parser, and the real-window handle map. Linked into
+// configure-script parser and its PICK, and the real-window handle map. Linked into
 // adw_win32_tests.
 #include <windows.h>
 
@@ -252,6 +252,54 @@ TEST(config_script_parse) {
   CHECK(err.find("line 2") != std::string::npos);
   CHECK(!bad.parse("JUMP 3\n", &err));
   CHECK(!bad.parse("ANSWER MAYBE\n", &err));
+  CHECK(!bad.parse("PICK 204\n", &err));
+  CHECK(err.find("PICK needs") != std::string::npos);
+}
+
+// PICK selects the item with that text (any case) wherever a sorted list box
+// or combo box holds it, and notifies as SELECT does; an item that is not
+// there, or a control of another class, fails (the runner logs it).
+TEST(config_script_pick) {
+  ConfigScript s;
+  std::string err;
+  CHECK(s.parse("PICK 204 [-h-]\nPICK 205 two\nPICK 204 [NOPE]\nPICK 206 x\n", &err));
+  HWND dlg = CreateWindowExW(WS_EX_TOOLWINDOW, L"STATIC", L"", WS_POPUP, -32000, -32000, 200, 200, nullptr, nullptr,
+                             GetModuleHandleW(nullptr), nullptr);
+  HWND lb = CreateWindowExW(0, L"LISTBOX", L"", WS_CHILD | LBS_SORT | LBS_HASSTRINGS, 0, 0, 100, 100, dlg,
+                            reinterpret_cast<HMENU>(uintptr_t(204)), nullptr, nullptr);
+  HWND cb = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | CBS_DROPDOWNLIST | CBS_SORT | CBS_HASSTRINGS, 0, 100, 100,
+                            100, dlg, reinterpret_cast<HMENU>(uintptr_t(205)), nullptr, nullptr);
+  CreateWindowExW(0, L"BUTTON", L"", WS_CHILD, 0, 150, 50, 20, dlg, reinterpret_cast<HMENU>(uintptr_t(206)), nullptr,
+                  nullptr);
+  CHECK(dlg && lb && cb);
+  for (const wchar_t* t : {L"[..]", L"[-h-]", L"[SUB]", L"[-c-]"}) SendMessageW(lb, LB_ADDSTRING, 0, LPARAM(t));
+  for (const wchar_t* t : {L"one", L"two", L"three"}) SendMessageW(cb, CB_ADDSTRING, 0, LPARAM(t));
+  ConfigScript::Action a;
+  a.kind = ConfigScript::Action::Kind::pick;
+  a.id = 204;
+  a.text = L"[-H-]";
+  wchar_t sel[32] = {};
+  CHECK(ConfigScript::apply(dlg, a));
+  LRESULT i = SendMessageW(lb, LB_GETCURSEL, 0, 0);
+  SendMessageW(lb, LB_GETTEXT, WPARAM(i), LPARAM(sel));
+  CHECK(i >= 0 && std::wstring(sel) == L"[-h-]");
+  a.id = 205;
+  a.text = L"two";
+  CHECK(ConfigScript::apply(dlg, a));
+  i = SendMessageW(cb, CB_GETCURSEL, 0, 0);
+  SendMessageW(cb, CB_GETLBTEXT, WPARAM(i), LPARAM(sel));
+  CHECK(i >= 0 && std::wstring(sel) == L"two");
+  a.id = 204;
+  a.text = L"[NOPE]";
+  LRESULT before = SendMessageW(lb, LB_GETCURSEL, 0, 0);
+  CHECK(!ConfigScript::apply(dlg, a));
+  CHECK_EQ(SendMessageW(lb, LB_GETCURSEL, 0, 0), before);
+  a.id = 206;
+  a.text = L"x";
+  CHECK(!ConfigScript::apply(dlg, a));  // a button
+  a.id = 207;
+  CHECK(!ConfigScript::apply(dlg, a));  // missing
+  DestroyWindow(dlg);
 }
 
 // Real windows get small guest handles with a zero high word (Windows 95's

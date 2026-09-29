@@ -22,8 +22,8 @@ box.
 
 | Page | What it shows | Command ids |
 |---|---|---|
-| **Sources** (`--gui` with no source) | The header "Import After Dark"; the **Installed** releases, each with its cover (48×60), "N modules · verified against the original disc" and a **Change cover…** link (its accessible name names the release: "Change the cover of After Dark 3.2…"); while any of them still shows a generated cover (an install from before covers, or an offline import), "N releases have no cover picture yet." with **Get the covers** (a progress window over `refresh_covers` for those releases, then what it got, then Sources again); three cards: **A disc image…**, **A drive or folder…**, **Download from the Internet Archive…** (sizes; hidden when nothing can be downloaded); "Files are copied to …"; **Cancel** (**Close** once something changed) | 101, 102, 103, 104 (Get the covers); 400 + registry index for Change cover…; IDCANCEL |
-| **Downloads** (from 103) | One card per release in registry order (limited by `--package`): cover, title, "CD image · 381.7 MB" / "Install files (ZIP) · 2.6 MB", "Imported · verified against the original disc" / "Not imported yet", "already downloaded" (in `--download-dir`, else the default folder); **Every release not imported yet** when two or more are not; the md5 and downloads-folder note; **Back** | 200 + i, 299, IDCANCEL (Back, to Sources) |
+| **Sources** (`--gui` with no source) | The header "Import a release"; an intro naming the seven releases of the registry; the **Installed** releases, each with its cover (48×60), "N modules · verified against the original disc" and a **Change cover…** link (its accessible name names the release: "Change the cover of After Dark 3.2…"); while any of them still shows a generated cover (an install from before covers, or an offline import), "N releases have no cover picture yet." with **Get the covers** (a progress window over `refresh_covers` for those releases, then what it got, then Sources again); three cards: **A disc image…** ("An ISO image of a CD, or floppy images (.img), zipped or not; select every disk of a set." — its file dialog lists "Disc and floppy images, and ZIPs of them or of install files"; a ZIP of a set's floppy images, such as Star Trek's from the Internet Archive, is one file; Star Wars Screen Entertainment's set is five, though only floppies of its CD's build verify: the earlier builds' floppy sets found online fail verification (3) unless adimport runs with `--no-verify`), **A drive or folder…**, **Download from the Internet Archive…** (sizes; hidden when nothing can be downloaded); a folder that is no known release gets the caution "That is not a disc Long After Dark knows."; "Files are copied to …"; **Cancel** (**Close** once something changed) | 101, 102, 103, 104 (Get the covers); 400 + registry index for Change cover…; IDCANCEL |
+| **Downloads** (from 103) | One card per release in registry order, seven today (limited by `--package`): cover, title, "CD image · 381.7 MB" / "Install files (ZIP) · 2.6 MB" / "2 floppy disk images · 2.8 MB" (the first copy's kind and size, every image of a floppy set counted: Star Wars Screen Entertainment's is "CD image · 6.9 MB", Star Trek's the two floppies), "Imported · verified against the original disc" (a floppy release's: "disks") / "Not imported yet", "already downloaded" (in `--download-dir`, else the default folder; a floppy set only when every image is there); **Every release not imported yet** when two or more are not; the md5 and downloads-folder note; **Back** | 200 + i, 299, IDCANCEL (Back, to Sources) |
 | **Progress** | The phase ("Downloading … from the Internet Archive (2 of 4)", "Copying …", "Getting the cover art" for `Progress::Phase::cover`, and for all of `--gui --refresh-covers` / Get the covers), a Fluent progress bar (determinate, or a sweep when the total is unknown), "123.4 MB of 400.0 MB (5.0 MB/s)" and the current item. **Cancel** greys and says "Cancelling…" until the worker has stopped; the window cannot be closed otherwise | IDCANCEL |
 | **Result** | A glyph (done E930 in the accent colour, partly done E7BA in caution, failed EA39 in critical), the heading and the text today's message boxes had; for a failure "Nothing was changed." and **Copy details** (the message and every mismatched file, to the clipboard) | IDOK (Done, default), 501 |
 | **Cover** (`--gui --change-cover <id>`, or Change cover… on Sources) | The release's cover at 192×240 with where it came from ("Box front · Wikisimpsons", "Installer art from your disc", "Your own picture", "No picture yet"); **Choose a picture…** (`set_cover`), **Use the original cover** (`clear_cover`, when your own picture is in use; the line under it says what the original is: "Original: Box front · Wayback Machine"), **Download the original cover** (`refresh_covers`; shown only when a better download exists and downloads are allowed, with what it gets under it: "Gets the Box front · Wayback Machine", and "your picture stays the cover" while one is set); the result in the window (caution or critical for problems); "Pictures stay on this computer, in …" | 601, 602, 603, IDOK (Done, default, Esc) |
@@ -82,7 +82,7 @@ and the cover window as `CoverOptions::allow_download`.
   `result=single|several|partial|covers`, `job=covers` (the progress page of
   "Get the covers"), `package=<id>` (the cover page),
   `status=ok|error|network|running` (the cover page), `caution=1` (Sources'
-  "not a known disc"), `workarea=<w>x<h>` (DIPs; default unlimited),
+  "not a disc Long After Dark knows"), `workarea=<w>x<h>` (DIPs; default unlimited),
   `dpichange=<n>` (a monitor change, without `dpi=`), `themechange=light|dark|hc`
   (a live theme change after opening), `report=<path>` (the client area in
   the picture, a pixel of the body's margin and `pal.base`).
@@ -101,8 +101,13 @@ and the cover window as `CoverOptions::allow_download`.
   dialog itself is the shell's and is not driven), and the wording and data
   the windows show (phases, the
   amount line, installed rows with module counts, the Internet Archive
-  list, the result texts, the cover origin line, the exit-code tally), over
-  a scratch assets tree; never creates the assets folder.
+  list — seven releases, Star Wars Screen Entertainment's card, Star Trek's
+  "2 floppy disk images · 2.8 MB", "already downloaded" only once both of its
+  images are there, "Every release not imported yet" over five — the
+  result texts, the cover origin line ("verified against the original
+  disks" for a floppy release), the
+  exit-code tally), over a scratch assets tree; never creates the assets
+  folder.
 * `import.gui_shots`: every page × light/dark/high contrast × 100/150/200%
   through the screenshot hook, over a scratch install with synthetic
   covers (set with `adimport --set-cover`); each picture exists, its DPI is

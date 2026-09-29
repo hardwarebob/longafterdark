@@ -48,8 +48,10 @@ std::wstring state_dir();
 // AD_SCR_LASTLOG, else logs\saver-last.log next to settings_path(): the
 // always-on log of the last /s run (INTERACTION.md §9.1).
 std::wstring last_exit_log_path();
-// %TEMP%\LongAfterDark-seed-<pid>-<window index>.ppm (INTERACTION.md §8).
-std::wstring seed_file_path(unsigned long pid, int window_index);
+// %TEMP%\LongAfterDark-seed-<pid>-<window index>.ppm (INTERACTION.md §8), or
+// with `size` ("640x480": the capture for a module's own screen, an
+// Intermission or a Star Trek module's, saver.cc) ...-<window index>-<size>.ppm.
+std::wstring seed_file_path(unsigned long pid, int window_index, const std::wstring& size = L"");
 inline constexpr wchar_t kSeedFilePrefix[] = L"LongAfterDark-seed-";
 // AD_HOST_EXE, else adhostwin.exe next to LongAfterDark.scr
 std::wstring host_exe_path();

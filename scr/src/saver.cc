@@ -10,6 +10,7 @@
 #include <cwchar>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -39,7 +40,13 @@ using std::chrono::milliseconds;
 constexpr UINT WM_APP_FRAME = WM_APP + 1;
 constexpr UINT WM_APP_HOSTEXIT = WM_APP + 2;
 constexpr UINT WM_APP_TESTEXIT = WM_APP + 3;
-constexpr UINT WM_APP_CAPS_LINE = WM_APP + 4;   // the host's --capabilities answer, for the last-exit log
+// The host's --capabilities answer (lParam: HostCapabilities*), posted to the
+// saver's thread rather than to a window: a relayout may retire any window,
+// the first one included, and a message queued for it goes with it.
+constexpr UINT WM_APP_CAPS = WM_APP + 4;
+// The longest the first hosts wait for that answer, when Random needs it
+// (App::caps_gate): past it, the rotation keeps every module.
+constexpr UINT kCapsWaitMs = 2000;
 constexpr UINT_PTR kTimerWatchdog = 1;
 constexpr UINT_PTR kTimerRotate = 2;
 constexpr UINT_PTR kTimerTestDisplay = 3;
@@ -48,8 +55,8 @@ constexpr UINT_PTR kTimerRotateRetry = 4;
 // top-level window, often for several intermediate modes); the windows are
 // re-planned once it has been quiet this long.
 constexpr UINT kRelayoutSettleMs = 500;
-// Caps Lock is re-checked this often (INTERACTION.md §4.1), and the input
-// owner's status with it.
+// Caps Lock (and Num Lock, for a host that keeps it) is re-checked this often
+// (INTERACTION.md §4.1), and the input owner's status with it.
 constexpr UINT kCapsCheckMs = 250;
 // While a decision is held (§4.3) the owner's status is polled this often.
 constexpr UINT kHoldPollMs = 16;
@@ -89,6 +96,10 @@ struct Hooks {
   milliseconds stall{20000};         // AD_SCR_TEST_STALL_MS: no frame for this long after the first = hung
   milliseconds first_frame{90000};   // AD_SCR_TEST_FIRSTFRAME_MS: grace for the first frame (slow module init)
   long long display_off_ms = 0;      // AD_SCR_TEST_DISPLAY_OFF_MS: after 5 frames, act as if the display slept this long
+  // AD_SCR_TEST_DISPLAY_ON: the console display is taken to be on whatever
+  // Windows reports, so the /s tests run on a machine whose monitors sleep
+  // (the saver would pause every host); DISPLAY_OFF_MS still simulates one.
+  bool display_on = false;
   std::wstring input_script;         // AD_SCR_TEST_INPUT: synthetic input instead of the real kind (input_rules.h)
   // AD_SCR_TEST_CAPTURE=<dir>: each window writes what it shows at the
   // presented frames AD_SCR_TEST_CAPTURE_FRAMES=<k>,... lists (default 30).
@@ -107,6 +118,7 @@ Hooks read_hooks() {
   h.stall = milliseconds(std::max<long long>(500, env_int(L"AD_SCR_TEST_STALL_MS", 20000)));
   h.first_frame = milliseconds(std::max<long long>(500, env_int(L"AD_SCR_TEST_FIRSTFRAME_MS", 90000)));
   h.display_off_ms = env_int(L"AD_SCR_TEST_DISPLAY_OFF_MS", 0);
+  h.display_on = env_set(L"AD_SCR_TEST_DISPLAY_ON");
   h.input_script = env_w(L"AD_SCR_TEST_INPUT");
   h.capture_dir = env_w(L"AD_SCR_TEST_CAPTURE");
   if (!h.capture_dir.empty()) {
@@ -222,6 +234,10 @@ class SaverWindow {
   bool create_fullscreen(const RECT& rc);
   bool create_preview(HWND parent);
   void start();
+  // Builds the rotation and starts the first host; start() does it at once
+  // unless the App still waits for the host's capabilities (then App does).
+  void start_rotation();
+  bool rotation_started() const { return rotation_ != nullptr; }
   // Monitor topology changes (/s only): where the window is and what it
   // shows; moving it onto a (possibly resized) monitor keeps its host; a
   // retired window loses its host and its HWND without ending the saver.
@@ -242,8 +258,14 @@ class SaverWindow {
   LRESULT handle(UINT msg, WPARAM wp, LPARAM lp);
 
   // ---- input (INTERACTION.md §4; only the owner's host gets input lines) ----
-  // The desktop capture for this window's first host (§8).
-  void set_seed(std::wstring path) { seed_path_ = std::move(path); }
+  // The desktop captures for this window's first host (§8): one for each
+  // screen it may be given, three at most (App::capture_seeds); it gets the
+  // one of its own, if any.
+  struct Seed {
+    ModuleScreen screen;
+    std::wstring path;
+  };
+  void set_seeds(std::vector<Seed> seeds) { seeds_ = std::move(seeds); }
   // Queue an input line for the host: its number, or 0 when there is no host.
   uint64_t send_input(const std::string& line);
   // The host's status, from the last consistent read.
@@ -254,6 +276,9 @@ class SaverWindow {
   // The letterboxed frame, in screen coordinates.
   RECT frame_screen() const;
   int caps_sent = -1;              // the Caps Lock toggle the host last heard (ADCAPS, then CAPS lines)
+  // The Num Lock toggle it last heard (ADNUMLOCK, then NUMLOCK lines); -1
+  // when it was started without one (a host that answered without numlock=1).
+  int numlock_sent = -1;
   int index() const { return index_; }
 
   HWND hwnd = nullptr;
@@ -261,6 +286,9 @@ class SaverWindow {
   bool runs_host() const { return runs_host_; }
 
  private:
+  // The screen a host of module `m` gets in this window (null: a module not
+  // known yet): module_screen's rule on its monitor, or /p's 320x240.
+  ModuleScreen screen_for(const Module* m) const;
   void spawn();
   void watchdog();
   void rotate();
@@ -274,7 +302,9 @@ class SaverWindow {
   Filter filter_for(bool d2d, bool upscale) const;
   void maybe_capture();   // AD_SCR_TEST_CAPTURE
   void draw_message(HDC dc, const std::wstring& text);
-  void set_status(std::wstring text);
+  // What the window says on black instead of a frame ("" for nothing); the
+  // test hook exits with `test_exit` when it appears.
+  void set_status(std::wstring text, int test_exit = kExitStartFailed);
 
   App& app_;
   int index_;
@@ -290,8 +320,8 @@ class SaverWindow {
   bool rotate_waiting_ = false;    // the owner's rotation waits for a game to end
   std::unique_ptr<HostProcess> host_;
   uint64_t generation_ = 0;
-  SizeI emu_{};                    // the current host's emulated screen
-  std::wstring seed_path_;         // consumed by the first spawn
+  ModuleScreen screen_{};          // the current host's emulated screen (its module's: module_screen)
+  std::vector<Seed> seeds_;        // consumed by the first spawn
   AdwHostStatusV1 status_cache_{};
   bool status_valid_ = false;
   std::unique_ptr<Frame> current_;
@@ -367,11 +397,17 @@ class App {
   void on_deactivate();
   void on_session_away(const char* what);
   void check_caps();
+  // Num Lock, as Caps Lock (INTERACTION.md §3.2), for a host that said
+  // numlock=1 (HostCapabilities::takes_numlock_lines): a NUMLOCK line when
+  // the toggle changed since the owner's host last heard it. It never ends
+  // the saver (input_rules.h: exempt_key).
+  void check_numlock();
   // Status changed (or might have): wake, play starting/ending, held decisions.
   void poll_status();
-  // The Caps Lock toggle, the cursor and the buttons: real, or the test
-  // script's synthetic ones.
+  // The Caps Lock and Num Lock toggles, the cursor and the buttons: real, or
+  // the test script's synthetic ones.
   int caps_toggle() const;
+  int numlock_toggle() const;
   POINT cursor_pos() const;
   bool scripted() const { return !script.empty() || script_loaded; }
   // Called by a window whose host is being replaced.
@@ -388,6 +424,33 @@ class App {
   Catalog catalog;
   std::wstring win_dir, host_exe;
   std::vector<std::string> available;      // ids whose module file exists
+  bool is_available(const std::string& id) const {
+    return std::find(available.begin(), available.end(), id) != available.end();
+  }
+  // What the host can run (--capabilities, dialog_support.h). When the
+  // rotation holds a module of another ABI than After Dark's (caps_gate),
+  // Random leaves out a module this host can't run (its lane or its module
+  // ABI isn't listed): a host too old for Star Wars Screen Entertainment's
+  // Intermission modules would run them into errors, a black screen three
+  // times over each pass. Its first hosts wait for the answer, kCapsWaitMs
+  // at most; any other run never waits and only logs it. The answer comes
+  // to this thread (WM_APP_CAPS, on_thread_message), whatever windows a
+  // relayout has made or retired meanwhile.
+  HostCapabilities host_caps;
+  bool caps_gate = false;                  // the rotation waits for, and applies, the answer
+  bool caps_waiting = false;               // ...which hasn't come yet
+  UINT_PTR caps_wait_timer = 0;            // thread timer: the end of that wait
+  // The first rotation built says in the logs what it holds (the others hold
+  // the same); a relayout during the wait may retire window 0 before it builds one.
+  bool rotation_logged = false;
+  // Random may play it: always without the gate; with it, when the host
+  // lists its lane and ABI (or never answered).
+  bool may_rotate(const std::string& id) const {
+    const Module* m = catalog.find(id);
+    return !caps_gate || !m || host_caps.runs(m->lane, m->abi);
+  }
+  void on_capabilities(const HostCapabilities& caps);   // the probe answered
+  void caps_wait_over();                               // ...or the wait ran out
   std::wstring message;
   int message_code = kExitOk;
   HANDLE job = nullptr;
@@ -408,7 +471,9 @@ class App {
   size_t topology_changes = 0;             // relayouts so far (AD_SCR_TEST_MONITORS layout)
   bool relayouting = false;                // our own window shuffle is not the user leaving
   std::vector<HANDLE> seed_files;          // delete-on-close desktop captures, open until we exit
-  std::map<int, std::wstring> seed_paths;  // window index -> its capture (first host only)
+  // Window index -> its captures, one per screen its first host may be
+  // given (first host only).
+  std::map<int, std::vector<SaverWindow::Seed>> seed_paths;
 
   // Input state.
   UINT_PTR caps_timer = 0, hold_timer = 0, script_timer = 0;
@@ -426,6 +491,7 @@ class App {
   ULONGLONG script_wait_until = 0;
   uint64_t script_frames_target = 0;
   int synthetic_caps = 0;
+  int synthetic_numlock = 0;
   POINT synthetic_cursor{};
 
  private:
@@ -500,11 +566,15 @@ void SaverWindow::start() {
     }
   }
   if (!runs_host_) return;
+  if (app_.caps_waiting) return;   // App::on_capabilities (or the end of the wait) starts it
+  start_rotation();
+}
+
+void SaverWindow::start_rotation() {
+  if (rotation_ || !runs_host_ || app_.exiting) return;
   std::vector<std::string> ids;
   const Settings& s = app_.settings;
-  auto avail = [&](const std::string& id) {
-    return std::find(app_.available.begin(), app_.available.end(), id) != app_.available.end();
-  };
+  auto avail = [&](const std::string& id) { return app_.is_available(id); };
   std::string first;
   if (!s.is_random()) {
     if (avail(s.module)) first = s.module;
@@ -514,21 +584,39 @@ void SaverWindow::start() {
     // Module=random, or a Randomize list: rotate through the list (a named
     // Module plays first), limited to the releases in Collections, with
     // byte-identical copies once per pass (COVERS.md §1.8). An empty or
-    // all-stale list means every module.
-    RotationPlan plan = effective_rotation(s, app_.catalog, avail);
-    if (plan.collections_ignored && index_ == 0) {
+    // all-stale list means every module. Random leaves out what this host
+    // can't run (App::may_rotate): a list of only such modules means every
+    // module it can run. A module chosen on its own is tried all the same,
+    // and says why it can't start.
+    const HostRotation r =
+        rotation_for_host(s, app_.catalog, avail, [&](const std::string& id) { return app_.may_rotate(id); });
+    const bool log_it = !app_.rotation_logged;
+    app_.rotation_logged = true;
+    if (r.plan.collections_ignored && log_it) {
       log_line("rotation: Collections ignored (nothing checked in them)");
       last_log("rotation: Collections ignored (nothing checked in them)");
     }
-    ids = std::move(plan.ids);
-    if (!plan.lead.empty()) first = plan.lead;
-    if (index_ == 0) {
+    ids = r.plan.ids;
+    first = r.plan.lead;   // a named Module leads, unless this host can't run it
+    // Nothing is left when the host can run none of the modules imported:
+    // then nothing plays (below), rather than every one of them in turn into
+    // errors, black and "could not be started" over and over.
+    const bool none_runs = ids.empty() && r.left_out > 0;
+    if (ids.empty() && !none_runs) ids = app_.available;
+    if (log_it) {
       std::string f;
       for (const auto& id : effective_collections(s.collections, app_.catalog)) f += (f.empty() ? "" : ",") + id;
       log_line("rotation: %zu module(s), collections=%s", ids.size(), f.empty() ? "all" : f.c_str());
+      if (r.left_out) last_log("rotation: left out %zu module(s) this host can't run", r.left_out);
     }
-    if (ids.empty()) ids = app_.available;
     rotating_ = true;
+    if (none_runs) {
+      // As the not-imported and host-missing messages do, this says what is
+      // wrong: the settings dialog shows these modules "Coming soon".
+      set_status(app_.preview ? L"No module can run on this host"
+                              : L"None of the modules imported can run on this Long After Dark host (adhostwin.exe).",
+                 kExitNoneRuns);
+    }
   } else if (!first.empty()) {
     ids.push_back(first);
   } else {
@@ -545,12 +633,34 @@ void SaverWindow::start() {
   }
 }
 
+ModuleScreen SaverWindow::screen_for(const Module* m) const {
+  // /p: a thumbnail in someone else's window, 320x240 for every module. The
+  // host renders an output that small through a guest display of at least
+  // 640x480 (host/ne16 "Small screens"), so a 640x480 scene of a module's own
+  // (an Intermission or a Star Trek module's) fills it too, as it does a 4:3
+  // monitor.
+  if (app_.preview) return ModuleScreen{{320, 240}, true};
+  // Its own screen when it has one (its catalog "screen", or its ABI's),
+  // else the Resolution setting on this monitor.
+  return module_screen(m ? own_screen(m->abi, m->screen) : SizeI{}, aspect_, app_.settings.scale);
+}
+
 ScreenSlot SaverWindow::slot() const {
   ScreenSlot s;
   s.rc = {(int)rc_.left, (int)rc_.top, (int)(rc_.right - rc_.left), (int)(rc_.bottom - rc_.top)};
   s.runs_host = runs_host_;
   s.message = !message_.empty();
-  if (runs_host_) s.emu = emulated_screen_size(aspect_, app_.settings.scale);
+  if (runs_host_) {
+    // The screen its host renders; between two hosts (a respawn due), the one
+    // its module's next host gets here; before its first (the rotation not
+    // built yet), the monitor's, as an After Dark module's. A module with a
+    // screen of its own (an Intermission or a Star Trek module) keeps it on
+    // any monitor, so its window can move anywhere and keep its host
+    // (plan_relayout).
+    const ModuleScreen ms = host_ ? screen_ : screen_for(rotation_ ? app_.catalog.find(rotation_->current()) : nullptr);
+    s.emu = ms.emu;
+    s.fixed = ms.fixed;
+  }
   return s;
 }
 
@@ -585,7 +695,12 @@ void SaverWindow::spawn() {
   halftone_upscale_ = true;
   halftone_samples_ = 0;
   halftone_ms_ = 0;
-  SizeI emu = app_.preview ? SizeI{320, 240} : emulated_screen_size(aspect_, app_.settings.scale);
+  // Each host its own module's screen (module_screen): a rotation from an
+  // After Dark module to one with a screen of its own (an Intermission or a
+  // Star Trek module), or back, gets a host of the new size, and the
+  // letterbox follows its frames.
+  const ModuleScreen screen = screen_for(m);
+  const SizeI emu = screen.emu;
   std::map<int, int> cv;
   if (auto it = app_.settings.controls.find(m->id); it != app_.settings.controls.end()) {
     // The catalog is authoritative about which slots exist and their ranges;
@@ -596,12 +711,30 @@ void SaverWindow::spawn() {
   }
   std::string cvset = format_cvset(cv);
   // Modules latch the Caps Lock toggle when they start (INTERACTION.md §3.1);
-  // every window's host gets it, owner or not.
+  // every window's host gets it, owner or not. The Num Lock toggle too, for
+  // a host that keeps one (numlock=1; dialog_support.h: numlock_env): Final
+  // Exam begins its exam on a change of it, so the host must start with the
+  // real one. Before the host's answer every host gets it (one that doesn't
+  // know ADNUMLOCK ignores it).
   const int caps = app_.caps_toggle();
+  const int numlock = app_.numlock_toggle();
+  const std::pair<std::wstring, std::wstring> numlock_var = numlock_env(app_.host_caps, numlock != 0);
   // Sound (AUDIO.md §9): the primary monitor's window's host alone, in /s,
   // with Sound=1; every other host is told ADSOUND=0.
   const SoundChoice sound = sound_for(app_.settings, app_.preview ? HostRole::control_panel : HostRole::saver,
                                       this == app_.owner(), app_.sound_forced_off);
+
+  // Only a window's first host starts on the desktop (§8), from the capture
+  // taken at its screen; without one (it failed, or its screen was not among
+  // the three planned, plan_seed_shots) it starts on black.
+  std::wstring seed;
+  for (const Seed& s : seeds_) {
+    if (s.screen == screen) seed = s.path;
+  }
+  if (!seeds_.empty() && seed.empty()) {
+    last_log("seed window=%d: none taken at %dx%d; the module starts on black", index_, emu.w, emu.h);
+  }
+  seeds_.clear();
 
   HostSpec spec;
   spec.exe = app_.host_exe;
@@ -614,14 +747,13 @@ void SaverWindow::spawn() {
       {L"ADCVSET", widen(cvset)},      // empty removes a stale inherited value
       {L"AD_ASSETS_DIR", assets_root()},
       {L"ADCAPS", caps ? L"1" : L"0"},
+      numlock_var,
       {L"ADSTATE", state_dir()},
-      // Only a window's first host starts on the desktop (§8); an empty
-      // value removes a stale inherited one.
-      {L"ADSEEDIMG", seed_path_},
+      // An empty value removes a stale inherited one.
+      {L"ADSEEDIMG", seed},
   };
   add_sound_env(spec.env, sound);
-  const bool seeded = !seed_path_.empty();
-  seed_path_.clear();
+  const bool seeded = !seed.empty();
   spec.stderr_path = env_w(L"AD_SCR_HOSTLOG");
   spec.priority_class = app_.preview ? BELOW_NORMAL_PRIORITY_CLASS : 0;
 
@@ -631,8 +763,9 @@ void SaverWindow::spawn() {
   // Previews are thumbnails: 30 fps is plenty and keeps the control panel light.
   host_->set_min_go_interval(app_.preview ? 30ms : 12ms);
   status_valid_ = false;
-  emu_ = emu;
+  screen_ = screen;
   caps_sent = caps;
+  numlock_sent = numlock_var.second.empty() ? -1 : numlock;
   std::wstring err;
   if (!host_->start(spec, app_.job, &err)) {
     last_log("spawn-failed window=%d module=%s: %s", index_, m->id.c_str(), narrow(err).c_str());
@@ -643,9 +776,10 @@ void SaverWindow::spawn() {
     return;
   }
   app_.pacer.add(host_.get());
-  last_log("spawn window=%d gen=%llu module=%s path=%s size=%dx%d cvset=%s caps=%d seed=%d sound=%d volume=%d pid=%lu",
+  last_log("spawn window=%d gen=%llu module=%s path=%s size=%dx%d cvset=%s caps=%d numlock=%d seed=%d sound=%d volume=%d "
+           "pid=%lu",
            index_, (unsigned long long)generation_, m->id.c_str(), narrow(spec.module_path).c_str(), emu.w, emu.h,
-           cvset.c_str(), caps, seeded ? 1 : 0, sound.on ? 1 : 0, sound.on ? sound.volume : -1, host_->pid());
+           cvset.c_str(), caps, numlock_sent, seeded ? 1 : 0, sound.on ? 1 : 0, sound.on ? sound.volume : -1, host_->pid());
 }
 
 void SaverWindow::kill_host(bool wait) {
@@ -695,13 +829,16 @@ OwnerStatus SaverWindow::status() {
   return st;
 }
 
+// Both by the current host's screen: a module's own 640x480 (an Intermission
+// or a Star Trek module's) is pillarboxed on a widescreen monitor, and its
+// clicks and moves land on it (Final Exam's mouse move ends its exam).
 POINT SaverWindow::map_cursor(POINT screen) const {
-  RectI fit = fit_rect(emu_.w, emu_.h, rc_.right - rc_.left, rc_.bottom - rc_.top);
-  return map_to_frame(screen, rc_, fit, emu_);
+  RectI fit = fit_rect(screen_.emu.w, screen_.emu.h, rc_.right - rc_.left, rc_.bottom - rc_.top);
+  return map_to_frame(screen, rc_, fit, screen_.emu);
 }
 
 RECT SaverWindow::frame_screen() const {
-  RectI fit = fit_rect(emu_.w, emu_.h, rc_.right - rc_.left, rc_.bottom - rc_.top);
+  RectI fit = fit_rect(screen_.emu.w, screen_.emu.h, rc_.right - rc_.left, rc_.bottom - rc_.top);
   return frame_screen_rect(rc_, fit);
 }
 
@@ -946,14 +1083,14 @@ void SaverWindow::maybe_capture() {
            last_d2d_ ? "d2d" : "gdi", filter == Filter::nearest ? "nearest" : "smooth", ok ? "" : ": ", err.c_str());
 }
 
-void SaverWindow::set_status(std::wstring text) {
+void SaverWindow::set_status(std::wstring text, int test_exit) {
   if (status_ == text) return;
   status_ = std::move(text);
   if (!status_.empty()) {
     last_log("status window=%d: %s", index_, narrow(status_).c_str());
     current_.reset();   // the message goes on black, not over a stale frame
     if (d2d_) d2d_->release();   // GDI draws it: the window is GDI's again
-    if (app_.hooks.exit_after_frames > 0) PostMessageW(hwnd, WM_APP_TESTEXIT, kExitStartFailed, 0);
+    if (app_.hooks.exit_after_frames > 0) PostMessageW(hwnd, WM_APP_TESTEXIT, (WPARAM)test_exit, 0);
   }
   InvalidateRect(hwnd, nullptr, FALSE);
 }
@@ -1091,6 +1228,12 @@ LRESULT SaverWindow::handle(UINT msg, WPARAM wp, LPARAM lp) {
           if (ps && ps->PowerSetting == kConsoleDisplayState && ps->DataLength >= sizeof(DWORD)) {
             DWORD state = 0;
             memcpy(&state, ps->Data, sizeof(state));
+#if AD_SCR_TEST_HOOKS
+            if (app_.hooks.display_on && state == 0) {
+              log_line("display state 0 taken as on (AD_SCR_TEST_DISPLAY_ON)");
+              state = 1;
+            }
+#endif
             app_.set_display_on(state != 0);   // dimmed still shows us
           }
           return TRUE;
@@ -1130,11 +1273,6 @@ LRESULT SaverWindow::handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_TESTEXIT:
       app_.request_exit((int)wp, "test hook");
       return 0;
-    case WM_APP_CAPS_LINE: {
-      std::unique_ptr<std::string> line(reinterpret_cast<std::string*>(lp));
-      last_log("host capabilities: %s", line->empty() ? "(no answer)" : line->c_str());
-      return 0;
-    }
     case WM_TIMER:
       if (wp == kTimerWatchdog) {
         watchdog();
@@ -1190,8 +1328,8 @@ bool App::load() {
     }
   }
   if (available.empty()) {
-    message = preview ? L"After Dark modules not imported"
-                      : L"After Dark modules not imported — open Screen Saver Settings…";
+    // Any release will do (six of After Dark, Star Wars Screen Entertainment).
+    message = preview ? L"No modules imported" : L"No modules imported — open Screen Saver Settings…";
     message_code = kExitNotImported;
   } else if (!file_exists(host_exe)) {
     message = preview ? L"Long After Dark host missing"
@@ -1212,31 +1350,77 @@ bool App::load() {
 }
 
 // INTERACTION.md §8: each monitor as it is now, before any saver window
-// covers it, at the emulated size of the window that will cover it.
+// covers it, at the emulated size of the window that will cover it: its
+// first host's, which depends on that host's module (module_screen). The
+// first module isn't known yet (a rotation's is drawn when it is built, after
+// the host's answer when Random waits for it), so a window that may start
+// with an After Dark module or one with a screen of its own (an Intermission
+// or a Star Trek module) gets both captures: the whole monitor at its After
+// Dark size, as ever, and the part that module's frame covers (640x480 of
+// its own: seed_source). Its first host takes its own. Three at most
+// (plan_seed_shots: a catalog may give every module a screen of its own);
+// a first host whose screen has none starts on black (SaverWindow::spawn).
 void App::capture_seeds(const std::vector<Monitor>& mons) {
   if (preview || !message.empty()) return;
   if (!settings.start_from_desktop) {
     last_log("seed: off (StartFromDesktop=0)");
     return;
   }
+  const std::set<SizeI> owns =
+      first_module_screens(settings, catalog, [this](const std::string& id) { return is_available(id); });
   int index = next_window_index;
   for (const Monitor& m : mons) {
     ScreenSlot s = slot_for(m);
     const int idx = index++;
     if (!s.runs_host) continue;
+    const int mw = m.rc.right - m.rc.left, mh = m.rc.bottom - m.rc.top;
+    std::vector<ModuleScreen> screens;
+    for (const SizeI& own : owns) screens.push_back(module_screen(own, (double)mw / std::max(1, mh), settings.scale));
+    // One BitBlt of the monitor for all of them, each picture its part
+    // shrunk on its own and written before the next is made (one in memory
+    // at a time), three at most (plan_seed_shots: After Dark's first, today's
+    // file name, then 640x480 and the smallest of the other sizes of their
+    // own); one the same as a picture before it, as on a 4:3 monitor at 480
+    // lines, is that one's file, and no picture of its own (a shot without a
+    // size).
+    size_t left_out = 0;
+    const std::vector<SeedShotPlan> plan = plan_seed_shots(screens, mw, mh, &left_out);
+    std::vector<SeedShot> shots;
+    for (const SeedShotPlan& p : plan) shots.push_back(p.same < 0 ? SeedShot{p.src, p.screen.emu} : SeedShot{});
     auto t0 = Clock::now();
-    std::vector<uint8_t> p6 = capture_monitor_p6(m.rc, s.emu);
-    std::wstring path = seed_file_path(GetCurrentProcessId(), idx), err;
-    HANDLE h = write_seed_file(path, p6, &err);
-    if (h == INVALID_HANDLE_VALUE) {
-      last_log("seed window=%d: %s", idx, narrow(err).c_str());
-      continue;
+    std::vector<std::wstring> written(plan.size());
+    capture_monitor_shots(m.rc, shots, [&](size_t i, const std::vector<uint8_t>& p6) {
+      const ModuleScreen& ms = plan[i].screen;
+      const RectI& src = plan[i].src;
+      if (const int same = plan[i].same; same >= 0) {
+        if (written[same].empty()) return;   // that one failed: logged there
+        written[i] = written[same];
+        seed_paths[idx].push_back({ms, written[i]});
+        last_log("seed window=%d %dx%d%s: the same picture as above", idx, ms.emu.w, ms.emu.h,
+                 ms.fixed ? " (the frame's part of the monitor)" : "");
+        return;
+      }
+      std::wstring path = seed_file_path(GetCurrentProcessId(), idx,
+                                         ms.fixed ? std::to_wstring(ms.emu.w) + L"x" + std::to_wstring(ms.emu.h) : L""),
+                   err;
+      HANDLE h = write_seed_file(path, p6, &err);
+      if (h == INVALID_HANDLE_VALUE) {
+        last_log("seed window=%d: %s", idx, narrow(err).c_str());
+        return;
+      }
+      seed_files.push_back(h);
+      seed_paths[idx].push_back({ms, path});
+      written[i] = path;
+      // The first picture's time includes the monitor's capture.
+      last_log("seed window=%d %dx%d from %dx%d%s in %lld ms", idx, ms.emu.w, ms.emu.h, src.w, src.h,
+               ms.fixed ? " (the frame's part of the monitor)" : "",
+               (long long)std::chrono::duration_cast<milliseconds>(Clock::now() - t0).count());
+      t0 = Clock::now();
+    });
+    if (left_out > 0) {
+      last_log("seed window=%d: none taken at %zu more screens of modules' own (%zu at most: 640x480, then the "
+               "smallest); a first host at one starts on black", idx, left_out, kMaxOwnSeedShots);
     }
-    seed_files.push_back(h);
-    seed_paths[idx] = path;
-    last_log("seed window=%d %dx%d from %ldx%ld in %lld ms", idx, s.emu.w, s.emu.h, m.rc.right - m.rc.left,
-             m.rc.bottom - m.rc.top,
-             (long long)std::chrono::duration_cast<milliseconds>(Clock::now() - t0).count());
   }
 }
 
@@ -1259,6 +1443,10 @@ int App::run() {
   pacer.start();
 
   bool ok_host = message.empty();
+  // Only a rotation holding a module of another ABI than After Dark's waits
+  // for the host's answer (App::caps_gate), whatever the mode.
+  caps_gate = ok_host && rotation_needs_capabilities(settings, catalog,
+                                                     [this](const std::string& id) { return is_available(id); });
   if (preview) {
     HWND parent = reinterpret_cast<HWND>(args.hwnd);
     if (!IsWindow(parent)) return kExitBadArgs;
@@ -1288,7 +1476,7 @@ int App::run() {
     capture_seeds(mons);
     for (const Monitor& m : mons) {
       auto w = make_window(m);
-      if (auto it = seed_paths.find(w->index()); it != seed_paths.end()) w->set_seed(it->second);
+      if (auto it = seed_paths.find(w->index()); it != seed_paths.end()) w->set_seeds(it->second);
       if (w->create_fullscreen(m.rc)) windows.push_back(std::move(w));
     }
     if (windows.empty()) return kExitBadArgs;
@@ -1301,16 +1489,24 @@ int App::run() {
     ShowCursor(FALSE);
     SetForegroundWindow(windows.front()->hwnd);
     start_input();
-    // What the host can do, for the log (never delays the first frame).
-    if (message.empty()) {
-      HWND to = windows.front()->hwnd;
-      std::wstring exe = host_exe;
-      std::thread([to, exe] {
-        HostCapabilities c = probe_capabilities(exe, 5000);
-        auto* line = new std::string(c.known ? c.line : std::string());
-        if (!PostMessageW(to, WM_APP_CAPS_LINE, 0, reinterpret_cast<LPARAM>(line))) delete line;
-      }).detach();
-    }
+  }
+  // What the host can do: for /s's last-exit log, and for what Random may
+  // play when the rotation needs it (caps_gate: then, /p as well, the first
+  // hosts wait for the answer, kCapsWaitMs at most). Otherwise it never
+  // delays the first frame. The answer comes to this thread (WM_APP_CAPS):
+  // the windows may be gone or new by then.
+  if (message.empty() && (!preview || caps_gate)) {
+    const DWORD to = GetCurrentThreadId();
+    std::wstring exe = host_exe;
+    std::thread([to, exe] {
+      auto* caps = new HostCapabilities(probe_capabilities(exe, 5000));
+      if (!PostThreadMessageW(to, WM_APP_CAPS, 0, reinterpret_cast<LPARAM>(caps))) delete caps;
+    }).detach();
+  }
+  if (caps_gate) {
+    caps_wait_timer = SetTimer(nullptr, 0, kCapsWaitMs, nullptr);
+    caps_waiting = caps_wait_timer != 0;   // no timer, no wait: nothing could end it for sure
+    log_line("rotation: waiting for the host's capabilities (a module of another ABI)");
   }
   for (auto& w : windows) w->start();
 
@@ -1341,7 +1537,7 @@ void App::request_exit(int code, const char* why) {
     clip_active = false;
     log_line("clip released (exit)");
   }
-  for (UINT_PTR* t : {&caps_timer, &hold_timer, &script_timer}) {
+  for (UINT_PTR* t : {&caps_timer, &hold_timer, &script_timer, &caps_wait_timer}) {
     if (*t) KillTimer(nullptr, *t);
     *t = 0;
   }
@@ -1357,6 +1553,30 @@ void App::request_exit(int code, const char* why) {
   for (auto& w : windows) if (w->hwnd && !preview) ShowWindow(w->hwnd, SW_HIDE);
   for (auto& w : windows) w->request_quit();   // all hosts start quitting in parallel
   PostQuitMessage(code);
+}
+
+// The host's --capabilities answer (known or not): logged, kept for what
+// Random may play (may_rotate) and whether Num Lock reaches the owner's host
+// (check_numlock: a change made while it was awaited goes out now), and the
+// end of the first hosts' wait.
+void App::on_capabilities(const HostCapabilities& caps) {
+  host_caps = caps;
+  last_log("host capabilities: %s", caps.known ? caps.line.c_str() : "(no answer)");
+  check_numlock();
+  caps_wait_over();
+}
+
+// The first hosts start now: the host answered, or kCapsWaitMs ran out (the
+// rotation then keeps every module, as with a host too old to answer).
+void App::caps_wait_over() {
+  if (!caps_waiting) return;
+  caps_waiting = false;
+  if (caps_wait_timer) KillTimer(nullptr, caps_wait_timer);
+  caps_wait_timer = 0;
+  if (exiting) return;
+  for (auto& w : windows) {
+    if (w->runs_host() && !w->rotation_started()) w->start_rotation();
+  }
 }
 
 ScreenSlot App::slot_for(const Monitor& m) const {
@@ -1391,6 +1611,14 @@ void App::display_changed() {
 }
 
 bool App::on_thread_message(const MSG& msg) {
+  if (msg.message == WM_APP_CAPS) {
+    // The probe's answer (App::run): no window of ours is its target, so a
+    // relayout can't lose it. (A modal loop would drop a thread message; the
+    // saver runs none.)
+    std::unique_ptr<HostCapabilities> caps(reinterpret_cast<HostCapabilities*>(msg.lParam));
+    if (caps) on_capabilities(*caps);
+    return true;
+  }
   if (msg.message != WM_TIMER) return false;
   if (relayout_timer && msg.wParam == relayout_timer) {
     KillTimer(nullptr, relayout_timer);
@@ -1400,11 +1628,17 @@ bool App::on_thread_message(const MSG& msg) {
   }
   if (caps_timer && msg.wParam == caps_timer) {
     check_caps();
+    check_numlock();
     poll_status();
     return true;
   }
   if (hold_timer && msg.wParam == hold_timer) {
     poll_status();
+    return true;
+  }
+  if (caps_wait_timer && msg.wParam == caps_wait_timer) {
+    last_log("host capabilities: no answer within %u ms; Random keeps every module", kCapsWaitMs);
+    caps_wait_over();
     return true;
   }
   if (script_timer && msg.wParam == script_timer) {
@@ -1552,6 +1786,11 @@ int App::caps_toggle() const {
   return (GetKeyState(VK_CAPITAL) & 1) ? 1 : 0;
 }
 
+int App::numlock_toggle() const {
+  if (scripted()) return synthetic_numlock;
+  return (GetKeyState(VK_NUMLOCK) & 1) ? 1 : 0;
+}
+
 POINT App::cursor_pos() const {
   if (scripted()) return synthetic_cursor;
   POINT p{};
@@ -1614,6 +1853,21 @@ void App::check_caps() {
   }
 }
 
+void App::check_numlock() {
+  // Only a host that numbers NUMLOCK lines hears one: another would leave the
+  // input lines' numbers behind the saver's count (dialog_support.h).
+  if (exiting || !host_caps.takes_numlock_lines()) return;
+  SaverWindow* o = owner();
+  if (!o || !o->host()) return;
+  const int now = numlock_toggle();
+  if (o->numlock_sent == now) return;
+  uint64_t n = o->send_input(numlock_line(now != 0));
+  if (n) {
+    o->numlock_sent = now;
+    log_line("input: numlock %d -> owner (n=%llu)", now, (unsigned long long)n);
+  }
+}
+
 void App::on_key(int vk, bool down, bool sys) {
   if (exiting) return;
   InputEvent ev{sys ? (down ? InputKind::syskey_down : InputKind::syskey_up)
@@ -1621,10 +1875,12 @@ void App::on_key(int vk, bool down, bool sys) {
                 vk};
   uint64_t n = 0;
   if (!sys) {
-    // The owner hears the key first, then whether Caps Lock changed (checked
-    // on both down and up: whenever Windows flips the toggle bit).
+    // The owner hears the key first, then whether Caps Lock or Num Lock
+    // changed (checked on both down and up: whenever Windows flips a toggle
+    // bit).
     if (SaverWindow* o = owner()) n = o->send_input(key_line(vk, down));
     check_caps();
+    check_numlock();
   }
   evaluate(ev, n);
 }
@@ -1794,7 +2050,9 @@ void App::script_tick() {
     ++script_pos;
     switch (s.op) {
       case TestStep::Op::key:
-        if (s.a == VK_CAPITAL && s.b) synthetic_caps ^= 1;   // Windows flips the toggle on the down
+        // Windows flips a toggle on the down.
+        if (s.a == VK_CAPITAL && s.b) synthetic_caps ^= 1;
+        if (s.a == VK_NUMLOCK && s.b) synthetic_numlock ^= 1;
         on_key(s.a, s.b != 0, false);
         break;
       case TestStep::Op::syskey:
@@ -1802,6 +2060,9 @@ void App::script_tick() {
         break;
       case TestStep::Op::caps_state:
         synthetic_caps = s.a;
+        break;
+      case TestStep::Op::numlock_state:
+        synthetic_numlock = s.a;
         break;
       case TestStep::Op::button:
         on_button((uint32_t)s.a, s.b != 0);

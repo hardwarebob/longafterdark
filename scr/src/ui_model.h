@@ -39,8 +39,9 @@ std::wstring duration_label(int minutes);
 // The Random mode line under the module list: "All 84 in rotation" /
 // "12 of 84 in rotation" / "None in rotation". `runnable` is how many of the
 // checked modules this adhostwin can run now (-1: not known yet). When some
-// can't (the Classic lane isn't built in), the line says so rather than
-// promising a rotation the saver can't play: "All 84 selected · 23 can run now".
+// can't (their lane or module ABI isn't built in), the line says so rather
+// than promising a rotation the saver can't play: "All 84 selected · 23 can
+// run now".
 // `distinct` is how many different modules those checks are (-1: not
 // counted): a module several releases ship byte for byte plays once per pass
 // (COVERS.md §1.8), so with copies checked the line says what rotates, "All
@@ -54,9 +55,9 @@ std::wstring rotation_tip(size_t checked, long long distinct, const std::wstring
 
 // The assets line in the footer: "202 modules from 5 releases", or with one
 // release "84 modules from After Dark 4.0 Deluxe", with " · 2 missing —
-// import again to restore" when files are gone, or "After Dark isn’t
-// imported yet" when the catalog is empty (COVERS.md §1.7). It is a status
-// line, so there is no closing full stop.
+// import again to restore" when files are gone, or "Nothing imported yet"
+// when the catalog is empty (COVERS.md §1.7). It is a status line, so there
+// is no closing full stop.
 struct AssetCounts {
   size_t total = 0, releases = 0, missing = 0;
   std::string release;   // the title of the one release there is ("" otherwise, or when it has none of its own)
@@ -65,7 +66,8 @@ AssetCounts count_assets(const Catalog& c, const std::vector<bool>& present);
 std::wstring assets_summary(const AssetCounts& a);
 
 // The not-imported welcome's text (under "Welcome to Long After Dark"): what
-// importing does.
+// importing does, for every release (six of After Dark, and Star Wars
+// Screen Entertainment).
 std::wstring welcome_text();
 
 // ---- string-slider stops ---------------------------------------------------------
@@ -267,6 +269,38 @@ struct WindowLayout {
 int dip(int dips, int dpi);
 WindowLayout layout_window(const LayoutInput& in);
 
+// ---- the footer's credit ---------------------------------------------------------------
+// "Made With Love by StarrLord" in the footer, in the free space between the
+// assets line ("232 modules from 7 releases") and Preview: one link to the
+// project's page in the dialog's link look (adw_ui's ButtonRole::subtle, as
+// "Show all" and "Get the covers": its box kLinkPad past its text, a fill on
+// hover and a deeper one pressed, the focus ring around it, a hand pointer),
+// its text in the caption face, like the assets line beside it: the lead in
+// text2, the name in the accent text colour, underlined under the pointer.
+// It is centred in that space and on the footer's buttons, and shows only
+// when all of its box fits with kCreditGapDip clear of the assets line's text
+// and of Preview: never clipped, never touching them.
+inline constexpr wchar_t kFooterCreditLead[] = L"Made With Love by";
+inline constexpr wchar_t kFooterCreditName[] = L"StarrLord";
+inline constexpr wchar_t kFooterCreditUrl[] = L"https://github.com/starrlord/longafterdark";
+inline constexpr int kCreditGapDip = 24;    // clear of the assets line's text and of Preview (the footer's gap)
+inline constexpr int kCreditLinkHDip = 24;  // the link's box, as tall as the strip's "Show all"
+
+struct FooterCreditInput {
+  int assets_right = 0;   // px: where the assets line's text ends (its widest line)
+  int lead_w = 0;         // px: kFooterCreditLead in the caption face
+  int space_w = 0;        // px: a space in it
+  int name_w = 0;         // px: kFooterCreditName in it
+  int line_h = 0;         // px: a line of it
+};
+struct FooterCreditLayout {
+  bool shown = false;
+  Rc box;                 // the link's box: the phrase and kLinkPad each side (hover fill, focus ring, clicks)
+  Rc lead, name;          // the two parts of the phrase, on one line, a space apart
+};
+// Pure: from the window's layout (its footer: Preview) and the texts' sizes.
+FooterCreditLayout layout_footer_credit(const WindowLayout& L, const FooterCreditInput& in);
+
 // Rows of the per-module settings panel (IDC_PANEL), top to bottom, for the
 // module's controls in catalog order. Labels sit above sliders and dropdowns,
 // with the value readout right-aligned on the label row; a dropdown whose
@@ -292,6 +326,45 @@ PanelLayout layout_panel(const std::vector<Control>& controls, int width, int dp
 inline constexpr double kPanelButtonMinDip = 120, kPanelButtonPadDip = 24;
 // A catalog name with nothing to show: only spaces and colons.
 bool blank_label(const std::string& name);
+
+// ---- the module list's group headers ------------------------------------------------
+// `text` cut to fit `room` px with an ellipsis after it ("Star Wars Screen
+// Entert…"), `measure` giving a string's width in px: the text itself when
+// it fits, "" when not even the ellipsis does. Spaces before the ellipsis go.
+std::wstring ellipsize(const std::wstring& text, int room, const std::function<int(const std::wstring&)>& measure);
+
+// A release's header in the module list (the dialog paints it): its title,
+// the number of its modules `gap` after it, and at the right, when none of
+// its modules can run, the "Coming soon" pill. The title gives way,
+// ellipsized, so that the count and the pill always show whole: "Star Wars
+// Screen Entertainment" in the narrowest list keeps its "14" (a title never
+// runs into them). Pixels: the title starts at `left`; the title and the
+// count end by `right`; the pill (`pill_w` wide; 0: none) ends at
+// `pill_right`, `gap` clear of the count.
+struct GroupHeaderInput {
+  std::wstring title;
+  int left = 0, right = 0;
+  int count_w = 0;
+  int gap = 0;
+  int pill_w = 0, pill_right = 0;
+};
+struct GroupHeaderLayout {
+  std::wstring title;       // as drawn: whole, or ellipsized ("" when not even "…" fits)
+  bool ellipsized = false;
+  int title_w = 0;          // its width
+  int count_x = 0;          // where the count starts
+  int pill_x = 0;           // where the pill starts (with a pill)
+};
+GroupHeaderLayout layout_group_header(const GroupHeaderInput& in,
+                                      const std::function<int(const std::wstring&)>& measure_title);
+// A row's checkbox in Random, and a group header's (DIPs).
+inline constexpr int kListBoxDip = 20;
+// A group header's frame across a list `list_w` px wide, as the dialog lays
+// it out: the title from 16 DIP in (in Random, after the group's checkbox and
+// 12 DIP), the title and count ending 16 DIP short of the right edge, the
+// pill 8 DIP short of the scroll bar's gutter (12 DIP while the list
+// scrolls, else 4), `gap` 8 DIP. The title and the widths are left to fill in.
+GroupHeaderInput group_header_frame(int list_w, int dpi, bool random, bool scrolls);
 
 // ---- template definitions ---------------------------------------------------------
 

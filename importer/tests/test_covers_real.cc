@@ -7,11 +7,14 @@
 //      Machine) is fetched into a scratch downloads folder, checked against
 //      its md5 and size, decoded, cropped and rendered as a tile.
 //   2. With AD_E2E_PKG=1, the real package images (found by size and md5 in
-//      AD_SOURCE_ISO_DIR, else <image dir>; the Deluxe ISO also in the
-//      downloads folder, which is only read) are imported into a scratch root
-//      with --no-cover-download, so every disc source is extracted: the
-//      originals must come out 387x183 (ad32), 387x172 (simpsons), 387x204
-//      (tt) and 118x226 (ad10, deluxe).
+//      AD_SOURCE_ISO_DIR, a ';'-separated list, else <image dir>, and the
+//      folders directly in each; the Deluxe ISO also in the downloads folder,
+//      which is only read) are imported into a scratch root with
+//      --no-cover-download, so every disc source is extracted: the originals
+//      must come out 387x183 (ad32), 387x172 (simpsons), 387x204 (tt) and
+//      118x226 (ad10, deluxe). A release with no cover source on its disc
+//      (Star Wars Screen Entertainment: every picture is inside its ARJ
+//      archives) is skipped.
 //   3. Every tile is drawn side by side into covers-sheet.png, for a person
 //      to look at.
 // Nothing is written outside <scratch> and the sheet; the scratch tree is
@@ -44,17 +47,6 @@ struct Tile {
   std::string name;
   Picture tile;
 };
-
-// The first file in `dirs` with this size and md5.
-std::optional<fs::path> find_image(const std::vector<fs::path>& dirs, uint64_t size, const std::string& md5) {
-  std::error_code ec;
-  for (const fs::path& d : dirs)
-    for (auto& e : fs::directory_iterator(d, ec)) {
-      if (!e.is_regular_file(ec) || e.file_size(ec) != size) continue;
-      if (md5_file_hex(e.path()) == md5) return e.path();
-    }
-  return std::nullopt;
-}
 
 Picture sheet(const std::vector<Tile>& tiles) {
   const int cols = std::min<int>(6, int(tiles.size())), rows = int((tiles.size() + 5) / 6);
@@ -124,24 +116,27 @@ int main(int argc, char** argv) {
 
   // 2. The disc sources, through real imports.
   if (env_on("AD_E2E_PKG")) {
-    std::vector<fs::path> dirs;
-    if (const char* e = getenv("AD_SOURCE_ISO_DIR"); e && *e) dirs.push_back(e);
-    dirs.push_back(argv[3]);
+    std::vector<fs::path> dirs = test::image_dirs(argv[3]);
     if (!installed_data.empty()) dirs.push_back(installed_data / L"downloads");
     const std::map<std::string, std::pair<int, int>> want = {
         {"deluxe", {118, 226}}, {"ad10", {118, 226}}, {"ad32", {387, 183}}, {"tt", {387, 204}}, {"simpsons", {387, 172}}};
     fs::path root = dir / L"root";
     for (const Package& p : builtin_packages()) {
       if (p.images.empty()) continue;
-      auto image = find_image(dirs, p.images[0].size, p.images[0].md5);
-      if (!image) {
+      if (std::none_of(p.covers.begin(), p.covers.end(),
+                       [](const CoverSource& c) { return c.kind == CoverSource::Kind::disc; })) {
+        fprintf(stderr, "skip %s: no cover source on its disc\n", p.id);
+        continue;
+      }
+      const fs::path image = test::find_image(dirs, p.images[0].size, p.images[0].md5);
+      if (image.empty()) {
         fprintf(stderr, "skip %s: no image with md5 %s\n", p.id, p.images[0].md5);
         notes.push_back(std::string("no image of ") + p.id);
         continue;
       }
-      fprintf(stderr, "---- %s from %s\n", p.id, to_utf8(image->wstring()).c_str());
+      fprintf(stderr, "---- %s from %s\n", p.id, to_utf8(image.wstring()).c_str());
       test::ProcessResult pr = test::run_process(
-          exe, {L"--no-cover-download", L"--image", image->wstring(), L"--dest", root.wstring(), L"--quiet"}, 1800000);
+          exe, {L"--no-cover-download", L"--image", image.wstring(), L"--dest", root.wstring(), L"--quiet"}, 1800000);
       fprintf(stderr, "%s", pr.output.c_str());
       CHECK_EQ(pr.exit_code, 0);
       fs::path cj = root / L"win" / L"covers" / to_wide(p.id) / L"cover.json";

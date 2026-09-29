@@ -277,7 +277,15 @@ class NativeBridge : public Bridge16 {
   }
 
   // 1:05c6 LoadAdSnd, without the VerStr gate (PACKAGES.md §7.4): 0 ok,
-  // 1 cannot load, 3 an entry point is missing.
+  // 1 AD_SND cannot be loaded, 3 a required entry point is missing — one of
+  // the five (adwSoundInit, adwSoundCleanup, adwSetVolume, adwSetSoundMute,
+  // adwStopSound) or a whole volume pair. The pairs: adwGetSystemVolumes
+  // (LPWORD) + adwSetSystemVolumes(WORD), which OLDMOD16 uses (AD_SND 3.0.3
+  // and later); else AD_SND 1.0's adwSavePreviousVolume() +
+  // adwRestorePreviousVolume() (After Dark 2.0, which has no other: AD.EXE
+  // 2.0b called them, with no arguments, where OLDMOD16 calls the first
+  // pair). The second pair is looked up only when the first is incomplete,
+  // so a 3.x/4.x AD_SND sees the same calls as ever.
   uint16_t load_ad_snd() {
     uint16_t h = uint16_t(api("KERNEL", "LoadLibrary", {l16(str(ad_snd_.c_str()))}));
     if (h < 32) {
@@ -292,27 +300,47 @@ class NativeBridge : public Bridge16 {
     snd_setvol_ = proc(h, "adwSetVolume");
     snd_setmute_ = proc(h, "adwSetSoundMute");
     snd_stop_ = proc(h, "adwStopSound");
-    if (!snd_init_ || !snd_cleanup_ || !snd_getsys_ || !snd_setsys_ || !snd_setvol_ || !snd_setmute_ || !snd_stop_) {
+    if (!snd_getsys_ || !snd_setsys_) {
+      snd_getsys_ = snd_setsys_ = 0;
+      snd_saveprev_ = proc(h, "adwSavePreviousVolume");
+      snd_restoreprev_ = proc(h, "adwRestorePreviousVolume");
+      if (!snd_saveprev_ || !snd_restoreprev_) snd_saveprev_ = snd_restoreprev_ = 0;
+    }
+    const bool volumes = snd_getsys_ || snd_saveprev_;
+    if (!snd_init_ || !snd_cleanup_ || !volumes || !snd_setvol_ || !snd_setmute_ || !snd_stop_) {
       unload_ad_snd();
       return 3;
     }
     rt_.wr8(data_ + nb::kSndBuf, 0);
     rt_.call_far(snd_init_, {w16(0), l16(data_ + nb::kSndBuf)});
-    rt_.call_far(snd_getsys_, {l16(data_ + nb::kSaved)});
+    if (snd_getsys_) {
+      rt_.call_far(snd_getsys_, {l16(data_ + nb::kSaved)});
+    } else {
+      rt_.call_far(snd_saveprev_, {});
+      snd_prev_saved_ = true;
+    }
     return 0;
   }
 
-  // 1:07ac.
+  // 1:07ac. What the load saved is restored, and only that:
+  // adwSetSystemVolumes gets the WORD adwGetSystemVolumes saved (when not 0),
+  // and AD_SND 1.0's adwRestorePreviousVolume runs only once
+  // adwSavePreviousVolume has. A load refused for a missing entry (error id
+  // 3) initialized and saved nothing, so its unload calls adwStopSound and
+  // adwSoundCleanup alone (those that resolved).
   void unload_ad_snd() {
     if (hsnd_) {
       if (snd_stop_) rt_.call_far(snd_stop_, {});
       uint16_t saved = rt_.rd16(data_ + nb::kSaved);
       if (snd_setsys_ && saved) rt_.call_far(snd_setsys_, {w16(saved)});
+      if (snd_restoreprev_ && snd_prev_saved_) rt_.call_far(snd_restoreprev_, {});
       if (snd_cleanup_) rt_.call_far(snd_cleanup_, {});
       api("KERNEL", "FreeLibrary", {w16(hsnd_)});
     }
     hsnd_ = 0;
     snd_init_ = snd_cleanup_ = snd_getsys_ = snd_setsys_ = snd_setvol_ = snd_setmute_ = snd_stop_ = 0;
+    snd_saveprev_ = snd_restoreprev_ = 0;
+    snd_prev_saved_ = false;
     rt_.wr16(data_ + nb::kSaved, 0);
   }
 
@@ -421,6 +449,8 @@ class NativeBridge : public Bridge16 {
   uint16_t hsnd_ = 0;
   uint32_t snd_init_ = 0, snd_cleanup_ = 0, snd_getsys_ = 0, snd_setsys_ = 0, snd_setvol_ = 0, snd_setmute_ = 0,
            snd_stop_ = 0;
+  uint32_t snd_saveprev_ = 0, snd_restoreprev_ = 0;  // AD_SND 1.0's volume pair (load_ad_snd)
+  bool snd_prev_saved_ = false;                      // adwSavePreviousVolume ran (unload_ad_snd restores only then)
   uint16_t hmod_ = 0;
   uint32_t entry_ = 0;
   uint16_t hdc_ = 0, hwnd_ = 0, saved_dc_ = 0, region_ = 0;

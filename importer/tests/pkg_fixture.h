@@ -1,24 +1,33 @@
-// Synthetic sources shaped like the five known After Dark releases
-// (PACKAGES.md §2–§4), for the package tests: the Deluxe and 10th
-// Anniversary CDs' plain FILES trees, and the AD 3.x InstallShield installs
-// (AD 3.2, Totally Twisted, the Simpsons floppies) with encrypted PKZIP
-// archives under the test-only password and an INSTALL.INS-like script that
-// holds it among decoys. Each fixture is a tree (path -> bytes) that can be
-// written as a folder, an ISO image or a FAT floppy image, plus exactly what
-// an import must install and the catalog ids it must list. Modules come from
-// module_builder.h: made-up resources, no After Dark bytes.
+// Synthetic sources shaped like the seven known releases (PACKAGES.md §2–§4),
+// for the package tests: the Deluxe and 10th Anniversary CDs' plain FILES
+// trees; the AD 3.x InstallShield installs (AD 3.2, Totally Twisted, the
+// Simpsons floppies) with encrypted PKZIP archives under the test-only
+// password and an INSTALL.INS-like script that holds it among decoys; a
+// Presage install shaped like Star Wars Screen Entertainment's (INSTALL.DAT,
+// multi-volume ARJ archives with split members, SZDD loose files, decoys
+// that must never be read); and a Microsoft Setup install shaped like Star
+// Trek: The Screen Saver's (SETUP.LST, KWAJ files written by kwaj_builder.h,
+// two install disks, decoys). Each fixture is a tree (path -> bytes) that can
+// be written as a folder, an ISO image, a FAT floppy image (or several), a
+// flat ZIP or a ZIP of floppy images, plus exactly what an import must
+// install and the catalog ids it must list. Modules come from
+// module_builder.h: made-up resources, no bytes of any release.
 #pragma once
 
 #include <deque>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
 
+#include "arj_builder.h"
 #include "fat_builder.h"
 #include "importer.h"
 #include "iso_builder.h"
+#include "kwaj_builder.h"
 #include "md5.h"
 #include "module_builder.h"
+#include "szdd_builder.h"
 #include "test_util.h"
 #include "zip_builder.h"
 
@@ -28,10 +37,12 @@ using Tree = std::map<std::string, std::vector<uint8_t>>;
 
 inline std::vector<uint8_t> vec(const std::string& s) { return std::vector<uint8_t>(s.begin(), s.end()); }
 
-// An NE (Classic) module named `name` importing `refs`.
+// An NE (Classic) module named `name` importing `refs`; it exports MODULE,
+// as every real one does (the catalog lists an NE only as its lane runs it).
 inline std::vector<uint8_t> ne_module(const std::string& name, const std::vector<std::string>& refs) {
   NeSpec ne;
   ne.module_refs = refs;
+  ne.exports = {"MODULE"};
   ne.resources = {{2000, "", 20, name + '\0'},
                   {2000, "", 30, "About " + name + "\r\n"},
                   {1000, "", 1, checkbox_record("Sound", 1)}};
@@ -346,6 +357,325 @@ inline PkgFixture simpsons_fixture() {
   return p.f;
 }
 
+// ---- Star Wars Screen Entertainment: a Presage install of Intermission modules --------------
+
+// An Intermission IMX module: an NE exporting what the IMX reader looks for
+// (SAVERDLGPROC only with `dialog`), with a dialog template blob.
+inline std::vector<uint8_t> imx_module(const std::string& name, const std::vector<std::string>& refs,
+                                       bool dialog = true) {
+  NeSpec ne;
+  ne.module_name = name;
+  ne.module_refs = refs;
+  ne.exports = {"WEP", "SAVERINIT", "SAVERDRAW"};
+  if (dialog) ne.exports.push_back("SAVERDLGPROC");
+  ne.exports.push_back("LIBMAIN");
+  if (dialog) ne.exports.push_back("SAVERDLGPROC2");
+  ne.resources = {{5, "", 1, "a made-up dialog template of " + name}};
+  return vec(build_ne(ne));
+}
+
+// A plain NE library importing `refs` (the DLLs beside the modules, whose
+// own imports the intermission invariants check).
+inline std::vector<uint8_t> ne_dll(const std::string& name, const std::vector<std::string>& refs) {
+  NeSpec ne;
+  ne.module_name = name;
+  ne.module_refs = refs;
+  ne.exports = {"WEP"};
+  return vec(build_ne(ne));
+}
+
+// A Presage installer script of our own (the real one is never copied):
+// [disks], [data] with the product's short name, a few [install] lines.
+inline std::vector<uint8_t> intermission_dat(const std::string& shortname) {
+  return vec("[disks]\r\n"
+             "1 = \"Made-Up Collection Disk 1\",swse1.arj\r\n"
+             "2 = \"Made-Up Collection Disk 2\",swse2.arj\r\n"
+             "\r\n"
+             "[data]\r\n"
+             "neededspace = 0\r\n"
+             "  ShortName =  " +
+             shortname +
+             "  \r\n"
+             "longname = A Made-Up Screen Saver Collection\r\n"
+             "DestDir = C:\\SAVER\r\n"
+             "\r\n"
+             "[install]\r\n"
+             "; comment lines are skipped\r\n"
+             "1 = 1,stress.dl_,stress.dll,A helper library\r\n"
+             "2 = 1,gm_battl.mi_,battle.mid,Some music,CHECK=24\r\n"
+             "3 = 1,swse1.arj,(DST),The first archive\r\n"
+             "4 = 5,swse.ini,(WIN)\\swse.ini,Settings,CHECK=100\r\n");
+}
+
+// Which install floppy each file is on (INSTALL.DAT's disk column): disk 1
+// has the installer, SWSE1.ARJ and the SZDD files; disks 2-5 one volume of
+// SWSE2 each; disk 5 also SWSE.INI, WinG, the VxDs and the control panel.
+inline int swse_disk(const std::string& name) {
+  if (name == "SWSE2.ARJ") return 2;
+  if (name == "SWSE2.A01") return 3;
+  if (name == "SWSE2.A02") return 4;
+  for (const char* d5 : {"SWSE2.A03", "SWSE.INI", "WING.DL_", "WINGPAL.WN_", "DVA.386", "ANTHOOK.386", "IMCPL.CPL",
+                         "SWSESET.EXE", "SYSINI.DAT"})
+    if (name == d5) return 5;
+  return 1;
+}
+
+// The files a Star Wars Screen Entertainment import must never open (I5):
+// the installer, readme and notes, the other MIDI sets, WinG, the VxDs, the
+// control panel, the chooser.
+inline const std::vector<std::string>& swse_decoys() {
+  static const std::vector<std::string> v = {"README.TXT",  "SVGA.EXE",    "INSTALL.EXE", "SYSINI.DAT",  "SB6BATTL.MI_",
+                                             "FM_TITLE.MI_", "WING.DL_",   "IMCPL.CPL",   "INSTDETL.DAT", "DIB.DR_",
+                                             "ANTHOOK.386", "SWSESET.EXE", "DVA.386",     "WINGPAL.WN_"};
+  return v;
+}
+
+// A Presage install at the source's root (a CD copy of the five floppies):
+// SWSE1.ARJ (every DLL, Intermission and its IMX reader, one module, and
+// four members the recipe skips — damaged on purpose, so decoding any of them
+// would fail the import), SWSE2.ARJ + .A01-.A03 (one archive: stored modules
+// cut across volumes, an LZH member cut across volumes, method 1 and 4
+// members), the SZDD loose files and SWSE.INI, and decoys. `swse1`, when
+// set, changes SWSE1.ARJ's members before the volume is written (the
+// expected files stay those of the unchanged release).
+inline PkgFixture swse_fixture(const std::function<void(std::vector<ArjEntry>&)>& swse1 = {}) {
+  PkgFixture f;
+  const std::string root = "packages/swse";
+  auto expect = [&](const std::string& rel, const std::vector<uint8_t>& d) { f.expect[root + "/" + rel] = d; };
+  const std::vector<std::string> base = {"INTRMLIB", "SWSE", "KERNEL", "USER", "GDI", "STRESS"};
+  auto with = [&](std::vector<std::string> extra) {
+    std::vector<std::string> r = base;
+    r.insert(r.end(), extra.begin(), extra.end());
+    return r;
+  };
+  auto stored = [](const std::string& n, const std::vector<uint8_t>& d, uint8_t flags = 0x10,
+                   std::optional<uint32_t> pos = std::nullopt) { return arj_stored_entry(n, d, flags, pos); };
+
+  // SWSE1.ARJ.
+  const auto intrmlib = ne_dll("INTRMLIB", {"USER", "KERNEL", "GDI", "ANTSW"});
+  const auto antsw = ne_dll("ANTSW", {"KERNEL", "GDI", "USER"});
+  const auto swse = ne_dll("SWSE", {"KERNEL", "USER", "GDI", "MMSYSTEM"});
+  const auto readjpg = ne_dll("READJPG", {"KERNEL", "USER", "GDI", "WIN87EM"});
+  const auto memmidi = arj_vector_plain("m4_text");  // method 4
+  const auto intermis = blob("the Intermission control panel");
+  const auto imimxply = ne_dll("IMIMXPLY", {"KERNEL", "USER"});
+  const auto bluprint = imx_module("BLUPRINT", with({"READJPG"}));
+  auto bad_crc = stored("IMAD_PLY.IMQ", blob("the After Dark reader"));
+  bad_crc.h.crc ^= 1;
+  auto garbage = arj_packed_entry("INTERMSN.HLP", 1, pattern(64, 17), blob("help"));
+  auto bad_snd = stored("AD_SND.DLL", blob("Intermission's sound support"));
+  bad_snd.h.crc ^= 2;
+  std::vector<ArjEntry> members = {
+      stored("INTRMLIB.DLL", intrmlib), stored("ANTSW.DLL", antsw), stored("SWSE.DLL", swse),
+      stored("READJPG.DLL", readjpg),
+      arj_packed_entry("MEMMIDI.DLL", 4, unhex(arj_vector("m4_text").packed), memmidi), stored("INTERMIS.EXE", intermis),
+      stored("IMIMXPLY.IMQ", imimxply), stored("BLUPRINT.IMX", bluprint), bad_crc, bad_snd,
+      stored("IWLIB.DLL", blob("an extension library")), garbage};
+  if (swse1) swse1(members);
+  f.source["SWSE1.ARJ"] = arj_volume("SWSE1.ARJ", false, members);
+  expect("SAVER/INTRMLIB.DLL", intrmlib);
+  expect("SAVER/ANTSW.DLL", antsw);
+  expect("SAVER/SWSE.DLL", swse);
+  expect("SAVER/READJPG.DLL", readjpg);
+  expect("SAVER/MEMMIDI.DLL", memmidi);
+  expect("SAVER/BLUPRINT.IMX", bluprint);
+  expect("ENGINE/INTERMIS.EXE", intermis);
+  expect("ENGINE/IMIMXPLY.IMQ", imimxply);
+
+  // SWSE2.ARJ .. .A03: one archive over four disks.
+  const auto battles = imx_module("BATTLES", base), cantina = imx_module("CANTINA", with({"READJPG", "WIN87EM"}));
+  const auto jawas = imx_module("JAWAS", base), storybrd = imx_module("STORYBRD", with({"READJPG"}));
+  const auto swtext = imx_module("SWTEXT", with({"COMMDLG"})), vader = imx_module("VADER", with({"READJPG"}));
+  const auto swtext_txt = arj_vector_plain("m1_all_bytes");  // method 1
+  const auto p1 = arj_vector_plain("m1_text"), p2 = arj_vector_plain("m1_two_blocks");
+  std::vector<uint8_t> swsfx = p1;  // an LZH member cut across volumes: each segment its own stream
+  swsfx.insert(swsfx.end(), p2.begin(), p2.end());
+  auto half = [](const std::vector<uint8_t>& d, bool second) {
+    const size_t cut = d.size() / 2;
+    return second ? std::vector<uint8_t>(d.begin() + cut, d.end()) : std::vector<uint8_t>(d.begin(), d.begin() + cut);
+  };
+  f.source["SWSE2.ARJ"] = arj_volume("SWSE2.ARJ", true,
+                                     {stored("BATTLES.IMX", battles), stored("CANTINA.IMX", cantina),
+                                      stored("JAWAS.IMX", half(jawas, false), 0x14)});
+  f.source["SWSE2.A01"] = arj_volume("SWSE2.A01", true,
+                                     {stored("JAWAS.IMX", half(jawas, true), 0x18, uint32_t(jawas.size() / 2)),
+                                      stored("STORYBRD.IMX", half(storybrd, false), 0x14)});
+  f.source["SWSE2.A02"] = arj_volume(
+      "SWSE2.A02", true,
+      {stored("STORYBRD.IMX", half(storybrd, true), 0x18, uint32_t(storybrd.size() / 2)),
+       arj_packed_entry("SWSFX.DLL", 1, unhex(arj_vector("m1_text").packed), p1, 0x14)});
+  f.source["SWSE2.A03"] = arj_volume(
+      "SWSE2.A03", false,
+      {arj_packed_entry("SWSFX.DLL", 1, unhex(arj_vector("m1_two_blocks").packed), p2, 0x18, uint32_t(p1.size())),
+       stored("SWTEXT.IMX", swtext),
+       arj_packed_entry("SWTEXT.TXT", 1, unhex(arj_vector("m1_all_bytes").packed), swtext_txt),
+       stored("VADER.IMX", vader)});
+  for (auto& [n, d] : std::vector<std::pair<std::string, std::vector<uint8_t>>>{
+           {"BATTLES.IMX", battles}, {"CANTINA.IMX", cantina}, {"JAWAS.IMX", jawas}, {"STORYBRD.IMX", storybrd},
+           {"SWSFX.DLL", swsfx}, {"SWTEXT.IMX", swtext}, {"SWTEXT.TXT", swtext_txt}, {"VADER.IMX", vader}})
+    expect("SAVER/" + n, d);
+
+  // Loose files: SZDD under the installer's names, and the settings.
+  const auto stress = ne_dll("STRESS", {"KERNEL", "USER", "TOOLHELP"});
+  f.source["STRESS.DL_"] = szdd_encode(stress);
+  expect("SAVER/STRESS.DLL", stress);
+  for (auto [from, to] : std::vector<std::pair<const char*, const char*>>{{"GM_BATTL.MI_", "BATTLE.MID"},
+                                                                          {"GM_CNTNA.MI_", "CANTINA.MID"},
+                                                                          {"GM_EMPIR.MI_", "EMPIRE.MID"},
+                                                                          {"GM_TITLE.MI_", "SWTHEME.MID"}}) {
+    auto music = vec("MThd");
+    auto body = blob(std::string("general midi ") + to, 400);
+    music.insert(music.end(), body.begin(), body.end());
+    f.source[from] = szdd_encode(music);
+    expect(std::string("SAVER/") + to, music);
+  }
+  const auto ini = vec("[Made-Up Module]\r\nSetting=1\r\n");
+  f.source["SWSE.INI"] = ini;
+  expect("WINDOWS/SWSE.INI", ini);
+  f.source["INSTALL.DAT"] = intermission_dat("SWSE");
+  for (const std::string& d : swse_decoys()) f.source[d] = blob("decoy " + d, 200);
+  f.ids = {"swse.battles", "swse.bluprint", "swse.cantina", "swse.jawas", "swse.storybrd", "swse.swtext", "swse.vader"};
+  return f;
+}
+
+// ---- Star Trek: The Screen Saver: a Microsoft Setup install of After Dark 2.0 modules ---------
+
+// An After Dark 2.0 module (the Classic lane: an NE exporting MODULE),
+// `name` as its name resource holds it (with the leading space After Dark
+// 2.0 put in most), importing `refs`, with `controls` (slot, record). Its
+// About text ends with the registrant stand-in and wraps a sentence by hand,
+// as the real ones do.
+inline std::vector<uint8_t> ad20_module(const std::string& name, const std::vector<std::string>& refs,
+                                        const std::vector<std::pair<uint16_t, std::string>>& controls = {},
+                                        bool stand_in = true) {
+  NeSpec ne;
+  ne.module_name = "AD20MOD";
+  ne.module_refs = refs;
+  ne.exports = {"WEP", "MODULE"};
+  std::string about = "ABOUT" + name + "\r\n\r\nA made-up module whose sentence is wrapped by \r\nhand.\r\n\r\n"
+                      "Made up for the tests.";
+  if (stand_in) about += "\r\nBerkeley Systems Authorized User.";
+  ne.resources = {{2000, "", 20, name + '\0'}, {2000, "", 30, about + '\0'}, {2000, "", 10, "By nobody.\r\n" + std::string(1, '\0')}};
+  for (const auto& [slot, rec] : controls) ne.resources.push_back({1000, "", slot, rec});
+  return vec(build_ne(ne));
+}
+
+// Which install floppy each file is on (the real split: the setup files and
+// the modules on disk 1; the engine, its DLLs and drivers, the art and sound
+// databases on disk 2).
+inline int startrek_disk(const std::string& name) {
+  for (const char* d2 : {"AD.EX_", "AD.HL_", "ADINIT.EX_", "AD_AILAN.DL_", "AD_LIB.DL_", "AD_MME.DR_", "AD_MOD.DL_",
+                         "AD_MPT.DR_", "AD_NET.EX_", "AD_NVLNW.DL_", "AD_RSRC.DL_", "AD_SB.DR_", "AD_SND.DL_",
+                         "AD_WRAP.CO_", "AFTERDRK.NS_", "NWCONN.DL_", "NWCORE.DL_", "NWMISC.DL_", "SPALETTE.DL_",
+                         "ST_MASKS.DL_", "ST_RESDB.DL_", "ST_SND.DL_", "ST_SVGA.DL_", "ST_VGA.DL_"})
+    if (name == d2) return 2;
+  return 1;
+}
+
+// The files a Star Trek: The Screen Saver import must never open (I5): the
+// setup program and its scripts, the network, PC-speaker and Sound Blaster
+// drivers, the disk's AD_PREFS.INI, the help file, the VxD, AD_MESG and the rest.
+inline const std::vector<std::string>& startrek_decoys() {
+  static const std::vector<std::string> v = {
+      "SETUP.EXE",   "_MSTEST.EX_",  "AD_NSTLL.MS_", "AD_NSTLL.DL_", "ST_NSTLL.IN_", "AD_NSTLL.INI", "AD_MESG.AD_",
+      "AD.38_",      "AD.HL_",       "AD_WRAP.CO_",  "NWCONN.DL_",   "AD_NET.EX_",   "AFTERDRK.NS_", "ADINIT.EX_",
+      "SPLASH1.BM_", "AD_PREFS.IN_", "AD_MPT.DR_",   "SPALETTE.DL_", "AD_LIB.DL_",   "AD_SB.DR_"};
+  return v;
+}
+
+// A Setup file list of our own (the real one is never copied): the window
+// title that names the release, a command line, a file list, the trailing
+// Ctrl-Z. `title` in Windows-1252.
+inline std::vector<uint8_t> setup_lst(const std::string& title = "Star Trek\xAE: The Screen Saver") {
+  return vec("[Params]\r\n"
+             "\tWndTitle            = " + title + "\r\n"
+             "\tWndMess             = Setting up a made-up screen saver...\r\n"
+             "\tCmdLine             = _mstest made_up.mst  /C \"/S %s %s\"\r\n"
+             "\r\n"
+             "[Files]\r\n"
+             "\tmade_up.in_ = made_up.inf\r\n"
+             "\x1A");
+}
+
+// Star Trek: The Screen Saver's two install disks' files at the source's
+// root (a copy of both, or the disks unioned): SETUP.LST, every file of the
+// registry's table KWAJ-compressed under its disk name (made-up modules and
+// DLLs as runs of literals; ST_VGA.DL_ is a fixed vector the research
+// encoder wrote, ST_MASKS.DL_ the distance-4096 crafted stream), and decoys.
+// `change`, when set, edits the sources after they are made (the expected
+// files stay those of the unchanged release).
+inline PkgFixture startrek_fixture(const std::function<void(Tree&)>& change = {}) {
+  PkgFixture f;
+  const std::string root = "packages/startrek";
+  auto put = [&](const std::string& disk_name, const std::string& rel, const std::vector<uint8_t>& d) {
+    f.source[disk_name] = kwaj_literals(d);
+    f.expect[root + "/" + rel] = d;
+  };
+  const std::vector<std::string> base = {"KERNEL", "USER", "GDI", "WIN87EM", "AD_MOD", "AD_RSRC"};
+  struct M {
+    const char* file;
+    const char* name;
+  };
+  // The 16 names, as the resources hold them: 15 with a leading space.
+  const std::vector<M> modules = {{"BRAINCEL", " Brain Cells"},  {"COMMS", " Communications"}, {"FINAL", " Final Exam"},
+                                  {"FRONTIER", " Final Frontier"}, {"HORTA", " Horta"},        {"IONSTORM", " Ion Storm"},
+                                  {"MISSION", " The Mission"},   {"PANELS", " Ship Panels"},   {"PLANETS", " PlanetaryAtlas"},
+                                  {"SCOTTYS", " Scotty's Files"}, {"SICKBAY", " Sickbay"},     {"SOUNDER", "Sounder"},
+                                  {"SPACE", " Space"},           {"SPOCK", " Spock"},          {"THOLIAN", " Tholian Web"},
+                                  {"TRIBBLE", " Tribbles"}};
+  for (const M& m : modules) {
+    const std::string file = m.file;
+    std::vector<uint8_t> d;
+    if (file == "COMMS")  // a button in slot 3; slot 0 empty
+      d = ad20_module(m.name, base, {{2, popup_record("Message", {"Custom", "Other"}, 0)}, {4, button_record("Edit Custom...")}});
+    else if (file == "SOUNDER")  // AD_SND only, a button in slot 2, no stand-in line
+      d = ad20_module(m.name, {"KERNEL", "USER", "GDI", "AD_SND"},
+                      {{1, popup_record("Sequence", {"In Order", "Shuffle"}, 0)}, {3, button_record("Sounds..")}}, false);
+    else if (file == "MISSION")  // no controls
+      d = ad20_module(m.name, base);
+    else
+      d = ad20_module(m.name, base, {{1, checkbox_record("Clear Screen First", 0)}});
+    put(file + ".AD_", "AFTERDRK/" + file + ".AD", d);
+  }
+  put("AD_MOD.DL_", "AFTERDRK/AD_MOD.DLL", ne_dll("AD_MOD", {"KERNEL", "GDI", "USER", "WIN87EM", "AD_RSRC", "AD_SND"}));
+  put("AD_RSRC.DL_", "AFTERDRK/AD_RSRC.DLL", ne_dll("AD_RSRC", {"KERNEL", "USER", "GDI"}));
+  put("AD_MME.DR_", "AFTERDRK/AD_MME.DRV", ne_dll("AD_MME", {"WIN87EM", "KERNEL", "USER"}));
+  put("ST_RESDB.DL_", "AFTERDRK/ST_RES/ST_RESDB.DLL", ne_dll("ARTDB", {"KERNEL"}));
+  put("ST_SVGA.DL_", "AFTERDRK/ST_RES/ST_SVGA.DLL", blob("made-up art, 256 colours", 6000));
+  put("ST_SND.DL_", "AFTERDRK/ST_RES/ST_SND.DLL", blob("made-up sounds", 9000));
+  auto wav = vec("RIFF");
+  auto body = blob("a made-up wave", 700);
+  wav.insert(wav.end(), body.begin(), body.end());
+  put("JIM.WA_", "AFTERDRK/SOUNDS/JIM.WAV", wav);
+  put("AD_SND.DL_", "ENGINE/AD_SND.DLL", ne_dll("AD_SND", {"KERNEL", "USER"}));
+  put("AD.EX_", "ENGINE/AD.EXE", blob("a made-up host", 3000));
+  // Written by the research encoder, and token by token.
+  f.source["ST_VGA.DL_"] = unhex(kKwajVectors[2].packed);
+  f.expect[root + "/AFTERDRK/ST_RES/ST_VGA.DLL"] = kwaj_vector_plain(kKwajVectors[2].name);
+  const KwajCraftedFile masks = kwaj_dist4096();
+  f.source["ST_MASKS.DL_"] = masks.file;
+  f.expect[root + "/AFTERDRK/ST_RES/ST_MASKS.DLL"] = masks.plain;
+  f.source["SETUP.LST"] = setup_lst();
+  for (const std::string& d : startrek_decoys()) f.source[d] = blob("decoy " + d, 200);
+  if (change) change(f.source);
+  f.ids = {"startrek.braincel", "startrek.comms",   "startrek.final",   "startrek.frontier",
+           "startrek.horta",    "startrek.ionstorm", "startrek.mission", "startrek.panels",
+           "startrek.planets",  "startrek.scottys",  "startrek.sickbay", "startrek.sounder",
+           "startrek.space",    "startrek.spock",    "startrek.tholian", "startrek.tribble"};
+  return f;
+}
+
+// A ZIP of floppy images, as the Internet Archive serves an item's: stored
+// members, disk 2 first, and (`with_scan`) a label scan beside them.
+inline std::vector<uint8_t> zip_of_images(const std::vector<std::pair<std::string, std::vector<uint8_t>>>& images,
+                                          bool with_scan = true) {
+  ZipBuilder b;
+  b.password = "";
+  for (const auto& [name, d] : images) b.add(name, d, /*deflate=*/false, /*encrypt=*/false);
+  if (with_scan) b.add("disk1.jpg", pattern(5000, 99), /*deflate=*/false, /*encrypt=*/false);
+  return b.build();
+}
+
 // ---- writing a fixture as a source -------------------------------------------------------
 
 inline std::filesystem::path path_under(const std::filesystem::path& root, const std::string& rel) {
@@ -375,17 +705,29 @@ inline std::vector<uint8_t> iso_of(const PkgFixture& f, bool joliet = true, cons
   return b.build();
 }
 
-// `disk`: 0 = every root file, 1 or 2 = that Simpsons floppy's files only.
-inline std::vector<uint8_t> fat_of(const Tree& t, int disk = 0, const std::string& corrupt_chain_of = "") {
-  FatBuilder b = FatBuilder::floppy288();
+// `disk`: 0 = every root file, else only that floppy's files, by `disk_of`
+// (the Simpsons' two by default; swse_disk for the five of Star Wars Screen
+// Entertainment, with FatBuilder::floppy144()).
+inline std::vector<uint8_t> fat_of(const Tree& t, int disk = 0, const std::string& corrupt_chain_of = "",
+                                   int (*disk_of)(const std::string&) = simpsons_disk,
+                                   FatBuilder b = FatBuilder::floppy288()) {
   for (const auto& [rel, d] : t)
-    if (!disk || simpsons_disk(rel) == disk) b.file(rel, d);
+    if (!disk || disk_of(rel) == disk) b.file(rel, d);
   auto img = b.build();
-  if (!corrupt_chain_of.empty() && (!disk || simpsons_disk(corrupt_chain_of) == disk)) {
+  if (!corrupt_chain_of.empty() && (!disk || disk_of(corrupt_chain_of) == disk)) {
     const auto& c = b.node(corrupt_chain_of).clusters;
     if (c.size() >= 2) b.set_fat(img, c[1], c[0]);  // a loop: reading it would fail
   }
   return img;
+}
+
+// A flat ZIP of the tree (every file at the root, none encrypted): the
+// Internet Archive's copies of install folders.
+inline std::vector<uint8_t> zip_folder(const Tree& t) {
+  ZipBuilder b;
+  b.password = "";
+  for (const auto& [rel, d] : t) b.add(rel, d, /*deflate=*/true, /*encrypt=*/false);
+  return b.build();
 }
 
 // ---- manifests and registries --------------------------------------------------------------
@@ -417,6 +759,7 @@ struct TestRegistry {
   std::deque<std::vector<adw::import::KnownFile>> manifests;
   std::deque<std::vector<adw::import::KnownImage>> images;
   std::deque<std::vector<adw::import::Download>> download_lists;
+  std::deque<std::vector<adw::import::DownloadPart>> part_lists;
   std::deque<std::vector<adw::import::CoverSource>> cover_lists;
 
   TestRegistry() {
@@ -447,17 +790,46 @@ struct TestRegistry {
     images.push_back({{keep(md5), size, "synthetic", ""}});
     get(id).images = images.back();
   }
-  // A download copy: `url`, saved as `file`, published with this size and md5.
+  // Known images of install disks: md5, size, disk number (1..N).
+  struct Disk {
+    std::string md5;
+    uint64_t size;
+    int disk;
+  };
+  void disk_images(const std::string& id, const std::vector<Disk>& disks) {
+    std::vector<adw::import::KnownImage> v;
+    for (const Disk& d : disks) v.push_back({keep(d.md5), d.size, "synthetic floppy", "", d.disk});
+    images.push_back(std::move(v));
+    get(id).images = images.back();
+  }
+  // A download copy: `url`, saved as `file`, published with this size and
+  // md5 (and `more`: the images of further install disks).
+  struct Part {
+    std::string url;
+    std::wstring file;
+    uint64_t size;
+    std::string md5;
+  };
   struct Copy {
     std::string url;
     std::wstring file;
     uint64_t size;
     std::string md5;
     std::string kind = "image";
+    std::vector<Part> more = {};
   };
   void downloads(const std::string& id, const std::vector<Copy>& copies) {
     std::vector<adw::import::Download> d;
-    for (const Copy& c : copies) d.push_back({keep(c.url), keep(c.file), c.size, keep(c.md5), keep(c.kind)});
+    for (const Copy& c : copies) {
+      std::span<const adw::import::DownloadPart> more;
+      if (!c.more.empty()) {
+        std::vector<adw::import::DownloadPart> parts;
+        for (const Part& q : c.more) parts.push_back({keep(q.url), keep(q.file), q.size, keep(q.md5)});
+        part_lists.push_back(std::move(parts));
+        more = part_lists.back();
+      }
+      d.push_back({keep(c.url), keep(c.file), c.size, keep(c.md5), keep(c.kind), more});
+    }
     download_lists.push_back(std::move(d));
     get(id).downloads = download_lists.back();
   }

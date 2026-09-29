@@ -14,6 +14,7 @@ enum : int {
   kExitNotImported = 10,     // catalog/assets missing: the message was shown
   kExitHostMissing = 11,     // adhostwin.exe missing: the message was shown
   kExitStartFailed = 12,     // test hook only: a module "could not be started"
+  kExitNoneRuns = 13,        // test hook only: the host can run none of the modules imported (said so)
 };
 
 int run_saver(const Args& args, void* hinstance);

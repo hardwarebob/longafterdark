@@ -4,18 +4,23 @@
 64-bit Windows by emulating their x86 code. It loads Berkeley Systems' real
 engines and modules into one emulated address space, traps every call they
 make into the operating system, and supplies that OS surface from the host.
-The screen saver presents the frames.
+The screen saver presents the frames. It runs the modules of LucasArts'
+Star Wars Screen Entertainment the same way: they were made for Delrina's
+Intermission, whose reader, library and modules run as real code too.
 
-It supports five releases: After Dark 4.0 Deluxe, After Dark 10th
-Anniversary, After Dark 3.2, Totally Twisted After Dark and The Simpsons
-Screen Saver, 202 catalog entries in all (`docs/PACKAGES.md`). Installing
+It supports seven releases: After Dark 4.0 Deluxe, After Dark 10th
+Anniversary, After Dark 3.2, Totally Twisted After Dark, The Simpsons
+Screen Saver, Star Trek: The Screen Saver (After Dark 2.0b) and Star Wars
+Screen Entertainment, 232 catalog entries in all
+(`docs/PACKAGES.md`). Installing
 and using it is covered in [INSTALL.md](INSTALL.md). This page is for
 working on it: the architecture, the components, building, testing,
 headless runs, where the assets live, and the conventions. Every command
 below runs in Git Bash from the repository root.
 
-**No After Dark files are shipped or committed.** Nothing in the repository,
-the build output or the test fixtures is an After Dark file; synthetic
+**No After Dark or Star Wars Screen Entertainment files are shipped or
+committed.** Nothing in the repository,
+the build output or the test fixtures is a file of those releases; synthetic
 fixtures are generated at test time. Users import their own copies with
 `adimport.exe`, from their disc, an image or a folder, or from the Internet
 Archive. Import manifests hold only path, size and MD5, and the AD 3.x
@@ -40,7 +45,8 @@ LongAfterDark.scr ──spawns──► adhostwin.exe  one process per monitor, 
   Import… ──► adimport.exe       │  adw::cpu     x86 interpreter: flat 32-bit, 16-bit protected mode, x87
                   │              ▼
                   │   emulated: pe32 lane  module + ADXPL510 engine
-                  │             ne16 lane  module + ADXPL300/310/40 engine + helpers, under OLDMOD16 or the native AD3 bridge
+                  │             ne16 lane  module + ADXPL300/310/40 engine + helpers, under OLDMOD16 or the native AD3 bridge,
+                  │                        or an Intermission module + SWSE.DLL + INTRMLIB, under Intermission's IMIMXPLY.IMQ
                   ▼
   %LOCALAPPDATA%\LongAfterDark\assets\win\{FILES, packages\<id>, catalog-win.json}   read by the host and the saver
 ```
@@ -48,14 +54,20 @@ LongAfterDark.scr ──spawns──► adhostwin.exe  one process per monitor, 
 * **Two lanes, chosen by the module file's header.** `pe32` runs 32-bit
   After Dark 4-generation modules (PE32 DLLs) with the real `ADXPL510.DLL`.
   `ne16` runs 16-bit modules (NE DLLs: the AD 2.x/3.x "Classic" modules and
-  those of AD 3.2, Totally Twisted, the Simpsons and the 10th Anniversary)
-  with their real engines. Where a disc ships Berkeley's `OLDMOD16.DLL`
-  bridge, the lane runs it; otherwise a host-native AD3 bridge implements
-  OLDMOD16's verified behaviour (`docs/PACKAGES.md` §7.4).
+  those of AD 3.2, Totally Twisted, the Simpsons, the 10th Anniversary and
+  Star Trek: The Screen Saver) with their real engines. Where a disc ships
+  Berkeley's `OLDMOD16.DLL` bridge, the lane runs it; otherwise a
+  host-native AD3 bridge implements OLDMOD16's verified behaviour
+  (`docs/PACKAGES.md` §7.4), standing in for Star Trek's After Dark 2.0
+  host, `AD.EXE`, too (`docs/ABI.md` §3.9). Star Wars Screen
+  Entertainment's modules are NE DLLs too: the ne16 lane tells them apart
+  by their exports and drives them through Intermission's own reader,
+  `IMIMXPLY.IMQ`, a second module protocol beside the After Dark one
+  (`docs/PACKAGES.md` §7.5, `docs/ABI.md` §3.8).
 * **Run the original code, replace only the OS and the host.** The engines,
   helper DLLs and modules all run as emulated code. The host stands in for
-  Windows 95 underneath them, and for the original `AFTERDAR.SCR` and
-  `OLDMOD32.DLL` above them.
+  Windows 95 underneath them, and for the original `AFTERDAR.SCR`,
+  `OLDMOD32.DLL` and Intermission's `INTERMIS.EXE` above them.
 * **An authentic display.** The guest sees an 8-bit `RC_PALETTE` screen with
   the 20 static colours. Drawing is done by the real GDI onto DIB sections
   whose bits alias emulated memory (arenas are file mappings), and palette
@@ -72,12 +84,17 @@ LongAfterDark.scr ──spawns──► adhostwin.exe  one process per monitor, 
 * **One sound engine for both lanes.** The lanes map the modules' sound
   APIs (DirectSound, ACM, the MCI sequencer and `waveOut` for the 32-bit
   modules; AD_SND's `sndPlaySound`, `waveOut`, `midiOut` and MCI strings for
-  the 16-bit ones) onto one deterministic mixer and MIDI file player in
-  `adw_core`, which plays through WASAPI and the Windows MIDI mapper or
-  captures to a WAV. What the guest sees depends only on its own calls and
-  virtual time. With sound off (`adhostwin`'s default) every sound API
-  answers exactly as the silent host of before, so the headless `FBHASH`
-  baselines hold (`docs/AUDIO.md`).
+  the 16-bit ones, and for Star Trek: The Screen Saver's AD_SND 1.0 its
+  multimedia sound driver's `sndPlaySound` and `waveOut` volume; for Star
+  Wars Screen Entertainment, `SWSE.DLL`'s own `sndPlaySound` for the
+  effects and MEMMIDI's `midiOutShortMsg` stream, sequenced from a
+  multimedia timer, for the music) onto one deterministic
+  mixer, MIDI file player and raw MIDI port in `adw_core`, which plays
+  through WASAPI and the Windows MIDI mapper or captures to a WAV. What the
+  guest sees depends only on its own calls and virtual time. With sound off
+  (`adhostwin`'s default) every sound API answers exactly as the silent
+  host of before, so the headless `FBHASH` baselines hold
+  (`docs/AUDIO.md`).
 
 ## Documents
 
@@ -85,9 +102,9 @@ LongAfterDark.scr ──spawns──► adhostwin.exe  one process per monitor, 
 |---|---|
 | [INSTALL.md](INSTALL.md) | For users: importing the releases, covers, installing the screen saver, its settings, where the files are, updating |
 | [DESIGN.md](DESIGN.md) | The architecture and every contract in brief: host protocol, CPU, loader, core, shims, pacing, catalog and settings, assets, packages, interaction, covers, audio |
-| [ABI.md](ABI.md) | The host/engine/module ABI, recovered by our own disassembly and verified on the After Dark 4.0 Deluxe disc's binaries |
-| [API_SURFACE.md](API_SURFACE.md) | Every function the Deluxe disc's modules and engines import, counted and classified |
-| [PACKAGES.md](PACKAGES.md) | The five releases: registry, identification, extraction formats, layouts, the merged catalog, how the lanes find a package, the native AD3 bridge |
+| [ABI.md](ABI.md) | The host/engine/module ABI, recovered by our own disassembly and verified on the After Dark 4.0 Deluxe disc's binaries, Intermission's IMX protocol, verified on the Star Wars Screen Entertainment disc's (ABI.md §3.8), and After Dark 2.0's host, `AD.EXE`, verified on Star Trek: The Screen Saver's floppies (ABI.md §3.9) |
+| [API_SURFACE.md](API_SURFACE.md) | Every function the Deluxe disc's modules and engines import, counted and classified (and where Star Wars Screen Entertainment's census is) |
+| [PACKAGES.md](PACKAGES.md) | The seven releases: registry, identification, extraction formats (ISO-9660, FAT, PKZIP, ARJ, SZDD, KWAJ), layouts, the merged catalog, how the lanes find a package, the native AD3 bridge and After Dark 2.0, the Intermission protocol |
 | [INTERACTION.md](INTERACTION.md) | Wake or play, the status record, module buttons (`--configure`), the per-user state overlay, the desktop seed |
 | [COVERS.md](COVERS.md) | Releases in the settings dialog (the box-cover strip, filtering and grouping by release), the importer's cover pipeline, the shared UI library `adw_ui` and the importer's restyled windows (implemented; §9 records what was built) |
 | [AUDIO.md](AUDIO.md) | Sound: how every module makes it (a census of all 202), the host audio engine (`adw/core/audio.h`), both lanes' DirectSound/ACM/WINMM/MMSYSTEM mappings, the saver's Sound and Volume settings, the tests |
@@ -104,9 +121,9 @@ actually behaves; the design documents record the plan and the evidence.
 | `host/core/` | `adw_core`, **`adhostwin.exe`** | `adw` | The host process: screen, protocol, environment, virtual clock, pacing, the audio engine (mixer, MIDI player, WASAPI/`waveOut`/MIDI-mapper and capture sinks), status record, `--configure` driver, lane registration | [host/core/README.md](../host/core/README.md) |
 | `host/win32/` | `adw_win32` | `adw::win32` | The Win32 guest runtime (TEB/PEB, thunks, SEH, heap, VFS and state overlay, 8-bit display) and its API shims, DirectSound included | [host/win32/README.md](../host/win32/README.md) |
 | `host/pe32/` | `adw_lane_pe32` | `adw::pe32` | The 32-bit lane: `AD_MODULE32`, the DRAWFRAME budget loop, controls, package-aware DLL search | `pe32/lane.hh` |
-| `host/win16/` | `adw_win16` | `adw::win16` | The Win16 guest runtime (LDT, global/local heaps, DOS/BIOS layer, synthetic desktop) and its API shims, MMSYSTEM's sound included | [host/win16/README.md](../host/win16/README.md) |
-| `host/ne16/` | `adw_lane_ne16` | `adw::ne16` | The 16-bit lane: OLDMOD16 or the native AD3 bridge, palettes, small screens, long calls | `ne16/lane.hh` |
-| `importer/` | `adw_import`, **`adimport.exe`** | `adw::import` | Package registry, ISO-9660/Joliet, FAT12/16 and PKZIP readers, verification, atomic per-package import, Internet Archive downloads, covers, catalog generator | [importer/README.md](../importer/README.md) |
+| `host/win16/` | `adw_win16` | `adw::win16` | The Win16 guest runtime (LDT, global/local heaps, DOS/BIOS layer, synthetic desktop, the DIB driver) and its API shims, MMSYSTEM's sound included | [host/win16/README.md](../host/win16/README.md) |
+| `host/ne16/` | `adw_lane_ne16` | `adw::ne16` | The 16-bit lane: its module protocols (After Dark: OLDMOD16 or the native AD3 bridge; Intermission: the IMX reader), palettes, small screens, long calls | `ne16/lane.hh` |
+| `importer/` | `adw_import`, **`adimport.exe`** | `adw::import` | Package registry, ISO-9660/Joliet, FAT12/16, PKZIP, ARJ, SZDD and KWAJ readers, verification, atomic per-package import, Internet Archive downloads, covers, catalog generator | [importer/README.md](../importer/README.md) |
 | `importer/gui/` | `adw_import_gui` | `adw::import::gui` | The importer's windows (`adimport --gui`): sources, downloads, progress, result, cover | [importer/gui/README.md](../importer/gui/README.md) |
 | `scr/` | `adw_scr`, **`LongAfterDark.scr`** | `adw::scr` | The screen saver (`/s`, `/p`, `/c`), the settings dialog, input rules, which host plays sound, thumbnails, desktop capture | [scr/README.md](../scr/README.md) |
 | `common/ui/` | `adw_ui` | `adw::ui` | The Windows 11 theming and widgets shared by the settings dialog and the importer's windows | [common/ui/README.md](../common/ui/README.md), COVERS §3 |
@@ -185,14 +202,40 @@ The binaries are linked statically (no DLLs beside them) with an 8 MB stack.
 Every component registers CTest tests under `<component>/tests/`; its README
 lists them. Run them with `build.sh`, or `ctest --output-on-failure` in the
 build directory. Left to their defaults the suites are offline, their
-fixtures are synthetic, and every test that needs After Dark files skips
-without them.
+fixtures are synthetic, and every test that needs After Dark (or Star Wars
+Screen Entertainment) files skips without them. The importer's readers are
+tested on archives and images built at test time: `import.zip`,
+`import.fat`, and, for Star Wars Screen Entertainment's installer,
+`import.arj` (ARJ volumes, thirteen fixed LZH and method-4 vectors that the
+Python reference and 7-Zip decode the same way, and streams crafted bit by
+bit; no test compresses anything into ARJ,
+[THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md)) and `import.szdd`
+(SZDD, with two fixed vectors that Windows' `EXPAND.EXE` expands the same
+way); for Star Trek: The Screen Saver's, `import.kwaj` (KWAJ method 3:
+eight fixed vectors of made-up data and six streams written token by
+token, each expanded alike by the research reference decoder, libmspack and
+Deark, then cut, bit-flipped and bounded; no test compresses anything),
+and `import.fat` reads ZIPs of floppy images too; `import.packages` imports
+all seven releases from made-up sources.
 
 * **Tests that open real windows** are labelled `gui`: the screen saver's
   smoke tests (`scr_smoke_*`; `/s` briefly covers every monitor) and the
   importer's `import.gui_flow` (real importer windows, briefly). `ctest -LE
   gui` (with `build.sh`: `AD_CTEST_ARGS="-LE gui"`) skips every one of them;
-  add `-j8` to run the rest in parallel.
+  add `-j8` to run the rest in parallel. Since Star Trek: The Screen Saver
+  they include `scr_smoke_screen-field` (a module whose catalog entry has
+  `"screen": "640x480"`: its hosts, the seed pictures, a monitor changing,
+  `/p`, the live preview and a thumbnail, with
+  `scr/tests/fixtures/catalog-seven.json`) and `scr_smoke_numlock` (the
+  `NUMLOCK` lines and `ADNUMLOCK`, against the test host `fakehost.exe`,
+  which says `numlock=1` unless `FAKEHOST_NUMLOCK=0`), and
+  `scr_smoke_seed-screens` (a catalog whose modules each give a screen of
+  their own: three desktop-seed pictures at most, the screens left out
+  counted in the log; it holds on a desktop that can't be read back too). While the monitors
+  are asleep the saver pauses its hosts, and every smoke test that runs a
+  `/s` times out: set `AD_SCR_TEST_DISPLAY_ON=1` for the run, a lever only
+  the test build, `LongAfterDark-test.scr`, reads (`scr_resources` checks
+  that the shipped `LongAfterDark.scr` does not hold it).
   Separately, `AD_SCR_SKIP_GUI_TESTS=1` makes the saver's report SKIP and
   `AD_IMPORT_SKIP_GUI_TESTS=1` the importer's. `import.gui_shots` renders
   every importer page in parked, cloaked windows that never show on the
@@ -207,19 +250,35 @@ without them.
   set, else the installed assets, read-only (`host/core/tests/test_paths.h`:
   they never move or write the data folder, and every host they start gets
   a scratch `AD_LOCALAPPDATA`). They skip (exit 77) when there are none:
-  `core.lane_detect_assets`, `pe32.assets`, `pe32.packages` (the 10th
-  Anniversary's pe32 modules; `AD_PE32_PKG_ROOT=<assets root>` names
-  another root), `ne16.assets`, `ne16.interaction` (each absent module is
-  skipped) and `import.catalog_real` (which also needs the prototype's
-  `research/win/catalog-win.json`).
+  `core.lane_detect_assets` (which also probes Star Wars Screen
+  Entertainment's `packages\swse\SAVER\*.IMX` when that release is there),
+  `pe32.assets`, `pe32.packages` (the 10th Anniversary's pe32 modules;
+  `AD_PE32_PKG_ROOT=<assets root>` names another root), `ne16.assets`,
+  `ne16.interaction` (each absent module is skipped), `ne16.swse` (Star
+  Wars Screen Entertainment's 14 Intermission modules: each twice, keys the
+  saver does not wake on, the pace of the modules that step once per call,
+  the reader oracle, a small screen, the desktop seed, a streamed start,
+  sound and the music's volume, and Darth Vader's **Configure...** button;
+  `AD_NE16_SWSE_ROOT=<assets root>` names another root, and it skips when
+  its root holds no `swse`), `ne16.startrek` (Star Trek: The Screen Saver's
+  16 After Dark 2.0 modules: each twice, over AD_SND 1.0 and the
+  `AD_PREFS.INI` seeds, sound captured twice, Scotty's Files' blueprints,
+  Communications' and Sounder's buttons in configure mode, hidden and
+  scripted, Sounder's folder chosen through `[-h-]` (saved as `H:\…` and
+  played by a later run; `ne16.interaction` does the same for Globe's map
+  in both releases that have it), and a scripted Final Exam,
+  Num Lock, answers, the mouse and the wake, headless and streamed;
+  `AD_NE16_STARTREK_ROOT=<assets root>` names another root, and it skips
+  when its root holds no `startrek`) and `import.catalog_real` (which also
+  needs the prototype's `research/win/catalog-win.json`).
 * **Opt-in tests** skip (77) unless their variable is set:
 
   | Variable | Runs | Needs | Network |
   |---|---|---|---|
-  | `AD_E2E=1` | `import.e2e` (the Deluxe image, ~400 MB, imported and compared), `import.download_real` (every release from its Internet Archive copies; `AD_E2E_LOCAL_DIRS`, default `source_iso/` and the installed downloads, supplies verified local copies instead), `import.covers_real` (every registry cover) | disk space | **yes** |
+  | `AD_E2E=1` | `import.e2e` (the Deluxe image, ~400 MB, imported and compared), `import.download_real` (every release from its Internet Archive copies; `AD_E2E_LOCAL_DIRS`, default the image folders below and the installed downloads, supplies verified local copies instead; `AD_E2E_PACKAGES=<id>[,<id>…]` limits it to those releases), `import.covers_real` (every registry cover) | disk space | **yes** |
   | `AD_E2E=1` + `AD_E2E_ASSETS=<assets root>` | the screen saver's real-module runs `scr_smoke_e2e-rodger` and `scr_smoke_e2e-dosshell` (real windows, label `gui`); note that `AD_E2E=1` also turns on the importer's downloads above | imported releases | no (the importer's: yes) |
   | … + `AD_SCR_SOUND_E2E=1` | `scr_smoke_e2e-sound`: the saver's sound on two staged monitors, captured to a WAV, never played | as above, and a host whose `--capabilities` says `audio=1` | no |
-  | `AD_E2E_PKG=1` | `import.pkg_real` (the four real package images, found by MD5 in `AD_SOURCE_ISO_DIR`, default `source_iso/`); with `AD_E2E=1`, `import.covers_real` also takes their disc art | the images | no |
+  | `AD_E2E_PKG=1` | `import.pkg_real` (the five real package images and Star Trek's two disk images, loose or in the ZIP they came in, found by MD5 in `AD_SOURCE_ISO_DIR`, a `;`-separated list of folders, default `source_iso/`, and in the folders directly in each; it also checks the Star Trek recipe against the disks' own `ST_NSTLL.INF`); with `AD_E2E=1`, `import.covers_real` also takes their disc art | the images | no |
   | `AD_AUDIO_ASSETS=1` (or a comma list of cases) | `core.audio_assets`: real modules' sound, captured and measured | imported releases (`AD_E2E_ASSETS`, else `AD_ASSETS_DIR`, else the installed ones) | no |
   | `AD_NE16_PKGROOTS=<dir>` | `ne16.pkg`: one module each of `ad10`, `ad32`, `tt` and `simpsons`, run standalone from one root per release (`<dir>\<id>\win\packages\<id>\…`, PACKAGES.md §4.4) | those roots | no |
   | `AD_GUI_TESTS=1` | `import.cli`'s runs of the importer's real windows | an interactive desktop | no |
@@ -235,7 +294,11 @@ without them.
   `AD_LOCALAPPDATA=<scratch>` stands in for `%LOCALAPPDATA%` wherever the
   data folder is derived through `adw/core/data_root.h`.
 * **Determinism.** The Deluxe modules' headless `FBHASH` streams are the
-  regression baseline for lane changes (`docs/PACKAGES.md` §9). Sound off
+  regression baseline for lane changes (`docs/PACKAGES.md` §9; for the
+  sixth release, the streams of all 202 After Dark modules, three of them
+  changed on purpose and accepted there, each with its reason, and for the
+  seventh, three more, with the 14 Star Wars Screen Entertainment modules'
+  streams unchanged). Sound off
   leaves them unchanged. A run with sound on differs from one without (the
   modules wait for their sounds and songs), but is deterministic too, and
   the same whether its sound is played, captured or dropped
@@ -275,8 +338,10 @@ AD_ASSETS_DIR=C:/Temp/adroot ADFRAMES=120 ADGOWAITMS=0 $H packages/tt/TWISTED/<M
   module's sound on and captures it (the mix as a WAV, the MIDI messages as
   `C:/Temp/x.mid`) without playing anything; `ADSOUND=1` turns it on and, in
   a streamed run, plays it on the real device (a headless run never opens
-  one). `ADVOLUME` (0–100, default 50) is After Dark's volume slider. At the
-  end stderr gets one `[audio]` summary line (`docs/AUDIO.md` §4).
+  one). `ADVOLUME` (0–100, default 50) is After Dark's volume slider, and
+  for an Intermission module both Intermission's own Volume (the effects)
+  and the music's level. At the end stderr gets one `[audio]` summary line
+  (`docs/AUDIO.md` §4).
 * `adhostwin --test-pattern` drives the whole protocol without a module;
   `--capabilities` prints what the build has; `--configure <module>
   --button <slot>` runs a module's own button (`docs/INTERACTION.md` §6.1).
@@ -297,7 +362,7 @@ Everything the programs keep is under **`%LOCALAPPDATA%\LongAfterDark`**
   assets\                          the assets root (AD_ASSETS_DIR, adimport --dest)
     win\
       FILES\{AD40,CLASSIC,ENGINE,AFI}\   After Dark 4.0 Deluxe, as on the disc; its import.json beside FILES
-      packages\<id>\               every other release: module folder(s), ENGINE\, import.json
+      packages\<id>\               every other release: module folder(s), ENGINE\, import.json (swse also WINDOWS\)
       catalog-win.json             merged over every installed release (DESIGN §6a, PACKAGES §6)
       covers\<id>\                 each release's box cover (COVERS §2.5)
       import.lock                  one import at a time
@@ -308,10 +373,10 @@ Everything the programs keep is under **`%LOCALAPPDATA%\LongAfterDark`**
   logs\saver-last.log              how the last /s run ended
 ```
 
-Package ids are `deluxe` (its files stay in `FILES\`), `ad10`, `ad32`, `tt`
-and `simpsons`. `ADSTATE` is unset in headless runs, so the state overlay
-lives in memory and no user state is read or written. Build trees go to
-`build/` (gitignored).
+Package ids are `deluxe` (its files stay in `FILES\`), `ad10`, `ad32`, `tt`,
+`simpsons`, `swse` and `startrek`. `ADSTATE` is unset in headless runs, so
+the state overlay lives in memory and no user state is read or written.
+Build trees go to `build/` (gitignored).
 
 ## Conventions
 

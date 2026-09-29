@@ -1,6 +1,6 @@
 // Resumable HTTP(S) download through WinHTTP.
 //
-// Built for one job — fetching the After Dark disc images (up to ~400 MB)
+// Built for one job — fetching the releases' disc images (up to ~400 MB)
 // and install ZIPs from the Internet Archive — so it favours robustness over
 // generality: redirects are followed by hand (archive.org answers
 // /download/… with a 302 to a storage node, and following them ourselves
@@ -34,7 +34,7 @@ struct DownloadOptions {
   // another size is fetched again without hashing it first.
   uint64_t expected_size = 0;
   // Without a published size, the most a transfer may bring (0 = 2 GiB, more
-  // than any After Dark file): a server that streams past it is refused
+  // than any known release's file): a server that streams past it is refused
   // (verify_failed) and its .part deleted.
   uint64_t max_size = 0;
   // Cancels at once, even while WinHTTP waits on the network (cancel.h).

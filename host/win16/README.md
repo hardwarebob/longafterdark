@@ -1,19 +1,24 @@
 # host/win16 — the Win16 guest runtime and API shims
 
 `adw_win16` is one emulated Win16 "task" for Long After Dark's Classic lane
-(`host/ne16`). That lane runs the 16-bit modules of all five releases: the
+(`host/ne16`). That lane runs the 16-bit modules of all seven releases: the
 After Dark 2.x/3.x modules in After Dark 4.0 Deluxe's `FILES\CLASSIC`, After
-Dark 3.2, Totally Twisted, The Simpsons Screen Saver, and the 16-bit modules
-of After Dark 10th Anniversary. The module, its package's engine when it uses
-one (`ADXPL300.DLL`, `ADXPL40.DLL` or `ADXPL310.DLL`), `AD_SND.DLL`, the helper
+Dark 3.2, Totally Twisted, The Simpsons Screen Saver, the 16-bit modules of
+After Dark 10th Anniversary, Star Trek: The Screen Saver's After Dark 2.0
+modules (below), and Star Wars Screen Entertainment's Intermission modules
+(below). The module, its package's engine when it uses one
+(`ADXPL300.DLL`, `ADXPL40.DLL` or `ADXPL310.DLL`; After Dark 2.0's module
+library `AD_MOD.DLL` with `AD_RSRC.DLL`), `AD_SND.DLL` (and After Dark 2.0's
+sound driver `AD_MME.DRV`), the helper
 DLLs and, where the package ships it (Deluxe, 10th Anniversary), the real
-`OLDMOD16.DLL` run as 16-bit protected-mode code on `adw::cpu`, over a
-host-owned LDT, with KERNEL/USER/GDI/MMSYSTEM/… supplied from here. The
-packages without `OLDMOD16.DLL` go through the lane's native AD3 bridge
-instead (`ne16/bridge.hh`, PACKAGES.md §7.4). Design and contract:
-`docs/DESIGN.md`, `docs/ABI.md` §3/§4/§8 (verified on the
+`OLDMOD16.DLL` — for an Intermission module, its helper DLLs and
+Intermission's own reader, `IMIMXPLY.IMQ` — run as 16-bit protected-mode code
+on `adw::cpu`, over a host-owned LDT, with KERNEL/USER/GDI/MMSYSTEM/…
+supplied from here. The packages without `OLDMOD16.DLL` go through the
+lane's native AD3 bridge instead (`ne16/bridge.hh`, PACKAGES.md §7.4). Design
+and contract: `docs/DESIGN.md`, `docs/ABI.md` §3/§4/§8 (verified on the
 Deluxe binaries), `docs/API_SURFACE.md` §2, `docs/PACKAGES.md`
-§7.3/§7.4.
+§7.3/§7.4/§7.5.
 
 | File | What it owns |
 |---|---|
@@ -25,12 +30,12 @@ Deluxe binaries), `docs/API_SURFACE.md` §2, `docs/PACKAGES.md`
 | `signatures16.cc` | **Generated** (`research/win/gen_sig16.py`): name, convention, return width and argument bytes of every entry of the emulated system DLLs, from the Win16 interface facts in `research/win/spec`. |
 | `runtime16.hh/.cc` | `Runtime16`: the CPU in segmented mode, `call_far` (nested host→guest calls to a sentinel), thunk dispatch, faults (→ `GuestError16`), VGA ports (0x3DA retrace from the clock, DAC 0x3C7–0x3C9 on the display palette), virtual time, debug knobs. |
 | `modules16.hh/.cc` | `ModuleTable16`: NE loading via `adw::loader::ne` (place → selectors → dependencies → `load_segments` → prolog patching → LibEntry → DLLENTRYPOINT), LoadLibrary/FreeLibrary/GetModuleHandle/GetProcAddress (names case-insensitive, constant exports), resources incl. Win 3.0 `NAMETABLE`s, pseudo modules for the system DLLs. |
-| `dos16.hh/.cc` | INT 21h (DOS 7.00: files as a handle table over `win32::Vfs::open`/`VfsFile`, directories, rename, FindFirst/FindNext on the merged listing), INT 1Ah/2Fh/25h/26h/10h/16h/31h, the guest disk's seeds (below: `C:\WINDOWS` and its `TEMP` as in-memory overlays until the lane mounts its own, `MODULES.INI`/`AD_PREFS.INI`/`AFTERDRK.INI` as empty virtual files with their settings as profile seeds, `seed_program_manager`'s `PROGMAN.INI` and `.GRP` files as virtual files), and `profiles16()`, the runtime's `win32::IniStore`. |
+| `dos16.hh/.cc` | INT 21h (DOS 7.00: files as a handle table over `win32::Vfs::open`/`VfsFile`, directories, rename, FindFirst/FindNext on the merged listing, the current drive and each drive's current directory, `dos_chdir`), INT 1Ah/2Fh/25h/26h/10h/16h/31h, the guest disk's seeds (below: `C:\WINDOWS` and its `TEMP` as in-memory overlays until the lane mounts its own, `MODULES.INI`/`AD_PREFS.INI`/`AFTERDRK.INI` as empty virtual files with their settings as profile seeds, `seed_program_manager`'s `PROGMAN.INI` and `.GRP` files as virtual files, `seed_intermission`'s profile seeds for an Intermission module, `seed_after_dark2`'s for an After Dark 2.0 one), and `profiles16()`, the runtime's `win32::IniStore`. |
 | `input16.hh`, `keyboard16.cc` | Saver-window input (below): the WH_KEYBOARD chain, input messages tagged with their input line, the per-step report (consumed, queue reads, wake); the fixed US keyboard (scan codes, `TranslateMessage`'s characters, `key_lparam`). |
 | `dialogs16.hh/.cc` | Configure mode (below): the Win16 → Win32 dialog template converter, the message translation table, and the shims that make a module's dialogs, message boxes and file dialogs real. |
-| `gdi16.hh`, `gdi16_objects.cc`, `gdi16.cc` | `Gdi16`: Win16 GDI objects on real GDI with the Win32 lane's key-table model (`win32/display.hh`); screen DCs are DIB sections over the display's bits; DIBs are translated to hardware indices through the DC's palette. Also USER's SelectPalette/RealizePalette. |
-| `kernel16.cc user16.cc system16.cc` | The API families (`register_<family>16(Runtime16&)`); `system16.cc` also has MMSYSTEM's clock, WIN87EM, COMMDLG, KEYBOARD, SHELL, TOOLHELP and `register_all16()`. `user16.cc` also holds the synthetic desktop and the icons (below), `SHELL.ExtractIcon`, and the host-posted messages MMSYSTEM's callbacks use (`user16_post_host`/`user16_dispatch_host`). |
-| `sound16.hh/.cc` | MMSYSTEM's sound half (below, AUDIO.md §8) over the host audio engine (`adw/core/audio.h`): `sndPlaySound`, `waveOut*`, `midiOut*`/`aux*` volumes, the mixer (none), `mciSendString`'s sequencer, the MCISEQ.DRV stub, and the delivery of `MM_WOM_*`/`MM_MCINOTIFY`. Without an enabled engine: the silent device, byte for byte. |
+| `gdi16.hh`, `gdi16_objects.cc`, `gdi16.cc` | `Gdi16`: Win16 GDI objects on real GDI with the Win32 lane's key-table model (`win32/display.hh`); screen DCs are DIB sections over the display's bits; DIBs are translated to hardware indices through the DC's palette; the native DIB driver (`CreateDC("DIB")`, below). Also USER's SelectPalette/RealizePalette. |
+| `kernel16.cc user16.cc system16.cc` | The API families (`register_<family>16(Runtime16&)`); `system16.cc` also has MMSYSTEM's clock, WIN87EM, COMMDLG, KEYBOARD, SHELL, TOOLHELP and `register_all16()`. `user16.cc` also holds the synthetic desktop and the icons (below), `SHELL.ExtractIcon`, the host-posted messages MMSYSTEM's callbacks use (`user16_post_host`/`user16_dispatch_host`), and the guest pump of the Intermission protocol (`user16_dispatch_guest`, below). |
+| `sound16.hh/.cc` | MMSYSTEM's sound half (below, AUDIO.md §8) over the host audio engine (`adw/core/audio.h`): `sndPlaySound`, `waveOut*`, `midiOut*` (volumes, and the raw port a self-sequencing guest plays through)/`aux*` volumes, the mixer (none), `mciSendString`'s sequencer, the MCISEQ.DRV stub, and the delivery of `MM_WOM_*`/`MM_MOM_*`/`MM_MCINOTIFY` and of the multimedia timer events (`timeSetEvent`, registered in `system16.cc`). Without an enabled engine: the silent device, byte for byte. |
 
 ## The synthetic desktop and icons (PACKAGES.md §7.3)
 
@@ -76,7 +81,188 @@ palette. ADXPL310 builds an "identity" palette from `GetSystemPaletteEntries`
 at start-up and converts its full-screen canvas's colour table through it
 with `GetNearestPaletteIndex`; with 236 identical black entries every
 non-static index maps to 0 and `SIMPCLOK` draws its clocks in black. The
-Classic lane turns it on for the AD 3 generation packages only (`ne16/lane.hh`).
+Classic lane turns it on for the AD 3 generation packages (`ne16/ad3_protocol.cc`)
+and for every Intermission module (`ne16/imx_protocol.cc`: SWSE builds its
+identity palettes from it too, `_CREATESYSTEMPALETTE`); `ADDESKTOPPAL`
+overrides it (`ne16/lane.hh`).
+
+## The DIB driver (`CreateDC("DIB")`)
+
+`CreateDC("DIB", NULL, NULL, lpPackedDIB)` (or `"DIB.DRV"`) was Windows
+3.1's DIB.DRV: a device DC that draws straight into a packed DIB's own bits,
+which the program also reads and writes itself between GDI calls. Star Wars
+Screen Entertainment's `SWSE.DLL` makes every "addressable canvas" this way
+(`_GETCANVASDC`) and draws on it with GDI and with its own blitters. Here the
+driver is native (DIB.DRV is never loaded), `Gdi16::create_dib_dc`: the DC's
+surface is a DIB section aliasing the packed DIB's bits in guest memory, so
+every GDI shim draws into them and blits read them like any 8-bit surface.
+It takes what DIB.DRV's Enable took (verified in its code): a
+`BITMAPINFOHEADER` (`biSize` 40, one plane, `BI_RGB`), the colour table
+(`biClrUsed` entries, else 256), then the bits, bottom-up or top-down — 8
+bits per pixel only (DIB.DRV also drew 1- and 4-bit DIBs: refused here,
+logged). Anything else is 0. `DeleteDC` leaves the DIB as it was; no bitmap
+selects into the DC.
+
+Its pixel values are the DIB's own indices, and colours become them as
+DIB.DRV's ColorInfo made them (`Gdi16::dib_index`):
+
+* `DIBINDEX(n)` (0x10FFnnnn), `PALETTEINDEX(n)` and physical colours (the
+  flag byte's top bit set) are pixel value n, the low byte, whatever palette
+  is selected;
+* any other colour is the nearest entry (squared RGB distance, the first of
+  equals) of the DIB's colour table read as RGBQUADs — or, when the table's
+  first `biClrImportant` (else all) WORDs are 0, 1, 2, … (an index table,
+  what SWSE writes: `SETDIBUSAGEBI`), of the 16 VGA colours, pixel values
+  0–15. On SWSE's canvases RGB white is 15 and black 0, whatever the
+  canvas's palette holds there; HYPERSPC's `PALETTERGB` star streaks are 15,
+  7 and 8.
+
+The table is read from guest memory at every match, as the driver read it.
+A memory DC made compatible with a DIB DC has the same colour semantics.
+DIB bits drawn onto either (`StretchDIBits`, `SetDIBitsToDevice`) keep their
+indices when the DC's table is an index table or the source's
+`DIB_PAL_COLORS` table is the identity (DIB.DRV's translation between two
+tables); otherwise each source colour goes to its nearest entry (a
+`DIB_PAL_COLORS` source's colours are its entries in the DC's palette). A DIB
+pattern brush (`CreateDIBPatternBrush`: a copy of the packed DIB, as Windows
+kept one) paints its top-left 8×8 pixel values unchanged on a DIB DC, and
+elsewhere its colours through a bitmap made for it, which `DeleteObject`
+deletes with the brush (so does `CreateBrushIndirect`'s `BS_DIBPATTERN`).
+`GetPixel`, `SetPixel`'s result and `GetNearestColor` answer the table's
+colours (the VGA colours for an index table). The DC is no palette device
+(no `RC_PALETTE`): `RealizePalette` maps nothing, and `GetDeviceCaps`
+answers the driver's `GDIINFO`, sized by the DIB (256 colours, `RASTERCAPS`
+0x2299, 96 dpi).
+
+Real GDI batches drawing per thread, but the program reads the bits between
+calls: an API call that touched a DIB DC (`Gdi16::host_dc`) ends with a
+`GdiFlush` (`Runtime16::flush_gdi_after_call`).
+
+## Intermission modules (Star Wars Screen Entertainment)
+
+The ne16 lane runs Star Wars Screen Entertainment's IMX modules through
+Intermission's own `IMIMXPLY.IMQ`, calling `SAVERMAIN` as INTERMIS did.
+What the runtime has for it (the AD3 path uses none of the first two):
+
+* **Profile seeds**, `seed_intermission(rt, IntermissionSeeds)` (`dos16.hh`):
+  `SYSTEM.INI [boot] display.drv=pnpdrvr.drv` (Windows 95's driver name,
+  which SWSE's blit-technology check compares with its own record); with
+  `swse_gdi` (the module folder holds `SWSE.DLL`) `SWSE.INI [technology]
+  display.drv=pnpdrvr.drv`, `WinGFound=1`, `DibBlit=GDI` — what SWSESET's
+  "Use GDI Graphics" leaves, so SWSE draws with GDI and the DIB driver and
+  never loads WinG; `ANTSW.INI [Intermission] Volume` (0–100; 0 is "Off":
+  no sound at all) and `Saver Path` (default: the guest directory). Like
+  every seed they are read under the files and never written out.
+* **The guest pump**, `user16_dispatch_guest(rt, max)`: the message loop
+  INTERMIS ran between two calls. The guest's own posted messages (not the
+  host-posted ones, not the tagged input messages) go to their live
+  windows' procedures in queue order — a posted `WM_TIMER` with a
+  `TIMERPROC` to that procedure — then each due timer fires once, to its
+  `TIMERPROC` or window (one that an earlier callback of the same pump set
+  again waits for its new time, as `SetTimer` reset it on Windows). Messages
+  posted to the task itself (hwnd 0: SWSE's `FORCETOWAKE` posts fake mouse
+  and Shift-key input for INTERMIS with `PostAppMessage(GetCurrentTask(),
+  …)`) are removed and counted in `StepReport16::task_posts` (a running
+  count) and `last_task_msg`. At most `max` messages; returns how many were
+  handled.
+* **KERNEL**: resources are counted as Win16 counted them — `LoadResource`
+  of a loaded resource returns the same block with one more use,
+  `FreeResource` takes one away and frees the block at none, and the next
+  `LoadResource` reads the image again (POSTERS edits its locked caption
+  every frame). `AccessResource` is a read-only DOS handle at the
+  resource's data in the module file (SWSE and READJPG read pictures,
+  palettes, shapes and sounds through it). `GetTempFileName` with `uUnique`
+  0 takes the first unused number from 1234h up and creates the empty file,
+  in `C:\WINDOWS\TEMP` — with `TF_FORCEDRIVE`, in the current directory of
+  the drive it names (the Windows 3.1 SDK's rule; that drive's own, below:
+  on `C:` the module folder unless a chdir moved it, on `H:` its root until
+  something went there, and `C:\WINDOWS\TEMP` for a drive the guest's disk
+  does not have, as Wine does).
+  `SetHandleCount` (grows only, at most 255), `GlobalWire`/`GlobalUnWire`
+  (lock and unlock), `_hwrite`. `GetModuleHandle` finds the system modules
+  Windows 95 always has loaded (KERNEL, USER, GDI, SYSTEM, KEYBOARD,
+  DISPLAY, SOUND, MMSYSTEM) before anything imports them. The synthetic
+  desktop's Program Manager belongs to a second task
+  (`kernel16_shell_task`, which `IsTask` accepts and no task list shows);
+  the runtime's own is `kernel16_current_task`.
+* **USER**: `GetMenu`, `GetWindowTask`, `GetNextWindow` and
+  `EnumChildWindows` answer from the synthetic desktop (JAWAS sizes up the
+  desktop's windows; `EnumChildWindows(desktop)` calls back for its
+  top-level windows and theirs). A `wsprintf`/`wvsprintf` `%s` whose far
+  pointer reads nothing is "", logged (SWTEXT's configure dialog passes a
+  near pointer).
+* **GDI**: the DIB driver (above), `PaintRgn`, `CreateHatchBrush`,
+  `CreateDIBPatternBrush`, `GetSystemPaletteUse`, and `MulDiv` with Win16's
+  rounding (to nearest, halves away from zero; -32768 for a zero divisor or
+  a result outside -32767..32767).
+* **INT 2Fh 1684h** (a VxD's API entry point) answers that there is none
+  (ES:DI = 0:0).
+* **WING**: `WinGCreateHalftoneBrush` pops 8 argument bytes (WING.DLL
+  returns with `retf 8`; the interface table says 6). Nothing of WinG is
+  implemented: the seeds keep SWSE off it.
+
+## After Dark 2.0 (Star Trek: The Screen Saver)
+
+The ne16 lane runs Star Trek: The Screen Saver's 16 modules through its
+native AD3 bridge (`ne16/bridge.hh`) over the package's own AD_SND 1.0;
+every Win16 import of the modules, `AD_MOD.DLL`, `AD_RSRC.DLL` and
+`AD_MME.DRV` already had a handler. What the runtime has for them:
+
+* **Profile seeds**, `seed_after_dark2(rt)` (`dos16.hh`), which the lane's
+  AD3 protocol applies when the module folder holds `AD_MOD.DLL`:
+  `AD_PREFS.INI [After Dark] Path=C:\AFTERDRK\` — where AD_MOD opens
+  `ST_RES\ST_RESDB.DLL` and `ST_SND.DLL`, AD_SND lists its `*.DRV` sound
+  drivers and Sounder finds `SOUNDS\*.WAV` (without it every module but
+  Sounder stops with "File not found.") — and `[Sound]
+  SoundDriver=AD_MME.DRV`, AD_SND 1.0's driver for Windows' multimedia sound
+  (the disk's default, the PC speaker's `AD_MPT.DRV`, has SPALETTE.DLL
+  busy-wait on the timer chip's port 0x40, which the runtime has not). Read
+  under the empty virtual file and never written out: AD_SND's `[Sound]
+  Mute`, Communications' `[Communications] MessageText` and Sounder's
+  `[Sounder] SoundPath` land in the upper layer.
+* **Num Lock's toggle**: `GetKeyState(VK_NUMLOCK)` bit 0 from
+  `InputState::numlock` (the `NUMLOCK` line, `ADNUMLOCK` at start), as
+  `VK_CAPITAL`'s comes from `caps`. Final Exam latches it as it starts and
+  begins its exam when it changes.
+* **Sound**: AD_MME.DRV reaches MMSYSTEM with `GetModuleHandle("MMSystem")`
+  and `GetProcAddress` by ordinal (`sndPlaySound` #2, `mmsystemGetVersion`
+  #5, `waveOutGetNumDevs`, `waveOutGetDevCaps`, `waveOutOpen` with
+  `WAVE_FORMAT_QUERY`, `waveOutGetVolume`/`waveOutSetVolume`): the modules'
+  sounds are `sndPlaySound` images from `ST_SND.DLL` (8-bit mono PCM), their
+  level `waveOutSetVolume` at After Dark's volume.
+* **Configure mode**: Sounder's "Sounds.." dialog lists its folders with
+  `DlgDirList(…, DDL_EXCLUSIVE | DDL_DRIVES | DDL_DIRECTORY)`: the drives are
+  `[-c-]` and, the host's drives being mounted as `H:`, `[-h-]`, so the
+  user reaches their own `.WAV` folders (below). The list takes the guest's
+  DOS along (drive and directory, "Files" below), so on OK Sounder's
+  `getcwd()` (INT 21h AH=19h, then AH=47h) names the folder drive and all:
+  `SoundPath=H:\C\USERS\ME\MUSIC`, which every later run plays. Globe's
+  "Map..." in After Dark 4.0 Deluxe and 3.2 saves `GlobeFile=H:\…` the same
+  way. A folder whose 8.3 path is longer than DOS's current directory (66
+  characters with `H:\`) is not entered: its `DlgDirList` fails. Sounder
+  then lists the files of the drive's root (it asks for `\*.WAV`), and an
+  OK there saves `SoundPath=H:\`, which plays nothing; Globe also lists the
+  root, which holds no map, so its OK saves nothing.
+* **Masks from DIBs** (`gdi16.cc`): DIB bits reach real GDI as hardware
+  indices under the key table, except into a monochrome bitmap —
+  `SetDIBits` and `CreateDIBitmap`, and `StretchDIBits` and
+  `SetDIBitsToDevice` on a memory DC holding one —, where real GDI gets the
+  DIB's own colour table (a `DIB_PAL_COLORS` one as the DC's palette maps
+  it) and makes the bits of real GDI's rule: 1 only where a pixel is the
+  table's entry nearest white (the first of equal ones), 0 for every other
+  entry, however light (beside a white, yellow and light grey are 0). With
+  the key table only index 255 would be 1, so a white the palette holds at
+  any other slot made a black mask. Whether Windows 3.1 or 95 drew these
+  masks by the same rule is not known here; a white-on-black 1-bpp mask
+  comes out the same under any rule that makes white 1 and black 0.
+  AD_MOD.DLL makes its masks so: Scotty's Files' blueprints (1-bpp DIBs,
+  white on black; drawn through the mask in a colour it fades in with
+  `AnimatePalette`), The Mission's console lights, a Final Frontier star.
+  So does Mowin' Man (After Dark 4.0 Deluxe, 3.2, 10th Anniversary), whose
+  mower was drawn inside a white box before. Everywhere else (a colour
+  memory bitmap, a DIB DC, the screen, an RLE DIB) both calls keep the key
+  table; `test_mono_dib_targets` checks both sides, and that the source
+  origin and a band's start scan reach real GDI as given.
 
 ## Sound (AUDIO.md §8)
 
@@ -86,10 +272,15 @@ unset) it is the silent device of before, answer for answer: one wave-out
 device "Long After Dark (silent)" whose format queries all succeed and whose
 `sndPlaySound` reports the sound played, no MIDI, aux or mixer devices, MCI
 refused (`MCIERR_DEVICE_NOT_INSTALLED`); the calls it never answered
-(`waveOutWrite` & co., the rest of `midiOut`) stay unimplemented. AD_SND.DLL
-needs the wave device to initialize at all (ABI.md §3.6).
+(`waveOutWrite` & co.) stay unimplemented, and `midiOutOpen` fails honestly
+(`MMSYSERR_NODRIVER` for the mapper, `BADDEVICEID` otherwise, the handle
+zeroed; a signature-only one used to return "success" without writing it),
+with every midiOut handle invalid. AD_SND.DLL needs the wave device to
+initialize at all (ABI.md §3.6). Timer events work either way (below).
 
-With the engine on (every audio call carries `Runtime16::peek_us()`):
+With the engine on (every audio call carries `Runtime16::peek_us()`, or,
+inside a callback procedure, its dated time — MCI commands excepted:
+Callbacks, below):
 
 * **`sndPlaySound`**: a `SND_MEMORY` image is copied at the call — its RIFF
   extent, bounded by the segment (AD_SND unlocks it right after) — then
@@ -111,8 +302,15 @@ With the engine on (every audio call carries `Runtime16::peek_us()`):
 * **`midiOut*`, `aux*`**: one MIDI device ("Long After Dark MIDI", mapper
   technology, `MIDICAPS_VOLUME|LRVOLUME`) — the engines' `IsMusicAvail` — and
   two aux devices (0 CD audio: stored; 1 = the MIDI bus). `midiOutSetVolume`
-  and `auxSetVolume(1)` are one volume, the engine's MIDI bus. The rest of
-  `midiOut` is `MMSYSERR_NOTSUPPORTED`. No mixer (`mixerGetNumDevs` 0), and
+  and `auxSetVolume(1)` are one volume, the engine's MIDI bus. The device's
+  raw port (AUDIO.md §8.3) is for a guest that sequences itself — Star Wars
+  Screen Entertainment's MEMMIDI plays SWSE's songs through it from a 4 ms
+  timer event: `midiOutOpen` (the mapper or device 0, one client at a time,
+  `CALLBACK_*` with `MM_MOM_OPEN`/`DONE`/`CLOSE`), `midiOutShortMsg`/
+  `LongMsg`/`Reset` into the engine's raw MIDI (`midi_short`/`long`/`reset`:
+  the `.mid` log, the live synth), `MIDIHDR` flags (a long message is done
+  when its call returns), patch caching `MMSYSERR_NOTSUPPORTED` (no
+  `MIDICAPS_CACHE`), `midiOutGetID`. No mixer (`mixerGetNumDevs` 0), and
   with the engine on no mixer API by name either (`Shim16Entry::by_name`:
   `GetProcAddress` answers 0, ordinals resolve): AD_SND 3.2/TT picks its
   mixer path whenever `GetProcAddress` finds those names, and with no mixer
@@ -148,29 +346,82 @@ With the engine on (every audio call carries `Runtime16::peek_us()`):
 
 **Callbacks** (AUDIO.md §8.6): the engine's events (`chunk_done` →
 `MM_WOM_DONE` and the header's `WHDR_DONE`, `song_end` → `MM_MCINOTIFY`) and
-the ones MMSYSTEM raises itself (`MM_WOM_OPEN`/`CLOSE`, SUPERSEDED/ABORTED)
-queue with their virtual time and issue order. They are delivered at the
+the ones MMSYSTEM raises itself (`MM_WOM_OPEN`/`CLOSE`, `MM_MOM_OPEN`/`DONE`/
+`CLOSE`, SUPERSEDED/ABORTED) queue with their virtual time and issue order,
+with the periods of the multimedia timer events. They are delivered at the
 first API call at or after that time (the runtime's audio hook, below) and
 at the lane's pump before every DRAWFRAME (`audio16_pump`): window messages
 are posted to the guest's queue (`user16_post_host`), where a guest that
 pumps takes them, and the pump sends those still waiting to their window
 procedures, as the 1996 host's message loop did between DRAWFRAMEs;
-`CALLBACK_FUNCTION` procedures are called as a nested `call_far` with their
-module's DS. Never while a delivery runs (a callback's own API calls deliver
-nothing). Everything is a function of the guest's calls and virtual time.
+`CALLBACK_FUNCTION` procedures, and one timer procedure call per period, are
+called as a nested `call_far` with their module's DS. Never while a delivery
+runs (a callback's own API calls deliver nothing). Such a procedure ran at
+interrupt time on Windows, at its event's time: the MMSYSTEM calls it makes
+are dated from that time plus what it has run since, and neither a delivery
+nor the lane's step end renders the engine past a due point still to be
+delivered (a delivery takes it only as far as the events due, the step end
+only up to `Runtime16::audio_due()`), so MEMMIDI's notes keep their 4 ms
+grid when a frame ends after a DRAWFRAME that made no call, or inside a long
+one; clocks the guest reads never go back. MCI commands a procedure sends
+are dated at the delivery point instead (MCI was no interrupt-time API), so
+a `play … to` stop is reckoned from the song's real start. What a procedure
+causes — its device opened or closed, a long MIDI message sent, a WAVEHDR it
+wrote that the stream finishes at once (an empty one) — waits for a later
+delivery point, whatever its date: a procedure that answers each
+notification with another request (`midiOutLongMsg` from `MM_MOM_DONE`, an
+empty WAVEHDR from `MM_WOM_DONE`) takes one step per delivery point instead
+of looping inside one while virtual time barely moves. Everything is a
+function of the guest's calls and virtual time.
+
+**Timer events** (`timeSetEvent`/`timeKillEvent`/`timeBeginPeriod`/
+`timeEndPeriod`/`timeGetDevCaps` in `system16.cc`, delivered by
+`sound16.cc`'s `timer16_set`/`timer16_kill`; AUDIO.md §8.6): with or without
+the engine — the delivery hook goes in at the first event, so a module that
+sets none runs exactly as before. 1–65535 ms, periodic or one-shot, 16
+events at most, `TimeProc(wID, 0, dwUser, 0, 0)` FAR PASCAL per period, the
+event rescheduled before the call; missed periods are caught up, at most the
+last 250 ms of them (at least one) when a periodic event fell further behind
+(an event a procedure sets starts no more than 250 ms back either).
+`audio16_close` kills what the guest left set.
 
 ## The guest's disk (INTERACTION.md §7)
 
 Files and profiles go through `win32::Vfs` and `win32::IniStore`, shared
-with the pe32 lane. The Classic lane mounts (`ne16/lane.cc` `mount_disk`):
+with the pe32 lane. The Classic lane mounts, for an After Dark module,
+`mount_disk` (`ne16/ad3_protocol.cc`) and, for an Intermission module,
+`mount_imx_disk` (`ne16/imx_protocol.cc`), both declared in
+`ne16/protocol.hh` (INTERACTION.md §7.2):
 
 | Guest | Lower (read-only) | Upper |
 |---|---|---|
-| `C:\WINDOWS` | virtual seed files (`MODULES.INI`, `AD_PREFS.INI`, `AFTERDRK.INI` empty; `PROGMAN.INI` and the `.GRP` files once the synthetic desktop exists; `LunData.dat`, the module dir's `LUNDATA.DAT`, where the installers copied it) | `<ADSTATE>\<package>\WINDOWS`, or memory |
+| `C:\WINDOWS` | the package's `WINDOWS` folder when it has one (Star Wars Screen Entertainment's: `SWSE.INI`, as its installer put it there); virtual seed files (`MODULES.INI`, `AD_PREFS.INI`, `AFTERDRK.INI` empty; `PROGMAN.INI` and the `.GRP` files once the synthetic desktop exists; `LunData.dat`, the module dir's `LUNDATA.DAT`, where the installers copied it); for an Intermission module, the profile seeds of `seed_intermission` (above), for an After Dark 2.0 module those of `seed_after_dark2` (above) | `<ADSTATE>\<package>\WINDOWS`, or memory |
 | `C:\WINDOWS\TEMP` | — | memory, always |
-| `C:\WINDOWS\SYSTEM` | the engine dir | none (read-only) |
-| `C:\AFTERDRK`, `C:\AFTERD~1` | the module dir | `<ADSTATE>\<package>\<MODDIR>` (one directory for both names; in memory mode each name has its own) |
+| `C:\WINDOWS\SYSTEM` | the engine dir (an Intermission module's: `IMIMXPLY.IMQ`) | none (read-only) |
+| `C:\AFTERDRK`, `C:\AFTERD~1` (After Dark) | the module dir | `<ADSTATE>\<package>\<MODDIR>` (one directory for both names; in memory mode each name has its own) |
+| `C:\SAVER` (Intermission, instead of `C:\AFTERDRK`) | the module dir: the modules, their DLLs, the MIDI files, `SWTEXT.TXT` | `<ADSTATE>\<package>\SAVER`, or memory |
 | `H:\<L>\…` | the host's drives, 8.3 names | none |
+
+The guest directory (`C:\AFTERDRK` or `C:\SAVER`) is the current directory
+when the module starts. The guest's DOS keeps a current drive and, on each
+drive, a current directory of its own (`win32::Vfs`; a drive's root until
+something goes there), as DOS did: INT 21h AH=0Eh selects a drive the
+guest's disk has (`C:`, and `H:` with the host's drives mounted; it reports
+8 drive letters, to `H:`), AH=19h reports the current drive, AH=3Bh sets the
+directory of its path's drive and leaves the current drive, AH=47h reports
+any drive's own directory (DL 0 the current one), whole, and `DlgDirList`
+moves to the drive and directory it lists. `\name` resolves against the
+current drive's root and `X:name` against drive X's own directory in every
+file call; a bare `name` resolves against the current directory in
+`_lopen` and INT 21h, `OpenFile` searches from there, and the profile
+calls look for it in `C:\WINDOWS`, as Windows did. A current directory holds at most 66
+characters with its drive (`kMaxCurDir`), as a DOS CDS did (AH=47h's
+64-byte buffer holds the part after `C:\`): a chdir deeper than that fails
+with error 3, and a folder list does not go there. (Before, AH=19h said
+`C:` whatever the current directory's drive, AH=0Eh selected nothing and
+reported 5 letters, AH=47h returned the current directory whatever DL
+named, cut to 63 characters, and `X:name` meant `X:\name`, `c:` in a folder
+list `C:\`.)
 
 Opening a lower file for writing (`_lcreat`, `OpenFile(OF_CREATE|OF_WRITE…)`,
 INT 21h 3Ch/3Dh/5Bh/6Ch) copies it up first; new files and directories go
@@ -184,12 +435,16 @@ WMORPH `morph*.dat` (module dir); FISHPRO `[Fish]`, BUGS `[Bugs]`, ARTIST
 `[The Artist] Image`, LOGO `[Logo Section] LogoFile`, Message Mayhem
 `[Message Mayhem] CustomA` (`MODULES.INI`); GLOBE `AD_PREFS.INI`; LUNATIC
 `LunData.dat` (in `GetWindowsDirectory()`, so `<package>\WINDOWS`; read from the seed until
-Keys… or a high score writes it).
+Keys… or a high score writes it); Star Trek's Communications `[Communications]
+MessageText`, Sounder `[Sounder] SoundPath` and AD_SND 1.0 `[Sound] Mute`
+(`AD_PREFS.INI`).
 
 ## Saver-window input (INTERACTION.md §5.2)
 
 Modules mostly poll (`GetAsyncKeyState` & co. read the host's `InputState`;
-`VK_RBUTTON`/`VK_MBUTTON` from the `MOUSE` bitmask). For those that take
+`VK_RBUTTON`/`VK_MBUTTON` from the `MOUSE` bitmask; `GetKeyState`'s bit 0 is
+Caps Lock's toggle for `VK_CAPITAL`, from the `CAPS` line, and Num Lock's for
+`VK_NUMLOCK`, from the `NUMLOCK` line). For those that take
 messages, the lane (`ne16/lane.cc`, "Input and status") hands every `KEY`
 line to the WH_KEYBOARD chain (`SetWindowsHook`/`SetWindowsHookEx(2)`, most
 recent first; `DefHookProc(…, &token)` and `CallNextHookEx(token)` call the
@@ -240,7 +495,13 @@ the saver.
   selector, GDI object, icon or emulated window has one), mapped both ways.
   The wrapped shims (`GetDlgItem`, `SendDlgItemMessage`, `Set/GetDlgItemText`,
   `…Int`, `CheckDlgButton`, `IsDlgButtonChecked`, `CheckRadioButton`,
-  `DlgDirList`/`DlgDirSelect` (on the guest's disk), `EndDialog`,
+  `DlgDirList`/`DlgDirSelect` (on the guest's disk; `DDL_DRIVES` lists
+  `[-c-]` and, when the host's drives are mounted, `[-h-]`, which
+  `DlgDirSelect` makes `h:`; `DlgDirList` moves the guest's DOS to the drive
+  and directory it lists, each drive keeping its own, so `c:*.WAV` lists
+  `C:` where the list left it; a directory deeper than a DOS current
+  directory is refused, 0, the list, the spec and the current directory
+  unchanged), `EndDialog`,
   `SendMessage`, `PostMessage`, `DefWindowProc`, `CallWindowProc`, window
   queries and moves, focus, capture, timers with guest `TIMERPROC`s, props,
   window words/longs incl. subclassing, `EnumChildWindows`, scroll bars,
@@ -263,7 +524,7 @@ the saver.
   (strings, `LB_GETTEXT`/`CB_GETLBTEXT`, `EM_GETLINE`, tab stops,
   `LB_GETSELITEMS`, rectangles; owner-draw lists without `HASSTRINGS` pass
   item data), `EM_SETSEL`/`EM_LINESCROLL` repacked, `LB_DIR`/`CB_DIR` listed
-  from the guest's disk.
+  from the guest's disk (the drives as `DlgDirList` lists them).
 * DC wrappers: a real HDC reaches the guest as a gdi16 DC for one message
   (or a `GetDC`/`BeginPaint` … `ReleaseDC`/`EndPaint`): an 8-bit key
   surface filled from the real pixels (nearest hardware colour), with the
@@ -273,7 +534,12 @@ the saver.
 * `MessageBox` → a real `MessageBoxW`; `COMMDLG.GetOpenFileName`/
   `GetSaveFileName` → the real dialogs (hooks and templates ignored,
   logged), the chosen host path back as an 8.3 `H:\` path
-  (`Vfs::host_to_guest`); `WinHelp` → logged, 1; `WinExec("notepad
+  (`Vfs::host_to_guest`); `COMMDLG.ChooseFont` → the real font dialog
+  (screen fonts; hooks, templates and printer fonts ignored, logged),
+  started from the guest's `LOGFONT`, and on OK the `LOGFONT`, point size,
+  font type and (`CF_EFFECTS`) colour written back — SWTEXT's Select Font;
+  hidden (`ADCONFIGHIDDEN`), where no script line can pick a font, it is
+  cancelled, logged; `WinHelp` → logged, 1; `WinExec("notepad
   <file>")` → the file copied into the upper layer and the real Notepad on
   that copy (not started when hidden or in memory); `EnumFonts` → the
   Windows 95 faces this host has.
@@ -313,7 +579,11 @@ the saver.
 4. **State**: `struct MyState : RuntimeState16 {…}` + `c.rt.state<MyState>()`.
 5. **GDI**: `c.rt.state<Gdi16>()` — `get`/`dc`/`host_dc`, `key(hdc, colorref)`
    (the only form a colour may reach real GDI in), `sync(hdc)` before real
-   GDI draws, `dc_palette`, `dc_surface`, `display()`.
+   GDI draws, `dc_palette`, `dc_surface`, `display()`. On a DC with DIB
+   colour semantics (`Dc16::dib_header`: a DIB driver DC or one compatible
+   with it) `key` matches the DIB driver's way (`dib_index`); read pixels
+   back with `surface_rgb`. Taking a DIB DC's `host_dc` schedules the
+   `GdiFlush`.
 6. **Time**: only `c.rt.tick_count()` (GetTickCount: 55 ms steps),
    `c.rt.time_ms()` (timeGetTime), `c.rt.local_filetime()`, `c.rt.clock_us()`.
    Every read advances virtual time (see below), so busy-waits end.
@@ -372,15 +642,22 @@ for content drawn and erased inside one DRAWFRAME (`ne16/lane.hh`, "Frames").
 ## Debugging
 
 `ADTRACE` categories: `api16` (every call, raw argument words, result, caller),
-`mod16` (loading, LibEntry, DllEntryPoint, GetProcAddress), `res16`
-(FindResource), `file16` (files and profile strings), `dos` (INT 21h),
+`mod16` (loading, LibEntry, DllEntryPoint, GetProcAddress, the resident
+system modules GetModuleHandle finds), `res16` (FindResource, LoadResource
+and FreeResource with the use count, AccessResource), `file16` (files and profile strings), `dos` (INT 21h),
 `throw16` (Throw with a BP-chain backtrace), `prof16` (host time per shim, at
-exit), `pace` (the lane's DRAWFRAMEs, work and virtual time per frame, and frames that ended inside a call), `user16` (also host-posted messages), `sound` (every MMSYSTEM sound call
+exit), `pace` (the lane's DRAWFRAMEs, work and virtual time per frame, and frames that ended inside a call), `user16` (also host-posted messages, and what the guest pump dispatches), `sound` (every MMSYSTEM sound call
 with its virtual time: voices, streams, MCI commands and their results,
-notifies and callbacks as they are delivered), `lane`, `bt16` (every call with the BP chain of
+timer events set and killed, notifies and callbacks as they are delivered —
+but not the two that come hundreds of times a second: the timer periods and
+the short MIDI messages), `timer16` (each multimedia timer procedure call:
+the event, its procedure and `dwUser`, the period's due time and the virtual
+time it was delivered at), `midi16` (each `midiOutShortMsg` with the time it
+is dated at), `debug16` (`OutputDebugString`), `lane`, `bt16` (every call with the BP chain of
 its callers: which module code reached a shim), `dib16` (per `StretchDIBits`
 of an 8-bit DIB: the source rectangle's index histogram, what it became, the
-DIB's colour table and the DC's palette), `input16` (hooks installed and
+DIB's colour table and the DC's palette; DIB driver DCs as they are made,
+and each RGB colour matched on one with the pixel value it became), `input16` (hooks installed and
 called with their results, input posted/removed/dispatched/consumed,
 `FindWindow("Sleep")`, wake), `dlg16` (configure mode: every message
 forwarded to a guest dialog or window procedure, dialogs opened and ended,

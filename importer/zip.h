@@ -6,7 +6,11 @@
 // each member's data is found through its local header. Only what the
 // corpus uses is accepted — a single disk, no ZIP64, no strong encryption,
 // stored (0) or deflated (8) members with bare file names — and everything
-// else is refused as a damaged or foreign source, never guessed at.
+// else is refused as a damaged or foreign source, never guessed at. Member
+// names are UTF-8 from the constructor on: as stored when the archive flags
+// them UTF-8 (general-purpose bit 11; a byte that is not UTF-8 becomes
+// U+FFFD) or they are UTF-8, else decoded from code page 437 — so two names
+// are one only when Windows would take them for one file.
 // Extraction streams: decrypt, raw-inflate through zlib, and check the size
 // and CRC-32 of every member.
 //
@@ -32,7 +36,7 @@ class ZipError : public std::runtime_error {
 };
 
 struct ZipMember {
-  std::string name;  // as stored (a bare 8.3 name in the corpus)
+  std::string name;  // UTF-8 (a bare 8.3 name in the corpus): as stored, or decoded from code page 437
   uint16_t version_made = 0, flags = 0, method = 0;
   uint16_t mod_time = 0, mod_date = 0;  // DOS, local time
   uint32_t crc = 0;

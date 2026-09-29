@@ -34,8 +34,27 @@ namespace adw::win16 {
 // DOS error codes the file layer returns.
 namespace doserr {
 constexpr uint16_t kInvalidFunction = 1, kFileNotFound = 2, kPathNotFound = 3, kTooManyFiles = 4,
-                   kAccessDenied = 5, kInvalidHandle = 6, kNoMoreFiles = 18, kFileExists = 80;
+                   kAccessDenied = 5, kInvalidHandle = 6, kInvalidDrive = 15, kNoMoreFiles = 18, kFileExists = 80;
 }
+
+// The guest's current drive and directories are DOS's (win32::Vfs keeps a
+// current drive and a current directory per drive; relative paths, "X:name"
+// included, resolve against them): INT 21h AH=0Eh selects a drive, 19h
+// reports it, 3Bh sets its drive's directory, 47h reports any drive's, and
+// USER's DlgDirList moves to the drive and directory it lists. A current
+// directory is at most kMaxCurDir characters with its drive ("C:\" and 63
+// more): a DOS CDS held 67 bytes with the NUL, and AH=47h's 64-byte buffer the
+// part after "C:\" with its NUL. A chdir that would go deeper fails with
+// error 3, as DOS's did, so a folder dialog never enters such a folder and
+// AH=47h never has to cut a path short. The drive letters run to H: (AH=0Eh
+// reports 8): C:, and the host's drives' H: when mounted.
+constexpr size_t kMaxCurDir = 66;
+constexpr uint8_t kLastDrive = 8;
+// Makes `path` its drive's current directory (DOS chdir), and with
+// select_drive (DlgDirList) that drive the current one too. 0, or -error:
+// kPathNotFound when it is not an existing directory, holds a wildcard, or is
+// longer than kMaxCurDir; nothing changes then.
+int dos_chdir(Runtime16& rt, const std::string& path, bool select_drive);
 
 class DosFiles : public RuntimeState16 {
  public:
@@ -109,6 +128,45 @@ void register_dos(Runtime16& rt);
 //   [Logo Section] LogoFile = C:\AFTERDRK\BITMAPS\ADLOGO.BMP (AD 3.2's LOGO
 //         refuses to start without it)
 void seed_modules_ini(Runtime16& rt);
+// The profile seeds an Intermission module (the ne16 lane's IMX protocol:
+// Star Wars Screen Entertainment) runs over, read as seed ⊕ file and never
+// written out (host_integration.md §3.4):
+//   SYSTEM.INI [boot] display.drv = pnpdrvr.drv — Windows 95's display
+//        driver name, which SWSE's GETBLITTECHNOLOGY compares with SWSE.INI's
+//        (1:4E95..1:4EB6; empty sends it to its WinG test);
+//   with swse_gdi (the module folder holds SWSE.DLL): SWSE.INI [technology]
+//        display.drv = pnpdrvr.drv, WinGFound = 1, DibBlit = GDI — what
+//        SWSESET's "Use GDI Graphics" left after a probe: SWSE draws with GDI
+//        and the DIB driver at once, never loads WING.DLL, never waits
+//        (1:4EBC..1:4F3B);
+//   ANTSW.INI [Intermission] Volume = volume, 0..100 — Intermission's own
+//        volume, which SWSE turns into waveOutSetVolume (×595) and where 0 is
+//        "Off": no effects and no music (1:7073..1:70D2) — and Saver Path =
+//        saver_path (default: the guest directory), where INTRMLIB looks for
+//        savers (1:2243..1:225C; its default is "c:\saver").
+struct IntermissionSeeds {
+  int volume = 0;
+  bool swse_gdi = false;
+  std::string saver_path;
+};
+void seed_intermission(Runtime16& rt, const IntermissionSeeds& seeds);
+// The profile seeds an After Dark 2.0 module (the ne16 lane's AD3 protocol,
+// when the module folder holds AD_MOD.DLL: ne16/package.hh after_dark2) runs
+// over, read as seed ⊕ file and never written out — what Star Trek: The
+// Screen Saver's installer left in C:\WINDOWS\AD_PREFS.INI, with Windows'
+// own sound for the PC speaker's (PACKAGES.md §7.3):
+//   [After Dark] Path = the guest directory and a backslash (C:\AFTERDRK\),
+//        where AD_MOD.DLL finds its ST_RES\ art and sound (without it every
+//        module but Sounder stops with "File not found."), AD_SND its sound
+//        drivers (*.DRV) and Sounder its SOUNDS\*.WAV;
+//   [Sound] SoundDriver = AD_MME.DRV, AD_SND 1.0's plug-in driver for
+//        "Multimedia Windows Sound": MMSYSTEM's sndPlaySound and waveOut
+//        volume. The disk's AD_PREFS.INI named the PC speaker's AD_MPT.DRV,
+//        whose SPALETTE.DLL busy-waits on the timer chip, which the runtime
+//        has not (the first sound would hang the module).
+// The modules' own writes (AD_SND's [Sound] Mute, Communications' [Communications]
+// MessageText, Sounder's [Sounder] SoundPath) land in the upper layer.
+void seed_after_dark2(Runtime16& rt);
 // A Windows 3.1 Program Manager's files — C:\WINDOWS\PROGMAN.INI [Groups]
 // naming five .GRP files in C:\WINDOWS (Main, Accessories, Games, StartUp,
 // After Dark) — which the desktop-icon gatherers of ADXPL40 and ADXPL310 read

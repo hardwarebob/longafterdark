@@ -7,6 +7,7 @@
 #include <map>
 #include <set>
 
+#include "geometry.h"
 #include "paths.h"
 
 namespace adw::scr {
@@ -100,6 +101,65 @@ RotationPlan effective_rotation(const Settings& s, const Catalog& c,
     plan.ids.push_back(lead && same_as_key(*lead) == key ? lead->id : m->id);
   }
   return plan;
+}
+
+bool rotation_needs_capabilities(const Settings& s, const Catalog& c,
+                                 const std::function<bool(const std::string&)>& available) {
+  if (!s.rotates()) return false;
+  const RotationPlan plan = effective_rotation(s, c, available);
+  auto other_abi = [&](const std::string& id) {
+    const Module* m = c.find(id);
+    return m && m->abi != kAfterDarkAbi;
+  };
+  return std::any_of(plan.ids.begin(), plan.ids.end(), other_abi) || (!plan.lead.empty() && other_abi(plan.lead));
+}
+
+HostRotation rotation_for_host(const Settings& s, const Catalog& c,
+                               const std::function<bool(const std::string&)>& available,
+                               const std::function<bool(const std::string&)>& runs) {
+  auto have = [&](const std::string& id) { return !available || available(id); };
+  auto can = [&](const std::string& id) { return !runs || runs(id); };
+  HostRotation r;
+  r.plan = effective_rotation(s, c, [&](const std::string& id) { return have(id) && can(id); });
+  // What the host's answer took away: counted against the rotation without
+  // it, not the whole catalog (a list of two modules loses at most two).
+  const RotationPlan all = effective_rotation(s, c, have);
+  std::set<std::string> gone;
+  for (const std::string& id : all.ids) {
+    if (!can(id)) gone.insert(id);
+  }
+  if (!all.lead.empty() && !can(all.lead)) gone.insert(all.lead);
+  r.left_out = gone.size();
+  return r;
+}
+
+std::set<SizeI> first_module_screens(const Settings& s, const Catalog& c,
+                                     const std::function<bool(const std::string&)>& available) {
+  auto ok = [&](const Module& m) { return !available || available(m.id); };
+  std::set<SizeI> screens;
+  auto add = [&](const Module& m) { screens.insert(own_screen(m.abi, m.screen)); };
+  auto every_available = [&] {
+    for (const Module& m : c.modules) {
+      if (ok(m)) add(m);
+    }
+  };
+  if (!s.rotates()) {
+    const Module* m = c.find(s.module);
+    if (m && ok(*m)) add(*m);
+    else every_available();   // gone (a re-import, a hand edit): the saver shows one of those there are
+    return screens;
+  }
+  if (rotation_needs_capabilities(s, c, available)) {
+    every_available();
+    return screens;
+  }
+  const RotationPlan plan = effective_rotation(s, c, available);
+  for (const std::string& id : plan.ids) {
+    if (const Module* m = c.find(id)) add(*m);
+  }
+  if (const Module* lead = plan.lead.empty() ? nullptr : c.find(plan.lead)) add(*lead);
+  if (screens.empty()) every_available();   // an empty rotation plays every module (saver.cc)
+  return screens;
 }
 
 // ---- the module list ------------------------------------------------------------------------

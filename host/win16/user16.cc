@@ -17,8 +17,9 @@
 // host's drawing; see README.md "The synthetic desktop and icons".
 //
 // Input (input16.hh, INTERACTION.md §5.2): modules poll GetAsyncKeyState/
-// GetKeyState/GetCursorPos, which read the host's InputState (KEY/CAPS/MOUSE
-// lines; VK_LBUTTON/VK_RBUTTON/VK_MBUTTON from the MOUSE bitmask). The lane
+// GetKeyState/GetCursorPos, which read the host's InputState (KEY/CAPS/
+// NUMLOCK/MOUSE lines; VK_LBUTTON/VK_RBUTTON/VK_MBUTTON from the MOUSE
+// bitmask; GetKeyState's toggle bit for VK_CAPITAL and VK_NUMLOCK). The lane
 // also hands each KEY line to the WH_KEYBOARD hooks (SetWindowsHook(Ex),
 // chained by DefHookProc/CallNextHookEx, most recent first) and, unless one
 // consumed it, posts it to the saver window as WM_KEYDOWN/WM_KEYUP — MOUSE
@@ -31,11 +32,29 @@
 // Configure mode (dialogs16.hh) wraps many of these shims: a handle from the
 // real-window range then names a real dialog or control.
 //
-// Known gaps, deliberately left (no module of the 202 in the five releases
-// needs more; API_SURFACE.md §2 USER):
+// The guest pump (user16_dispatch_guest, shim_families16.hh): the ne16
+// lane's Intermission protocol runs the message loop INTERMIS ran between
+// two saver calls — the guest's posted messages to their window procedures,
+// then the due timers — and counts what the guest posts to its own task
+// (StepReport16::task_posts). The AD3 path never calls it.
+//
+// Window queries answer from the synthetic desktop: GetWindow/GetNextWindow
+// walk the Z order, EnumChildWindows calls back for each descendant (the
+// desktop's: its top-level windows and theirs), GetMenu is the Program
+// Manager's menu bar or a top-level window's menu handle, GetWindowTask is
+// this task for its windows and the shell's for the Program Manager.
+//
+// wsprintf/wvsprintf: a %s whose far pointer reads nothing (SWTEXT's
+// configure dialog passes a near one) is "" and logged, never a fault.
+//
+// Known gaps, deliberately left (no module of the 202 in the five releases,
+// nor Star Wars Screen Entertainment's 14, needs more; API_SURFACE.md §2
+// USER):
 //   * in the saver, dialogs and menus are refused (configure mode makes
 //     dialogs real; menus stay refused).
 //   * GetMessage never blocks: with an empty queue it returns a WM_NULL.
+//   * GetTopWindow is 0, EnumTaskWindows calls nothing back, and GetWindow's
+//     GW_OWNER is 0 (no owners are tracked).
 #include <windows.h>
 
 #include <algorithm>
@@ -45,6 +64,7 @@
 #include <map>
 
 #include "adw/core/log.h"
+#include "win16/dialogs16.hh"
 #include "win16/dos16.hh"
 #include "win16/gdi16.hh"
 #include "win16/input16.hh"
@@ -100,6 +120,8 @@ constexpr uint16_t kSystemCursor = 0x0F00, kSystemIcon = 0x0F04;
 // Windows 3.1 Program Manager. Its HWND lies below the range the window
 // counter hands out (0x0400 up), so creating it renumbers no other window.
 constexpr uint16_t kProgmanHwnd = 0x0380;
+// Its menu bar (GetMenu): a handle no selector, GDI object, icon or window has.
+constexpr uint16_t kProgmanMenu = 0x0F08;
 
 struct Timer16 {
   uint16_t hwnd = 0, id = 0;
@@ -142,6 +164,9 @@ struct UserState : RuntimeState16 {
   uint64_t queue_reads = 0;  // saver-queue reads with removal and a key range
   uint32_t host_posted = 0;  // host-posted messages in `queue` (user16_post_host)
   bool wake = false;         // WM_CLOSE / SC_CLOSE posted to the saver window
+  uint32_t task_posts = 0;   // task messages user16_dispatch_guest removed (StepReport16)
+  uint16_t last_task_msg = 0;
+  uint32_t bad_wsprintf_ptrs = 0;  // %s arguments read as "" (format16), the first few logged
   uint16_t next_hwnd = 0x0400, next_atom = 0xC000, next_timer = 1;
   uint16_t desktop = 0, saver = 0, focus = 0, active = 0, capture = 0;
   int cursor_count = 0;
@@ -209,7 +234,12 @@ uint32_t send(Runtime16& rt, uint16_t hwnd, uint16_t msg, uint16_t wp, uint32_t 
 
 // Formats per Win16 wsprintf: %[-][#][0][width][.prec][l]{d,i,u,x,X,c,s,%};
 // int-sized arguments are WORDs, 'l' ones DWORDs, %s a FAR pointer. `next`
-// hands out argument words in order.
+// hands out argument words in order. A %s whose far pointer names no
+// readable memory reads as "" (the first few are logged): SWTEXT's
+// configure dialog passes a NEAR pointer (SWTEXT 1:06C9 pushes 0E24h alone),
+// so the selector half is the stack word after it — the dialog's HWND16,
+// which on Windows 95 happened to be some readable selector and printed
+// garbage, and here, a real window's 0xC000.., is no selector at all.
 std::string format16(Runtime16& rt, const std::string& fmt, const std::function<uint16_t()>& next) {
   std::string out;
   for (size_t i = 0; i < fmt.size(); i++) {
@@ -274,7 +304,14 @@ std::string format16(Runtime16& rt, const std::string& fmt, const std::function<
       case 's': {
         uint32_t fp = next();
         fp |= uint32_t(next()) << 16;
-        field = rt.read_str(fp);
+        try {
+          field = rt.read_str(fp);
+        } catch (const GuestError16&) {
+          if (us(rt).bad_wsprintf_ptrs++ < 8) {
+            log("win16: wsprintf %%s argument %04X:%04X is not a readable far pointer: read as \"\"", fp >> 16, fp & 0xFFFF);
+          }
+          field.clear();
+        }
         if (prec >= 0 && field.size() > size_t(prec)) field.resize(size_t(prec));
         break;
       }
@@ -492,8 +529,8 @@ uint16_t key_state(Call16& c, int vk, bool async) {
     UserState& s = us(c);
     if (down && !s.async_seen[size_t(vk)]) r |= 1;
     s.async_seen[size_t(vk)] = down;
-  } else if (vk == VK_CAPITAL && in.caps) {
-    r |= 1;
+  } else if ((vk == VK_CAPITAL && in.caps) || (vk == VK_NUMLOCK && in.numlock)) {
+    r |= 1;  // toggled: the CAPS and NUMLOCK lines (Final Exam starts its exam on Num Lock's)
   }
   return r;
 }
@@ -671,6 +708,37 @@ std::vector<uint16_t> z_order(UserState& s, uint16_t parent) {
   return out;
 }
 
+// GetWindow(hwnd, cmd): GW_HWNDFIRST/LAST/NEXT/PREV (0..3) among the window's
+// siblings in Z order, GW_CHILD (5) its topmost child, GW_OWNER (4; none are
+// tracked) 0. GetNextWindow is its NEXT/PREV half.
+uint16_t window_rel(UserState& s, uint16_t h, uint16_t cmd) {
+  auto wi = s.windows.find(h);
+  if (wi == s.windows.end()) return 0;
+  if (cmd == 5) {
+    std::vector<uint16_t> kids = z_order(s, h == s.desktop ? 0 : h);
+    return kids.empty() ? 0 : kids.front();
+  }
+  std::vector<uint16_t> sib = z_order(s, wi->second.parent == s.desktop ? 0 : wi->second.parent);
+  auto it = std::find(sib.begin(), sib.end(), h);
+  if (it == sib.end()) return 0;
+  switch (cmd) {
+    case 0: return sib.front();
+    case 1: return sib.back();
+    case 2: return it + 1 == sib.end() ? 0 : *(it + 1);
+    case 3: return it == sib.begin() ? 0 : *(it - 1);
+    default: return 0;
+  }
+}
+
+// A window's descendants, each followed by its own, in Z order.
+void descendants(UserState& s, uint16_t parent, std::vector<uint16_t>* out, int depth = 0) {
+  if (depth > 32) return;
+  for (uint16_t k : z_order(s, parent == s.desktop ? 0 : parent)) {
+    out->push_back(k);
+    descendants(s, k, out, depth + 1);
+  }
+}
+
 }  // namespace
 
 uint16_t user16_saver_window(Runtime16& rt) {
@@ -765,6 +833,61 @@ int user16_dispatch_host(Runtime16& rt, int max) {
 
 bool user16_window_exists(Runtime16& rt, uint16_t hwnd) { return hwnd && us(rt).windows.count(hwnd) != 0; }
 
+int user16_dispatch_guest(Runtime16& rt, int max) {
+  UserState& s = us(rt);
+  int n = 0;
+  // The guest's posted messages, in queue order; the ones a window
+  // procedure posts meanwhile join the end and are taken too (up to max),
+  // as INTERMIS's loop kept dispatching while its queue held something.
+  while (n < max) {
+    auto it = std::find_if(s.queue.begin(), s.queue.end(), [](const Msg16& m) { return !m.host; });
+    if (it == s.queue.end()) break;
+    Msg16 m = *it;
+    s.queue.erase(it);
+    n++;
+    if (!m.hwnd) {
+      s.task_posts++;
+      s.last_task_msg = m.msg;
+      trace("user16", "task message %04X (%04X, %08X) taken by the guest pump", m.msg, m.wparam, m.lparam);
+      continue;
+    }
+    if (!s.windows.count(m.hwnd)) {
+      trace("user16", "guest message %04X for %04X dropped: no such window", m.msg, m.hwnd);
+      continue;
+    }
+    trace("user16", "guest message %04X (%04X, %08X) dispatched to %04X", m.msg, m.wparam, m.lparam, m.hwnd);
+    if (m.msg == WM_TIMER && m.lparam) rt.call_far(m.lparam, {w16(m.hwnd), w16(m.msg), w16(m.wparam), l16(rt.tick_count())});
+    else send(rt, m.hwnd, m.msg, m.wparam, m.lparam);
+  }
+  // Then the timers that are due, once each (GetMessage's WM_TIMER, which
+  // DispatchMessage hands to the TIMERPROC, else to the window). A callback
+  // may set or kill timers: each is looked up again before it fires, and
+  // fires only if still due — one an earlier callback set again (SetTimer on
+  // its hwnd and id resets it, as Windows did) waits for its new time, as
+  // GetMessage's own timer check (take) would have it.
+  std::vector<std::pair<uint16_t, uint16_t>> due;
+  uint64_t now = rt.peek_us();
+  for (const Timer16& t : s.timers) {
+    if (now >= t.due_us) due.push_back({t.hwnd, t.id});
+  }
+  for (const auto& [hwnd, id] : due) {
+    if (n >= max) break;
+    auto t = std::find_if(s.timers.begin(), s.timers.end(), [&](const Timer16& x) { return x.hwnd == hwnd && x.id == id; });
+    if (t == s.timers.end() || now < t->due_us) continue;
+    uint32_t proc = t->proc;
+    t->due_us = now + uint64_t(std::max<uint32_t>(t->elapse_ms, 1)) * 1000;
+    n++;
+    if (proc) {
+      trace("user16", "timer %u of %04X: TIMERPROC %04X:%04X", id, hwnd, proc >> 16, proc & 0xFFFF);
+      rt.call_far(proc, {w16(hwnd), w16(WM_TIMER), w16(id), l16(rt.tick_count())});
+    } else if (hwnd && s.windows.count(hwnd)) {
+      trace("user16", "timer %u: WM_TIMER to %04X", id, hwnd);
+      send(rt, hwnd, WM_TIMER, id, 0);
+    }
+  }
+  return n;
+}
+
 StepReport16 user16_end_step(Runtime16& rt, uint32_t keep_steps) {
   UserState& s = us(rt);
   StepReport16 r;
@@ -789,6 +912,8 @@ StepReport16 user16_end_step(Runtime16& rt, uint32_t keep_steps) {
   }
   r.queue_reads = s.queue_reads;
   r.wake = s.wake;
+  r.task_posts = s.task_posts;
+  r.last_task_msg = s.last_task_msg;
   return r;
 }
 
@@ -1374,10 +1499,60 @@ void register_user16(Runtime16& rt) {
     }
     c.ret(0);
   });
-  r.impl(U, "EnumChildWindows", [](Call16& c) { c.ret(1); });
+  // EnumChildWindows(hwndParent, lpEnumFunc, lParam): BOOL FAR PASCAL
+  // f(HWND, LPARAM) for each of the window's descendants (each followed by
+  // its own, in Z order) until one returns 0; the desktop's are the
+  // top-level windows (the synthetic desktop comes into being, as for
+  // EnumWindows) and theirs. JAWAS (1:3B3D) asks for its window's parent's.
+  // A handle naming no window, 0 included, enumerates nothing: FALSE.
+  r.impl(U, "EnumChildWindows", [](Call16& c) {
+    uint16_t h = c.w();
+    uint32_t proc = c.ptr();
+    uint32_t lp = c.l();
+    UserState& s = us(c);
+    if (!h || !s.windows.count(h)) return c.ret(0);
+    if (h == s.desktop) ensure_desktop(c.rt);
+    std::vector<uint16_t> list;
+    descendants(s, h, &list);
+    for (uint16_t k : list) {
+      if (!wnd(c, k)) continue;  // destroyed by an earlier callback
+      trace("user16", "EnumChildWindows(%04X) -> %04X:%04X(%04X, %08X)", h, proc >> 16, proc & 0xFFFF, k, lp);
+      if (!(c.rt.call_far(proc, {w16(k), l16(lp)}) & 0xFFFF)) break;
+    }
+    c.ret(1);
+  });
   r.impl(U, "EnumTaskWindows", [](Call16& c) { c.ret(1); });
   r.impl(U, "GetTopWindow", [](Call16& c) { c.ret(0); });
-  r.impl(U, "GetNextWindow", [](Call16& c) { c.ret(0); });
+  // GetNextWindow(hwnd, GW_HWNDNEXT | GW_HWNDPREV): GetWindow's two
+  // sibling steps (JAWAS walks back through the Z order with it, 1:3A24).
+  r.impl(U, "GetNextWindow", [](Call16& c) {
+    uint16_t h = c.w(), cmd = c.w();
+    c.ret(cmd == 2 || cmd == 3 ? window_rel(us(c), h, cmd) : 0);
+  });
+  // GetMenu(hwnd): the window's menu bar — none on the saver's popup window
+  // or a child window; the menu handle a module's own top-level window was
+  // created with; the synthetic Program Manager's menu bar (JAWAS asks while
+  // it sizes up the windows on the desktop, 1:3DFE).
+  r.impl(U, "GetMenu", [](Call16& c) {
+    uint16_t h = c.w();
+    UserState& s = us(c);
+    Wnd16* w = wnd(c, h);
+    if (!w) return c.ret(0);
+    if (h == s.progman) return c.ret(kProgmanMenu);
+    c.ret((w->style & WS_CHILD) ? 0 : w->id);
+  });
+  // GetWindowTask(hwnd): the task that made the window — this one for the
+  // saver window, the module's own windows and (configure mode) the real
+  // dialogs, the shell's for the synthetic Program Manager and the desktop
+  // (JAWAS's EnumWindows callback skips its own task's windows, 1:3B6D), 0
+  // for a handle that names no window.
+  r.impl(U, "GetWindowTask", [](Call16& c) {
+    uint16_t h = c.w();
+    UserState& s = us(c);
+    if (h && (h == s.progman || h == s.desktop)) return c.ret(kernel16_shell_task(c.rt));
+    if (wnd(c, h) || real_window16(c.rt, h)) return c.ret(kernel16_current_task(c.rt));
+    c.ret(0);
+  });
   r.impl(U, "GetLastActivePopup", [](Call16& c) { c.ret(c.w()); });
   // GetNextQueueWindow(hwnd, bNext): a stub row in the interface tables; BUGS
   // walks the queue's windows with it. There is no other window to find.
@@ -1396,32 +1571,10 @@ void register_user16(Runtime16& rt) {
     }
     c.ret(1);
   });
-  // GetWindow(hwnd, cmd): GW_HWNDFIRST/LAST/NEXT/PREV among its siblings in
-  // Z order, GW_OWNER (none are tracked: 0), GW_CHILD.
+  // GetWindow(hwnd, cmd): window_rel.
   r.impl(U, "GetWindow", [](Call16& c) {
     uint16_t h = c.w(), cmd = c.w();
-    UserState& s = us(c);
-    Wnd16* w = wnd(c, h);
-    if (!w) return c.ret(0);
-    if (cmd == 5) {  // GW_CHILD
-      std::vector<uint16_t> kids = z_order(s, h == s.desktop ? 0 : h);
-      return c.ret(kids.empty() ? 0 : kids.front());
-    }
-    std::vector<uint16_t> sib = z_order(s, w->parent == s.desktop ? 0 : w->parent);
-    auto it = std::find(sib.begin(), sib.end(), h);
-    if (it == sib.end()) return c.ret(0);
-    switch (cmd) {
-      case 0:  // GW_HWNDFIRST
-        return c.ret(sib.front());
-      case 1:  // GW_HWNDLAST
-        return c.ret(sib.back());
-      case 2:  // GW_HWNDNEXT
-        return c.ret(it + 1 == sib.end() ? 0 : *(it + 1));
-      case 3:  // GW_HWNDPREV
-        return c.ret(it == sib.begin() ? 0 : *(it - 1));
-      default:
-        return c.ret(0);
-    }
+    c.ret(window_rel(us(c), h, cmd));
   });
   // GetClassWord(hwnd, index): the window class's GCW_* fields.
   r.impl(U, "GetClassWord", [](Call16& c) {

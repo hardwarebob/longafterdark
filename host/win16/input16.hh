@@ -62,6 +62,11 @@ struct StepReport16 {
   bool wake = false;        // the guest posted WM_CLOSE / SC_CLOSE to the saver window (sticky)
   uint32_t dropped = 0;     // tagged messages nobody took this step
   uint64_t pending = 0;     // lowest seq still waiting in the saver window's queue (0 none)
+  // Running count of messages the guest posted to its task (hwnd 0) that
+  // user16_dispatch_guest took out of the queue (SWSE's FORCETOWAKE: fake
+  // mouse and Shift-key input for INTERMIS), and the latest one's number (0 none).
+  uint32_t task_posts = 0;
+  uint16_t last_task_msg = 0;
 };
 // Tagged messages nobody took are dropped once they have waited keep_steps
 // steps beyond the one they arrived in (0: at the end of their step). The

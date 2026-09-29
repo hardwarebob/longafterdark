@@ -11,6 +11,8 @@
 #include <utility>
 #include <vector>
 
+#include "catalog.h"
+
 namespace adw::scr {
 
 // ---- helper programs ------------------------------------------------------------
@@ -41,21 +43,71 @@ std::wstring import_outcome_note(DWORD code);
 
 // ---- what the host can do ----------------------------------------------------------
 // `adhostwin --capabilities` prints one line and exits 0 (INTERACTION.md
-// §3.3): "lanes=pe32,ne16 configure=pe32,ne16 status=1 state=1 seed=1", only
-// what that build has. The dialog asks once, without running any module:
-// which lanes run at all (a Classic module on a host without ne16 is
-// "Coming soon") and which can open a module's own settings windows (its
-// buttons, §6.3).
+// §3.3): "lanes=pe32,ne16 configure=pe32,ne16 abis=afterdark,intermission
+// status=1 state=1 seed=1 audio=1 numlock=1", only what that build has. The
+// dialog asks once (at a new catalog again only while it hasn't answered),
+// without running any module: which lanes and which module ABIs run at all
+// (a module whose lane or ABI isn't listed is "Coming soon") and which lanes
+// can open a module's own settings windows (its buttons, §6.3). The saver
+// asks too; when its rotation holds a module of another ABI than After
+// Dark's (rotation_needs_capabilities, releases.h), Random leaves out what
+// the host can't run (saver.cc), and only a host that says numlock=1 hears
+// Num Lock (below).
 struct HostCapabilities {
   bool known = false;                 // the host answered (a host too old to know the switch doesn't)
   std::vector<std::string> lanes, configure;
+  // The module ABIs it runs (catalog "abi"). A host that prints no "abis="
+  // predates them and runs After Dark's alone: {"afterdark"}.
+  std::vector<std::string> abis{kAfterDarkAbi};
   bool status = false, state = false, seed = false;
+  // numlock=1: a Num Lock toggle beside Caps Lock (INTERACTION.md §3.2):
+  // ADNUMLOCK=0|1 at start and NUMLOCK <0|1> input lines, numbered like CAPS.
+  bool numlock = false;
   std::string line;                   // as printed, for the logs
   bool has_lane(const std::string& lane) const;
+  bool has_abi(const std::string& abi) const;
   bool can_configure(const std::string& lane) const;
+  // Whether it runs a module of `lane` and `abi` ("" = "afterdark"): both
+  // listed. A host that didn't answer (!known) is taken to run everything: a
+  // module whose lane it lacks exits 3 there (host.h: kExitLaneMissing),
+  // which the dialog takes for that module alone (module_run's `exited_3`).
+  bool runs(const std::string& lane, const std::string& abi) const;
+  // Whether the saver may send it NUMLOCK lines: only once it has said
+  // numlock=1. A host without the line ignores it ("unrecognized") without
+  // numbering it, so every later input line would carry one number more in
+  // the saver's count than in the host's, and the input rules' holds
+  // (input_rules.h) would wait on numbers the host never reaches.
+  bool takes_numlock_lines() const { return known && numlock; }
+  // Whether a host started now gets ADNUMLOCK: unless it has answered without
+  // numlock=1. Before the answer it goes too (the saver's first hosts start
+  // before it unless the rotation waits for it: a module of another ABI,
+  // App::caps_gate, 2 s at most): a host that doesn't know the variable
+  // ignores it, while one that does must start with the real toggle, since
+  // modules latch it when they start (Final Exam's exam begins on a change of
+  // it): a later NUMLOCK line correcting a guessed one would read as a toggle.
+  bool takes_numlock_env() const { return !known || numlock; }
 };
 HostCapabilities parse_capabilities(const std::string& text);
 HostCapabilities probe_capabilities(const std::wstring& host_exe, DWORD timeout_ms = 5000);
+// The Num Lock toggle a host is started with: {"ADNUMLOCK", "0"|"1"} when it
+// takes one (takes_numlock_env), else {"ADNUMLOCK", ""}: removed, so nothing
+// inherited reaches it (an empty value removes a variable, host_process.h).
+std::pair<std::wstring, std::wstring> numlock_env(const HostCapabilities& caps, bool on);
+
+// What the settings dialog can do with a module now (its preview, its
+// thumbnail, its buttons, Preview):
+//   waiting      the host is being asked (--capabilities): start nothing yet;
+//   coming_soon  the host doesn't list its lane or its ABI, or one of its own
+//                runs exited 3 (`exited_3`: the host's "valid module whose
+//                lane is not built into this adhostwin", host.h, which is how
+//                a host too old to answer says so): dimmed, never started,
+//                its buttons read-only, "Coming soon". An exit 3 speaks for
+//                that module alone, never for the others of its lane or ABI.
+//                (A module ABI the host lacks fails with exit 1, as a damaged
+//                module does: only its abis= answer tells the two apart);
+//   runs         otherwise, a host that didn't answer included.
+enum class ModuleRun { runs, waiting, coming_soon };
+ModuleRun module_run(const Module& m, const HostCapabilities& caps, bool probing, bool exited_3);
 
 // A host started for a one-shot answer (--capabilities, --configure): no
 // console window (CREATE_NO_WINDOW), in a kill-on-close Job created with it,

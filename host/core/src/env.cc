@@ -257,6 +257,7 @@ Env Env::parse(const std::map<std::string, std::string>& in) {
     }
   }
   e.caps_at_start = e.flag("ADCAPS");
+  e.numlock_at_start = e.flag("ADNUMLOCK");
   return e;
 }
 

@@ -21,13 +21,15 @@ files together in either of these places:
 Screen Saver Settings lists it as "Long After Dark": the `.scr`'s string
 resource 1 (`IDS_DESCRIPTION`), which Windows shows instead of the file name.
 
-The modules come from your own After Dark discs: any of the five releases
-(After Dark 4.0 Deluxe, After Dark 3.2, Totally Twisted After Dark, After
-Dark 10th Anniversary and The Simpsons Screen Saver), from the disc, an image
-of it, a copy of its files, or the Internet Archive download. Click
-**Import…** in the settings dialog (or run `adimport.exe`) to copy them to
-`%LOCALAPPDATA%\LongAfterDark\assets\win`. Until then the saver shows "After
-Dark modules not imported".
+The modules come from your own discs: any of the seven releases (six of After
+Dark: After Dark 4.0 Deluxe, After Dark 3.2, Totally Twisted After Dark, After
+Dark 10th Anniversary, The Simpsons Screen Saver and Star Trek: The Screen
+Saver, which is After Dark 2.0b on two floppies; and LucasArts' Star Wars
+Screen Entertainment, whose modules run on Delrina's Intermission engine), from
+the disc (or the floppies), an image of it, a copy of its files, or the
+Internet Archive download. Click **Import…** in the settings dialog (or run `adimport.exe`) to
+copy them to `%LOCALAPPDATA%\LongAfterDark\assets\win`. Until then the saver
+shows "No modules imported".
 
 ## The data folder
 
@@ -47,8 +49,13 @@ saver keeps nothing there.
 **Names.** The saver's windows are of class `LongAfterDarkSaver` (the `/s`
 and `/p` windows), `LongAfterDarkLivePreview` and
 `LongAfterDarkThumbnailQueue`; its temporary files are
-`%TEMP%\LongAfterDark-preview-<pid>.ini` and
-`%TEMP%\LongAfterDark-seed-<pid>-<window>.ppm`.
+`%TEMP%\LongAfterDark-preview-<pid>.ini` and the desktop captures,
+`%TEMP%\LongAfterDark-seed-<pid>-<window>.ppm` for a window that may start
+with a module that follows the display (an After Dark module) and
+`…-<window>-640x480.ppm` for one that may start with a module that has a
+640×480 screen of its own (an Intermission or a Star Trek module; the first
+file serves both where the two pictures are the same: **Starting from the
+desktop**).
 
 ## Command line
 
@@ -58,7 +65,7 @@ like `/`, and the window handle can be written as `/p 1234`, `/p:1234` or `/p123
 | Switch | What it does |
 |---|---|
 | `/s` | Full screen, with one topmost window per monitor. A key, a click, the wheel or a nudge of the mouse ends it (see **Ending the saver and playing** below). |
-| `/p <HWND>` | Live preview inside that window at 320×240. It exits when the window goes away. |
+| `/p <HWND>` | Live preview inside that window at 320×240 (for every module: see **Emulated screen**). It exits when the window goes away. |
 | `/c[:HWND]` or nothing | Opens the settings dialog. |
 | `/a` | Ignored (Windows 9x password change). |
 
@@ -70,15 +77,20 @@ The rules are the 1996 After Dark 4 saver's (`docs/INTERACTION.md`
 * **Not playing:** any key except Shift, Ctrl, Caps Lock and Num Lock, any
   click, the wheel or a nudge of the mouse (more than 10 pixels) ends the
   saver, and so does switching away (the Windows key, Alt+Tab,
-  Ctrl+Alt+Del). Caps Lock never does: in some modules it does something (it
-  scares the fish, changes the colours) or starts a game.
+  Ctrl+Alt+Del). Caps Lock and Num Lock never do: in some modules Caps Lock
+  does something (it scares the fish, changes the colours) or starts a game,
+  and Num Lock starts Final Exam's exam.
 * **Playing** (after Caps Lock in Rodger Dodger, You Bet Your Head, Simpsons
   Trivia, Mime Hunt, Frankenscreen, Marbles, RPS, Magic Turtle's editor,
-  How to Draw…): keys, clicks and the mouse belong to the game. Press Caps
-  Lock again to stop playing (the next key or move then ends the saver), or
-  press **Alt** (or F10) to end it at once. While a game runs the pointer
-  shows when the module asks for one, stays on the primary monitor, and the
-  randomizer waits before switching modules.
+  How to Draw…; after Num Lock in Final Exam, Star Trek: The Screen Saver's
+  Starfleet Academy exam): keys, clicks and the mouse belong to the game.
+  Press Caps Lock again to stop playing (Num Lock, in Final Exam; the next
+  key or move then ends the saver), or press **Alt** (or F10) to end it at
+  once. Final Exam's answers are the number keys; a move of the mouse ends
+  its exam, and the module asks its host to wake the saver (as After Dark
+  2.0 let it), which ends the saver too (`input: wake`). While a game runs
+  the pointer shows when the module asks for one, stays on the primary
+  monitor, and the randomizer waits before switching modules.
 * Locking the session (Win+L, Ctrl+Alt+Del then Lock, an idle-lock policy) or
   disconnecting it ends the saver, playing or not: a lock sends no
   deactivation, and the saver, a game and its sound would otherwise run on
@@ -87,10 +99,23 @@ The rules are the 1996 After Dark 4 saver's (`docs/INTERACTION.md`
 
 How: the window on the primary monitor is the **input owner**. Only its host
 gets input: each key as `KEY <vk> <0|1>`, then `CAPS <0|1>` when the Caps Lock
-toggle changed (checked on every key down and up, and every 250 ms), clicks
+toggle changed and `NUMLOCK <0|1>` when the Num Lock toggle changed (each
+checked on every key down and up, and every 250 ms), clicks
 and moves as `MOUSE <x> <y> <buttons>` in the host's emulated-screen
 coordinates (moves coalesced, one per `GO`). Every host starts with the Caps
-Lock toggle in `ADCAPS`, since modules latch it when they start. Each host
+Lock toggle in `ADCAPS` and the Num Lock toggle in `ADNUMLOCK`, since modules
+latch them when they start (Final Exam begins its exam on a change of Num
+Lock). Num Lock reaches a host only when its `--capabilities` says
+`numlock=1` (`HostCapabilities` in `dialog_support.h`): a host without it
+would ignore a `NUMLOCK` line without numbering it, and every input line
+after it would then carry a number one higher in the saver's count than in
+the host's (the holds below would wait for numbers it never reaches).
+Unless the rotation waits for the host's answer (it holds a module of
+another ABI than After Dark's: **What Random leaves out** below), the first
+hosts start before it (the saver never waits for it on this account), so
+they get `ADNUMLOCK` anyway, which a host without the toggle ignores; once a
+host has answered without `numlock=1`, its hosts start without it (the
+first ones too, when they waited for the answer). Each host
 publishes a status record (interactive, cursor, rotate-ok, key-filter, wake;
 the number of the last input line it applied and the highest it consumed) in
 a one-page shared section passed as `ADSTATUSHANDLE` (`adw/core/status.h`),
@@ -103,7 +128,10 @@ reads the saver window's queue), waits for the host's verdict, at most
 300 ms. The owner's host dying ends such a wait at once. Why each run ended
 is logged (`input: key vk=0x41`, `input: syskey vk=0x12`, `input: move dx=…
 dy=…`, `input: deactivated fg=<exe>`, `input: session locked`, `input: wake`,
-`test-exit`).
+`test-exit`); the toggles the owner's host is told of are logged too
+(`input: caps 1 -> owner (n=12)`, `input: numlock 1 -> owner (n=14)`), and
+each spawn line says what the host started with (`caps=0 numlock=1`;
+`numlock=-1`: none).
 
 **The last-exit log.** Every `/s` run rewrites `logs\saver-last.log` next to
 `settings.ini` (`AD_SCR_LASTLOG` overrides): the start (build, monitors, the
@@ -127,8 +155,13 @@ column at most 1240 DIP wide, centred.
 
 * **The box-cover strip** (`docs/COVERS.md` §1), when two or more
   releases (packages) are imported: one 4:5 box cover per release across the
-  top, oldest release first (Simpsons, 3.2, Totally Twisted, Deluxe,
-  10th Anniversary), each with its short title under it (64×80 DIP
+  top, oldest release first (Star Trek, Simpsons, Star Wars, 3.2, Totally
+  Twisted, Deluxe, 10th Anniversary; all seven fit the first-open window, and
+  the smallest one with its compact covers, without scrolling; a window as
+  narrow but 760 DIP or more tall fits five of its regular tiles whole at a
+  time beside a chevron (unscrolled, the sixth's cover shows too, only its
+  focus margin under the chevron), and its row scrolls by at most two
+  tiles, to the third), each with its short title under it (64×80 DIP
   covers; 48×60 without captions when the window is under 760 DIP tall). A
   caption may use its cover's whole window (the cell and its focus margins),
   so every release's short title fits whole at every scale; a longer one
@@ -155,9 +188,14 @@ column at most 1240 DIP wide, centred.
   covers (chevrons at the ends, the wheel, or the keyboard focus). The
   window opens at 1040×800 DIP with the strip (at least 680 tall).
 * **Single module / Random** at the top left chooses what the saver plays.
-  Below it, the **module list**, grouped by release (the release's title,
-  oldest release first), with a hairline and 12 DIP of space before each group
-  after the first. Rows show the module's own name; a module several
+  Below it, the **module list**, grouped by release (the release's title and
+  its number of modules, oldest release first), with a hairline and 12 DIP of
+  space before each group after the first. A title too long for the list
+  beside its count, and beside the "Coming soon" pill when the group has one,
+  is ellipsized ("Star Wars Screen Entertain… 14" in the narrowest window, in
+  Random): the count and the pill always show whole, the whole title is the
+  header's tooltip, and screen readers hear it whole. Rows show the
+  module's own name; a module several
   releases ship is listed under each of them. Only when one release has two
   builds under one name does the lane show: the Classic one reads "Bad Dog!
   (Classic)" (two alike of one lane: their file stems, "(BADDOG3)"). The
@@ -201,8 +239,13 @@ column at most 1240 DIP wide, centred.
   (see below) and those rows go.
 * The **details** of the selected module (never one the filter hides; see
   above): a **live preview** that runs it in
-  its own `adhostwin.exe` at a real screen's size (the primary monitor's
-  aspect ratio, 480 lines), shown scaled down, with the dialog's current,
+  its own `adhostwin.exe` at a real screen's size (an After Dark module at
+  480 lines at the preview box's own 16:9 aspect — 856x480, or 848x480
+  where the box's whole pixels come out a little taller — whatever the
+  Resolution setting; a module with a screen of its own, an Intermission or
+  a Star Trek module, at its 640x480, pillarboxed in the wide preview as on
+  a widescreen monitor: see **Emulated screen**),
+  shown scaled down, with the dialog's current,
   unsaved values; changing a value restarts it. Pointing at it shows the
   module's name along its foot. Under it the About text (tidied: the
   original's hard line breaks are rejoined; drawn with plain anti-aliasing)
@@ -226,26 +269,61 @@ column at most 1240 DIP wide, centred.
   first line, when they scroll) and is enabled once a value differs from the
   catalog's default.
 * **Resolution** and **Monitors**, each at the start of its half of the card
-  (dropdowns at most 280 DIP wide), and under them **Sound** ("Primary
+  (dropdowns at most 280 DIP wide; Resolution, 480 or 720 lines, is for the
+  modules that follow the display alone: an Intermission or a Star Trek
+  module always runs at its own 640×480, see **Emulated screen**), and under
+  them **Sound** ("Primary
   monitor" / "Off") and **Volume** (a 0–100 slider with its value at the end
   of its label row; screen readers call it "Volume"; greyed, with its label,
   while Sound is Off), then the note "Sound plays from the primary monitor’s
   screen saver." (`docs/AUDIO.md` §9; see **Sound** below). The
   slider is adw_ui's `init_slider`: Right and Up raise it by 1, Left and
   Down lower it, Page Up / Page Down by 10, Home / End to 0 / 100.
-* The footer: **Import…** with a line saying what is imported ("202
-  modules from 5 releases", or "84 modules from After Dark 4.0 Deluxe"),
-  then **Preview** (full screen, of the module the details show; greyed for
+* The footer: **Import…** with a line saying what is imported ("232
+  modules from 7 releases", or "84 modules from After Dark 4.0 Deluxe"),
+  then the credit, then **Preview** (full screen, of the module the details show; greyed for
   a module this host can't run yet, or whose file is missing, and while the
-  details show none), **OK** and **Cancel**.
+  details show none), **OK** and **Cancel**. The credit, "Made With Love by
+  StarrLord", is one link to <https://github.com/starrlord/longafterdark>
+  (`layout_footer_credit` in `ui_model.h`) in the dialog's link look (adw_ui's
+  `ButtonRole::subtle`, as **Show all**: a fill under the pointer and a
+  deeper one pressed, the focus ring round its box, a hand pointer), its text
+  in the caption face of the assets line: "Made With Love by" in `text2`,
+  "StarrLord" in the accent text colour, underlined under the pointer (the
+  hover cue high contrast keeps, whose hover fill is the window colour). It
+  sits in the free space between the assets line's text and Preview, centred
+  there and on the buttons, and shows only when its whole box fits with
+  24 DIP clear of both: beside "232 modules from 7 releases" it fits the
+  first-open window at every scale, and the narrowest one at most of them
+  (100, 125, 175, 225 and 250%, by a few pixels at some; at 150% and 200% it
+  gives way there, as it did not beside the six releases' "216 modules from
+  6 releases", whose digits are narrower), while an assets
+  line too long for the room (files missing; one release's long title in the
+  narrowest window) hides it, never clipped. If it had the focus, the
+  keyboard moves on to the next control (Preview) as Tab would, and the
+  default button with it, so Enter there runs Preview rather than OK; if
+  it hid while the window was inactive, the same happens when the window is
+  activated again (the dialog manager gives the focus back to it first). Tab
+  reaches it after Import… and before Preview; a click, Enter or
+  Space opens the page in the default browser (`ShellExecuteW` "open"); its
+  tooltip is the address; screen readers hear "Made With Love by StarrLord"
+  and, as its description (UI Automation's help text), "Opens
+  https://github.com/starrlord/longafterdark in your browser". The assets
+  line's window is only as wide as its text, so the two never overlap. The
+  welcome's footer (no Import…) shows it too: it has more room there.
 
 Until the modules are imported the details card is one welcome: a picture
 across its top (the night sky, the moon and two flying toasters), "Welcome to
-Long After Dark", what importing does (from any of the five releases' discs,
-an image, or the Internet Archive; `welcome_text` in `ui_model.h`) and an
-**Import After Dark…** button. The footer's Import is hidden meanwhile (it
-is the same command), Single/Random are greyed, and the list shows a few
-faint placeholder rows and "Your modules appear here after import".
+Long After Dark", what importing does (the original modules of After Dark and
+Star Wars Screen Entertainment, from any of the seven releases' discs, an image,
+or the Internet Archive; `welcome_text` in `ui_model.h`) and an **Import a
+release…** button (the importer's window is "Import a release"). The
+footer's Import is hidden meanwhile (it is the same command), its line reads
+"Nothing imported yet" (the credit beside it as ever), Single/Random are greyed, and the list shows a few
+faint placeholder rows and "Your modules appear here after import". "Long
+After Dark" stays the product's name; the words for the releases fit all seven
+(not every one is After Dark's, and Star Trek: The Screen Saver came on
+floppies, which "discs" covers).
 
 **Thumbnails.** A module with no icon of its own is shown by a square of one
 of its own frames: a third of the screen's height around the busiest part of
@@ -264,7 +342,10 @@ pattern is kept. Two things take them:
   frame so far);
 * in the background, every module still without a picture: when the dialog
   opens with any missing, and after an import. One at a time, in the list's
-  order, each in a host of its own on a 640x480 screen at idle priority for
+  order, each in a host of its own on a 640x480 screen (the module's own
+  rule at 4:3 and 480 lines, which is 640x480 for an After Dark, an
+  Intermission and a Star Trek module alike; a catalog "screen" of another
+  size would be that size) at idle priority for
   up to 12 seconds, never shown; paused while the full-screen Preview runs,
   stopped while an import runs, and never for a module this host can't run.
   `AD_SCR_THUMBGEN=0` turns this off.
@@ -276,20 +357,46 @@ are taken again.
 
 When the dialog opens it asks the host what it can do, without running any
 module: `adhostwin.exe --capabilities` prints one line such as
-`lanes=pe32,ne16 configure=pe32,ne16 status=1 state=1 seed=1 audio=1`. Without the
-Classic lane (`ne16` missing from `lanes=`), Classic modules
-are dimmed and marked **Coming soon**, and their preview says so instead of
-starting them. They stay in the list (and in the rotation when checked, their
-checkboxes dimmed like the row), so they play as soon as a host that has the
-lane is installed; meanwhile the rotation line says how many can run
-("All 84 selected · 23 can run now"). A host too old to answer is taken to
-run everything (it says so itself, with exit 3, when a lane is missing).
+`lanes=pe32,ne16 configure=pe32,ne16 abis=afterdark,intermission status=1 state=1 seed=1 audio=1 numlock=1`.
+`lanes=` are the lanes built in; `abis=` the module ABIs it runs (a catalog
+entry's `abi`: absent for After Dark's, `"intermission"` for Star Wars Screen
+Entertainment's IMX modules, which are on lane `ne16` too); a host that
+prints no `abis=` predates them and runs After Dark's alone. `numlock=1` is
+a host that keeps a Num Lock toggle beside Caps Lock (`NUMLOCK` lines and
+`ADNUMLOCK`, see **Ending the saver and playing**); the dialog itself sends
+no input, so only the saver acts on it. No module's
+preview or thumbnail starts until the answer is in (`dialog_support.h`,
+`module_run`). The answer stands while the dialog is open: after an import
+or a cover change the host is asked again only if it hasn't answered yet,
+so across the new catalog the live preview and the background thumbnails
+carry on and the module buttons stay live. A module whose lane or ABI the
+host doesn't list is dimmed and marked **Coming soon**: its preview says so
+instead of starting it, no thumbnail is taken of it, its buttons are
+read-only rows, Preview is greyed, and its release's header gets a **Coming
+soon** pill when all of its modules are. They stay in the list (and in the rotation when
+checked, their checkboxes dimmed like the row), so they play as soon as a
+host that runs them is installed; meanwhile the rotation line says how many
+can run ("All 32 selected · 18 can run now"). The saver's Random leaves them
+out when its rotation holds a module of another ABI than After Dark's
+(**What Random leaves out**, under **How it runs a module**); otherwise such
+a module is tried like any other, and skipped after three failed starts.
+
+A host too old to answer is taken to run everything. The host exits 3 only
+for a module whose lane isn't built in ("valid module whose lane is not
+built into this adhostwin", `host/core/include/adw/core/host.h`), and a
+module whose preview or thumbnail exits 3 before a frame becomes **Coming
+soon** by itself (the dialog keeps a set of such ids until the next
+catalog; its lane's and ABI's other modules are left as they are): that is
+how a host too old to answer shows a lane it lacks, one module at a time. A
+host that lacks a module's ABI fails the module with exit 1, as it does a
+damaged module ("… couldn’t start"); only its `abis=` answer says why.
 
 **Module buttons** (`docs/INTERACTION.md` §6.3). A module's own
-buttons ("Select Fish…", "Custom", "Edit / Select", "Pictures"…) open the
-module's own dialogs, as the original control panels did. A button row is a
-real button when `--capabilities` lists the module's lane under
-`configure=` and the module file is there. Pressing it runs
+buttons ("Select Fish…", "Custom", "Edit / Select", "Pictures", the Star Wars
+modules' "Configure...", Star Trek's "Edit Custom..." and "Sounds.."…) open the module's own dialogs, as the original
+control panels did. A button row is a real button when `--capabilities` lists
+the module's lane under `configure=`, the host runs the module (its lane and
+ABI, above) and the module file is there. Pressing it runs
 `adhostwin --configure <module> --button <index> --owner <this window>`
 (`CREATE_NO_WINDOW`, with `AD_ASSETS_DIR`, the dialog's current values, saved
 or not, as `ADCVSET`, and `ADSTATE`): the module's dialogs are real windows
@@ -359,7 +466,7 @@ Module=random            ; a catalog id, or random
 Randomize=ad40.toasters,ad40.fish   ; Random's subset (empty = every module)
 RandomizeSaved=ad40.fish ; the dialog's Random checklist kept while Module names one module ("-" = none checked)
 DurationMin=5            ; Random switches module this often; 0 = never
-Scale=1.0                ; 1.0 = 480-line emulated screen, 1.5 = 720-line
+Scale=1.0                ; 1.0 = 480-line emulated screen, 1.5 = 720-line (modules that follow the display; Intermission and Star Trek modules: always 640x480)
 Monitors=all             ; or primary (the other monitors stay black)
 StartFromDesktop=1       ; 0: /s starts every module on black (no desktop capture); no UI
 Collections=simpsons,tt  ; the strip's filter: release ids; empty or missing = every release
@@ -448,11 +555,48 @@ running. Only files named that way are ever deleted.
 
 ## How it runs a module
 
-* **Emulated screen:** 640×480 × `Scale`, widened to the monitor's aspect
-  ratio. It is never narrower than 4:3, both axes are multiples of 8, and the
-  width is capped at twice the 4:3 width. The host gets this through
+* **Emulated screen:** by the module's own screen, from its catalog entry
+  (`screen` when it has one, else its `abi`), one rule for every
+  host the saver and the settings dialog start (`own_screen` and
+  `module_screen` in `geometry.h`): the `/s` windows (each host of a
+  rotation, which switches between the kinds freely), Preview (a `/s`), the
+  dialog's live preview and its thumbnails. The host gets it through
   `ADSCREENW`/`ADSCREENH`, together with `ADSTREAM=1`, `ADCVSET` and
-  `AD_ASSETS_DIR`. The frame is letterboxed to keep the monitor's aspect.
+  `AD_ASSETS_DIR`, and the frame is letterboxed to keep the monitor's aspect.
+  * Modules that follow the display (After Dark's, without `screen`):
+    640×480 × `Scale` (the Resolution setting), widened
+    to the monitor's aspect ratio. It is never narrower than 4:3, both axes
+    are multiples of 8, and the width is capped at twice the 4:3 width.
+  * Modules with a screen of their own: that screen on every monitor,
+    whatever the Resolution setting. Intermission modules (Star Wars Screen
+    Entertainment, `"abi": "intermission"`) have 640×480 by their ABI; a
+    catalog entry gives any module one with `"screen": "WxH"` (Star Trek:
+    The Screen Saver's modules, `"640x480"`), which comes first (a catalog
+    without the field keeps the ABI's rule). Such modules compose fixed
+    scenes: the Intermission modules centre theirs on a larger screen, and
+    of the Star Trek modules The Mission draws its scene at the top left
+    beside a grey band and Final Exam, Sickbay, Scotty's Files and Ship
+    Panels sit small in the middle; so at 720 lines, say, the scene sat small
+    with bars around it; at their own size the letterbox scales the frame to
+    fit the monitor, keeping its shape: a 4:3 one at its full height on a
+    monitor at least 4:3 wide (bars at the sides on a widescreen), at its
+    full width on a narrower one (5:4, portrait: bars above and below).
+    Their clicks and moves are mapped into that frame (Final Exam's mouse
+    move included), and a game's cursor clip is that frame. The catalog
+    parser takes `screen` only as `<w>x<h>` with 1 to 5 decimal digits
+    either side (either `x`; leading zeros count, so `000640x480` is none,
+    and no axis can overflow), each axis 1..8192 and at most 4096×4096
+    pixels in all, the frames the stream parser reads back; anything else is
+    no screen of its own.
+  * `/p` is 320×240 for every module: the host renders an output that small
+    through a guest display of at least 640×480 (`host/ne16`, "Small
+    screens"), which a 640×480 scene of a module's own fills.
+  * The settings dialog's live preview runs After Dark modules at 480 lines
+    at the preview box's own 16:9 aspect, 856×480 (848×480 where the box's
+    whole pixels come out a little taller; it ignores the Resolution
+    setting), modules with a screen of their own at that screen (640×480),
+    pillarboxed; its thumbnails take every module at 640×480 (a module's own
+    screen of another size at that size).
 * **Pacing:** the first `GO` goes out with the spawn (the host waits only
   250 ms for it before frame 0). After that a clock thread wakes on every
   display refresh (`DwmFlush`), or on a 60 Hz high-resolution timer where DWM
@@ -471,8 +615,14 @@ running. Only files named that way are ever deleted.
   re-plans its windows against the monitors now present (`plan_relayout` in
   `geometry.h`). A window whose monitor is unchanged stays as it is. One whose
   monitor changed mode or position but kept its aspect ratio (so the host's
-  emulated screen size is the same) is moved, and its host carries on. A
-  monitor that is new, or whose aspect changed, gets a new window and host.
+  emulated screen size is the same) is moved, and its host carries on; so is
+  one whose host runs a module with a screen of its own (an Intermission or
+  a Star Trek module), whose 640×480 is the same on every monitor (such
+  windows go last, after the ones whose size matches a monitor, so neither
+  kind restarts for the other). A
+  monitor that is new, or whose aspect changed under an After Dark module,
+  gets a new window and host. A window's next host (its rotation's next
+  module, a respawn) takes its module's size on the monitor it is on then.
   Windows for monitors that are gone are closed along with their hosts. None
   of this counts as the user coming back: Windows moves the cursor off a
   monitor that goes away or changes mode, often by far more than the
@@ -507,15 +657,39 @@ running. Only files named that way are ever deleted.
   window presents (`present window=0: direct2d, …`) and what it cost
   (`stats … present_ms_avg=… present=d2d`).
 * **Starting from the desktop:** before any `/s` window appears, each
-  monitor that will run a host is captured (`BitBlt` with `CAPTUREBLT`),
-  shrunk with `HALFTONE` to that window's emulated size and written as a P6
-  to `%TEMP%\LongAfterDark-seed-<pid>-<window>.ppm`. The file is created
-  delete-on-close and kept open while the saver runs, so it disappears when
-  the saver ends, however it ends. Only each window's first host gets it
-  (`ADSEEDIMG`), so the module starts on the desktop as the 1996 saver's did;
-  respawns, rotations, `/p`, the live preview and thumbnails start black.
-  `StartFromDesktop=0` turns this off. The capture never leaves that file and
-  the hosts' memory.
+  monitor that will run a host is captured (`BitBlt` with `CAPTUREBLT`) and
+  shrunk with `HALFTONE` to its window's emulated size, written as a P6 to
+  `%TEMP%`. That size is the first host's, which its module decides, and
+  that module is drawn only when the rotation is built (after the host's
+  answer when Random waits for it), so the window gets a picture for each
+  screen its first module may have (`first_module_screens` in `releases.h`:
+  each own screen once, `plan_seed_shots` in `geometry.h`), all from the one
+  capture, and the first host takes the one of its own screen. For an After
+  Dark module (one that follows the display) it is the whole monitor at its
+  After Dark size, in `LongAfterDark-seed-<pid>-<window>.ppm`, as ever; for a
+  module with a screen of its own (an Intermission or a Star Trek module),
+  the part of the monitor its 640×480 frame will cover, shrunk to 640×480,
+  in `…-<window>-640x480.ppm`, one picture for both (a screen of another size
+  would have its own, `…-<window>-<W>x<H>.ppm`). A window that can only
+  start with such a module (it chosen alone, or Star Wars Screen
+  Entertainment or Star Trek: The Screen Saver the only release imported)
+  gets just `…-<window>-640x480.ppm`, and one that can only start with an
+  After Dark module just `…-<window>.ppm`. On a 4:3 monitor at 480 lines the
+  two pictures are the same (the whole monitor at 640×480), so a window that
+  may start with either kind gets just `…-<window>.ppm`, which a 640×480
+  module of its own takes too. However many screens of their own a catalog
+  gives its modules, a window gets three pictures at most (`plan_seed_shots`):
+  the After Dark one, the 640×480 one and the smallest of the other sizes; a
+  first host whose screen got none starts on black (`seed window=N: none
+  taken at WxH` in the logs, after a line that counts the screens left out).
+  The pictures are made and written one at a time, so only one is in memory
+  beside the monitor's capture. Each file is
+  created delete-on-close and kept open while the saver runs, so it
+  disappears when the saver ends, however it ends. Only each window's first
+  host gets one (`ADSEEDIMG`), so the module starts on the desktop as the
+  1996 saver's did; respawns, rotations, `/p`, the live preview and
+  thumbnails start black. `StartFromDesktop=0` turns this off. The capture
+  never leaves those files and the hosts' memory.
 * **Watchdog:** a host that exits, stops sending frames for 20 s, or sends
   no first frame within 90 s is restarted with backoff. After three failed
   starts without a frame, the window says "“Name” could not be started (host
@@ -524,6 +698,30 @@ running. Only files named that way are ever deleted.
   if every module fails in turn, retries slow to one every 30 s. Every host
   runs in a kill-on-close Job (created inside it, so
   not even one being started can be left behind), so none can outlive the saver.
+* **What Random leaves out:** a host too old for a module ABI (Star Wars
+  Screen Entertainment's Intermission modules on a host without
+  `abis=…intermission`) would run such a module into errors, a black screen
+  three times over on every pass. So when the rotation holds a module of
+  another ABI than After Dark's (`rotation_needs_capabilities` in
+  `releases.h`), `/s` and `/p` ask the host first (`--capabilities`; the
+  first hosts wait for the answer, 2 s at most, and without one the rotation
+  keeps every module; a late answer is logged, and only a window a later
+  monitor change makes goes by it), and Random leaves
+  out every module whose lane or ABI the host doesn't list
+  (`rotation_for_host`; the logs say "rotation: left out N module(s) this
+  host can't run", counting what the rotation would have held: a list of
+  two loses at most two); a Randomize list of only such modules gives way to
+  every module the host can run, and a named Module leading the list is left
+  out too. When the host can run none of the modules imported, nothing
+  plays: the window says "None of the modules imported can run on this Long
+  After Dark host (adhostwin.exe)." ("No module can run on this host" in
+  `/p`) instead of starting them one after another into errors. The answer
+  comes to the saver's thread, not to one of its windows, so a monitor
+  change while it is awaited (a window retired, another made) can't lose
+  it. Any other rotation never waits (`/s` only logs the answer): an After
+  Dark rotation on a host without the Classic lane still tries the Classic
+  modules (see **Watchdog**). A module chosen on its own is always tried
+  (and says why it can't start).
 
 ## Environment overrides
 
@@ -558,16 +756,18 @@ with `AD_HOST_EXE` pointing at its `adhostwin.exe`.
 
 | Variable | Effect |
 |---|---|
-| `AD_SCR_TESTEXIT_AFTER_FRAMES=N` | exit 0 after every host window has presented N frames. If the "not imported" or "host missing" message was shown instead, exit 10 or 11; if a module "could not be started", exit 12. |
+| `AD_SCR_TESTEXIT_AFTER_FRAMES=N` | exit 0 after every host window has presented N frames. If the "not imported" or "host missing" message was shown instead, exit 10 or 11; if a module "could not be started", exit 12; if the host can run none of the modules imported (**What Random leaves out**), exit 13. |
 | `AD_SCR_TEST_IGNORE_INPUT` | input doesn't end the run |
-| `AD_SCR_TEST_INPUT=<file>` | drive the input rules with a script instead of real input (which is then ignored), with a synthetic Caps Lock toggle so a test never touches the real one: `WAIT <ms>`, `FRAMES <n>` (the owner shows n more frames), `KEY <vk> <0\|1>` (`KEY 20 1` flips the synthetic Caps Lock), `SYSKEY <vk> <0\|1>`, `CAPSSTATE <0\|1>`, `BUTTON <1\|2\|4> <0\|1>`, `WHEEL`, `MOVE <dx> <dy>` (the synthetic cursor starts mid-owner), `DEACTIVATE`, `DISPLAYCHANGE` (`WM_DISPLAYCHANGE` to the owner window), `CLIPLOG` / `STATUSLOG` (log the cursor clip / the owner's status record), `LOG <text>`; `#` comments (`input_rules.h`) |
+| `AD_SCR_TEST_INPUT=<file>` | drive the input rules with a script instead of real input (which is then ignored), with synthetic Caps Lock and Num Lock toggles (both off at the start) so a test never touches the real ones: `WAIT <ms>`, `FRAMES <n>` (the owner shows n more frames), `KEY <vk> <0\|1>` (`KEY 20 1` flips the synthetic Caps Lock, `KEY 144 1` the synthetic Num Lock), `SYSKEY <vk> <0\|1>`, `CAPSSTATE <0\|1>`, `NUMLOCKSTATE <0\|1>` (set without a key: the saver notices within 250 ms), `BUTTON <1\|2\|4> <0\|1>`, `WHEEL`, `MOVE <dx> <dy>` (the synthetic cursor starts mid-owner), `DEACTIVATE`, `DISPLAYCHANGE` (`WM_DISPLAYCHANGE` to the owner window), `CLIPLOG` / `STATUSLOG` (log the cursor clip / the owner's status record), `LOG <text>`; `#` comments (`input_rules.h`) |
 | `AD_SCR_TEST_ROTATE_MS` | rotation interval in ms, used instead of `DurationMin` |
 | `AD_SCR_TEST_STALL_MS`, `AD_SCR_TEST_FIRSTFRAME_MS` | watchdog timeouts |
 | `AD_SCR_TEST_DISPLAY_OFF_MS` | after 5 frames, behave as if the display powered off for this long |
+| `AD_SCR_TEST_DISPLAY_ON` | take the console display to be on whatever Windows reports (`display state 0 taken as on` in `AD_SCR_LOG`): with the monitors asleep the saver pauses every host, and no `/s` smoke test would see a frame. Set it in the environment that runs the tests (the smoke tests pass it on); `AD_SCR_TEST_DISPLAY_OFF_MS` still simulates a power-off |
 | `AD_SCR_TEST_CAPTURE=<dir>` | each window writes what it shows when it has presented the frames in `AD_SCR_TEST_CAPTURE_FRAMES=<k>,…` (default 30): `window<N>-frame<K>.png` at its client size (the frame scaled into its letterbox as the window drew it, Direct2D or GDI, re-drawn off screen by `render_frame_bgr`) and `window<N>-frame<K>-host.png` (the host's frame as it came); `AD_SCR_LOG` gets a `capture window=N frame=K ok …` line for each |
 | `AD_SCR_TEST_MONITORS` | `x,y,w,h[,p];…` monitors to use instead of the real ones (`,p` marks the primary). `\|` separates the layouts reported after each successive display change |
+| `AD_SCR_TEST_OPEN_LOG=<file>` | the settings dialog's credit link appends `open<TAB><url>` here. The test build never opens a page itself, whatever its environment (it logs `dialog: open <url> (the test build opens nothing)`); only `LongAfterDark.scr` calls `ShellExecuteW` |
 | `AD_SCR_TEST_SCREENSHOT=<png>` | `/c` renders the settings dialog to this PNG and exits (0, or 1 if it couldn't). The window is created hidden, parked off every monitor and cloaked, never activated or focused (`WS_EX_NOACTIVATE`: no keystroke meant for another window can reach it), and drawn with `PrintWindow`: it never appears on screen. |
-| `AD_SCR_TEST_SCREENSHOT_STATE` | `key=value;…` for the screenshot: `theme=light\|dark\|hc`, `module=<id>`, `mode=single\|random`, `dpi=<n>` (lay out at that DPI), `dpichange=<n>` (send `WM_DPICHANGED` as if dragged to such a monitor), `size=<w>x<h>` (client, DIPs), `focus=list\|slider\|ok\|single\|random\|duration\|preview\|strip\|sound\|volume` (draw that control's focus ring; `strip`: the first selected cover, else the first, scrolled into view), `sound=off` (the Sound dropdown at Off: Volume greyed), `volume=<0..100>`, `wait=<ms>` and `frames=<n>` (how long to let the live preview run), `hover=preview` (the pointer over the live preview), `hover=strip:<id>` (that release's cover hovered), `collections=<id>,…` (the strip's filter, as if those covers had been clicked), `thumbgen=1\|wait` (take missing thumbnails in the background; `wait`: until all are taken, within `wait`), `report=<file>` (write where the list shows in the picture, the card's colour and whether anything straddles the list's top edge; `strip=x,y,w,h` where the strip's tiles area shows, `strip_mode=regular\|compact\|hidden`, the base colour and how many rows the list shows). A `size=` taller or wider than this machine's screen is honoured (the window's maximum tracking size is lifted off screen), so the regular strip can be captured at 150% and up. With `theme=hc`, `AD_UI_TEST_HC_SCHEME=nightsky\|aquatic\|desert\|dusk` stands one of Windows 11's contrast themes in for the system colours (the hook passes it to adw_ui's `set_test_hc_scheme`; the library itself reads no environment) |
+| `AD_SCR_TEST_SCREENSHOT_STATE` | `key=value;…` for the screenshot: `theme=light\|dark\|hc`, `module=<id>`, `mode=single\|random`, `dpi=<n>` (lay out at that DPI), `dpichange=<n>` (send `WM_DPICHANGED` as if dragged to such a monitor), `size=<w>x<h>` (client, DIPs), `focus=list\|slider\|ok\|single\|random\|duration\|preview\|strip\|sound\|volume\|credit` (draw that control's focus ring; `strip`: the first selected cover, else the first, scrolled into view), `sound=off` (the Sound dropdown at Off: Volume greyed), `volume=<0..100>`, `wait=<ms>` and `frames=<n>` (how long to let the live preview run), `hover=preview` (the pointer over the live preview), `hover=strip:<id>` (that release's cover hovered), `hover=credit` and `pressed=credit` (the footer's credit under the pointer, and held down), `collections=<id>,…` (the strip's filter, as if those covers had been clicked), `thumbgen=1\|wait` (take missing thumbnails in the background; `wait`: until all are taken, within `wait`), `report=<file>` (write where the list shows in the picture, the card's colour and whether anything straddles the list's top edge; `strip=x,y,w,h` where the strip's tiles area shows, `strip_mode=regular\|compact\|hidden`, the base colour and how many rows the list shows; each group's accessible name, `group<g>=`, and its title as the header drew it, `drawn<g>=` (whole, or ellipsized); what the host said, `caps=`, the modules "Coming soon", `soon=`, and the module the details show, `details=`, with its chip, `badge=`, whether its buttons are live, `button_live=`, and Preview enabled, `preview_enabled=`; the footer's credit, `credit=x,y,w,h` (its link's box, or `hidden`), `credit_lead=` and `credit_name=` (its two texts), with the assets line's text, `assets_text=`, and Preview, `preview_button=`, all in the picture's pixels). A `size=` taller or wider than this machine's screen is honoured (the window's maximum tracking size is lifted off screen), so the regular strip can be captured at 150% and up. With `theme=hc`, `AD_UI_TEST_HC_SCHEME=nightsky\|aquatic\|desert\|dusk` stands one of Windows 11's contrast themes in for the system colours (the hook passes it to adw_ui's `set_test_hc_scheme`; the library itself reads no environment) |
 
 ## Build and test
 
@@ -597,10 +797,41 @@ only reads it.
   (including headers claiming frames past 8192 on an axis or 4096×4096 in
   all, which are resynced past rather than waited on), the settings.ini
   round-trip and the dialog's Random / single-module rules, the catalog
-  (including the generated catalog's string sliders, units and buttons, and
-  a check of this machine's generated catalog when there is one), geometry,
-  window re-planning on monitor changes (`layout`), rotation, frame
-  conversion, the environment block, the dialog's helpers (`dialog`:
+  (including the generated catalog's string sliders, units and buttons, the
+  module ABI, `abi` (absent, empty or not a string is `afterdark`), a
+  module's own screen, `screen` (`"640x480"`, either `x`; absent, not a
+  string, not `<w>x<h>` with 1 to 5 decimal digits either side (six or
+  more are none whatever their value, `000640x480`, so an axis past what an
+  `int` holds, `4294967936x480`, never wraps round to a size), an axis
+  outside 1..8192 or more than 4096×4096 pixels is none; the catalog's size
+  before the ABI's), the six-release fixture's 14 Intermission modules, the
+  seven-release fixture's four Star Trek modules (After Dark's ABI, lane
+  `ne16`, 640x480 each), and a check of this machine's generated catalog
+  when there is one), geometry (with each module's emulated screen,
+  `module_screen` over `own_screen`: an After Dark module's exactly as
+  before, an Intermission module's 640x480 on every display at every
+  Resolution setting and a Star Trek module's catalog 640x480 the same, a
+  screen of another size kept as given, its frame scaled to fit (full
+  height beside bars on a widescreen, full width between bars on a 5:4 or
+  portrait monitor); the part of a monitor each kind's desktop seed is
+  taken from, `seed_source`;
+  and a window's seed pictures, `plan_seed_shots`: one for each screen its
+  module may have, After Dark's first, at 16:9 and 720 lines, on
+  4:3 at 480 lines (where the 640x480 one shares the first's file) and
+  at 720, 5:4 and portrait, for either kind alone, a Star Trek and an
+  Intermission module's one picture, and one of another size its own;
+  three at most among 70 screens in any order: 640x480 before smaller
+  ones, then the smallest, the rest counted as left out, and one that
+  follows the display, the first given),
+  window re-planning on monitor changes (`layout`: also a window running an
+  Intermission or a Star Trek module kept whatever the new aspect, and
+  matched after the windows of a monitor's own size, so neither kind
+  restarts for the other), rotation (also between an After Dark module and
+  an Intermission or a Star Trek one, host by host: each its module's size,
+  the one of its own kept through a monitor change and the After Dark one
+  replaced), frame conversion, the environment block (with `ADNUMLOCK`: the
+  toggle for a host that keeps one or hasn't answered yet, none for one
+  that answered without `numlock=1`, whatever is inherited), the dialog's helpers (`dialog`:
   adimport's exit codes, the preview-file names and sweep, and starting
   `fakeimport.exe` without a console window), and its presentation (`ui`:
   About tidying (including the catalog's own mid-phrase breaks, and credits
@@ -609,12 +840,26 @@ only reads it.
   overlapping, on the 4-DIP grid, 200% = 100% doubled, the large-window
   caps, the content column capped and centred, "Change module every" under
   the list in Random only, the two-line title, the links' text on the card
-  edge), the settings panel's rows (whole-row extents, read-only and
+  edge; the footer's credit, `layout_footer_credit`, measured in the real caption
+  face at 100–250% beside the assets line's texts: whenever it shows, clear
+  of the assets line's text and of Preview by 24 DIP, centred between them
+  and on the buttons, the phrase on one line inside its box; hidden only
+  without room, which one release's long title or the assets line at its
+  longest leaves none of in the narrowest window; shown at the first-open
+  size with seven releases, "232 modules from 7 releases"), the settings panel's rows (whole-row extents, read-only and
   unlabelled rows), string-slider stops with repeated labels (and
   `boldStop`), the thumbnail crop and quality gate, the names shown whole
   (every package's copy, `moduleName`-keyed, suffix kept), `--capabilities`
-  parsing and the probe against `fakehost.exe`, the button notes, and live
-  button rows), the releases (`releases`, COVERS.md §1: parsing
+  parsing (`abis=`: absent is `afterdark` alone, `abis=` alone is none; a
+  host that didn't answer runs everything; `numlock=1`, and only that, is a
+  host that keeps the Num Lock toggle: `NUMLOCK` lines only to one that said
+  so, `ADNUMLOCK` to every host but one that answered without it) and the
+  probe against `fakehost.exe` with and without `abis=` and `numlock=1`, what the dialog does with a module
+  (`module_run`: waiting while the host is asked, "Coming soon" for a lane or
+  ABI it doesn't list or for that module's own exit 3, which never spreads to
+  the rest of its lane or ABI), the group header's layout (`ellipsize`,
+  `layout_group_header`: the count and the pill always whole), the button
+  notes, and live button rows), the releases (`releases`, COVERS.md §1: parsing
   `packages[]` with every cover origin and the old-catalog fallback;
   `Collections` round trip and normalization, and the key left as written;
   `effective_rotation`'s filter, `sameAs` dedupe, empty fallback and lead;
@@ -625,13 +870,40 @@ only reads it.
   the 4-DIP grid and 200% = 100% doubled; `layout_window` with the strip:
   compact under 760 DIP, the status box clear of the tiles, and the columns
   keeping today's heights; the captions' shrink rule, and every registry
-  short title measured in the real caption face at 100–250%, each fitting
-  whole), the input rules (`input`: the whole `decide()` table, exempt
+  short title ("Star Wars" and "Star Trek" included) measured in the real caption face at
+  100–250%, each fitting whole; six releases (`tests/fixtures/catalog-six.json`:
+  the order, the Star Wars group, what Random plays on a host that can't run
+  their modules (none of them, a lead of theirs left out, a list of only
+  theirs giving way), `rotation_needs_capabilities`, `rotation_for_host`
+  (what the saver plays with the host's answer, how many it leaves out,
+  counted against the rotation and not the catalog, and nothing to play
+  when theirs alone are imported), `first_module_screens` (which screens
+  a window's first module may have, for its desktop seeds), and "Star Wars Screen
+  Entertainment" in the narrowest list at 100–250%, measured in the real
+  faces: its count and pill whole, the After Dark titles never ellipsized
+  without a pill); seven releases (`tests/fixtures/catalog-seven.json`: Star
+  Trek: The Screen Saver first, its group, "36 modules from 7 releases",
+  its modules in Random without waiting for the host (After Dark's ABI),
+  their 640x480, `first_module_screens` with them (theirs and Star Wars'
+  one screen, one seed picture), and seven covers: whole in the first-open
+  window and in the smallest one (compact covers) at 100–250%, scrolling in
+  a window as narrow but 760 DIP or more tall: five tiles whole at each
+  stop, the sixth's cover shown too unscrolled, the last stop the third);
+  a catalog whose 66 modules each give a screen of their own, all one
+  file: every screen a first module may have, three seed pictures (a
+  window's After Dark one, 640x480, the smallest other), a lead of the
+  largest left out, and one chosen alone its own), the input rules (`input`: the whole `decide()` table, exempt
   keys, holds and their 300 ms limit, key-filter verdicts, Alt, the wheel,
   move thresholds, a host dying mid-hold; `MOUSE` mapping into the
-  letterboxed frame; the `AD_SCR_TEST_INPUT` grammar) and `seed` (P6
+  letterboxed frame; the `NUMLOCK` line; the `AD_SCR_TEST_INPUT` grammar,
+  `NUMLOCKSTATE` and the synthetic toggles included) and `seed` (P6
   encoding, the delete-on-close seed file readable only with share-delete and
-  gone with its handle, a real capture, the last-exit log's cap and
+  gone with its handle, the name of the one taken for a module's own
+  screen, a real capture, the pictures handed over one by one in order,
+  each made only once the one before was taken (a picture repainted while
+  the first is taken shows in the second), a shot without a size and a
+  part off the monitor none, and a capture that can't be made taking every
+  shot without a picture, the last-exit log's cap and
   rewrite, the state/log paths, `StartFromDesktop`), and `paths` (the data
   folder, each case on a scratch `AD_LOCALAPPDATA`: every default location
   in `LongAfterDark` and what it holds found; nothing made until the first
@@ -671,15 +943,23 @@ only reads it.
   that speaks the protocol with a palette-cycling test pattern (it logs its
   parent's pid, so a test can tell the dialog's own hosts from the saver's,
   and `FAKEHOST_LANES=pe32` makes it exit 3 for a module in a `CLASSIC`
-  folder, as a host without the Classic lane does). Like the real host it
-  numbers `KEY`/`CAPS`/`MOUSE` lines and logs them, goes interactive on
+  folder, as a host without the Classic lane does; `FAKEHOST_ABIS` sets its
+  `abis=`, today's host's `afterdark,intermission` by default, `none` leaving
+  the key out as an older host does, which fails an `.IMX` module with exit
+  1; `FAKEHOST_EXIT3_MODULE=<text>` makes one module exit 3;
+  `FAKEHOST_CAPS_DELAY_MS` makes `--capabilities` answer late;
+  `FAKEHOST_NUMLOCK=0` leaves `numlock=1` out, as a host from before the Num
+  Lock toggle, to which a `NUMLOCK` line is a line it doesn't know). Like the real host it
+  numbers `KEY`/`CAPS`/`NUMLOCK`/`MOUSE` lines and logs them, ignores a line
+  it doesn't know without numbering it (logged as `unknown`), goes interactive on
   `CAPS 1` (eating keys and clicks while it is), publishes the status record
   through `ADSTATUSHANDLE`, checks `ADSEEDIMG` the way a host opens it,
   answers `--capabilities` and fakes `--configure` (logging its owner, whether
   that owner is disabled, and its environment; `FAKEHOST_CONFIGURE_EXIT` or
   `_EXIT_FILE` pick the exit, `crash` included). Its start lines carry
-  `ADSTATE`, `ADCAPS`, `ADSEEDIMG`, `ADSTATUSHANDLE`, and `ADSOUND`,
-  `ADVOLUME` and `ADAUDIOOUT` (fakehost makes no sound). They use the
+  `ADSTATE`, `ADCAPS`, `ADNUMLOCK`, `ADSEEDIMG`, `ADSTATUSHANDLE`, and `ADSOUND`,
+  `ADVOLUME` and `ADAUDIOOUT` (fakehost makes no sound), and its exit lines
+  the Num Lock toggle it ended with. They use the
   fixture catalog and settings under `tests/fixtures`. The placeholder module
   files are created at test time and contain no After Dark bytes. Covered:
   `/s` on every monitor or the primary only, `/p` in a hidden parent (and
@@ -695,7 +975,14 @@ only reads it.
   dialog's values, restarts when one changes, and leaves no host behind),
   `config-classic` (a host without the Classic lane: one probe, the module
   shown as coming soon and never started, not even for a thumbnail;
-  its chip names the release, never the lane),
+  its chip names the release, never the lane), `config-abi` (six off-screen
+  renders with `tests/fixtures/catalog-six.json`: on today's host the Star
+  Wars modules run, with a live Configure...; on a host without `abis=` they
+  are coming soon, never started, not even for a thumbnail, with their button
+  read-only and Preview greyed; one module's exit 3, from its preview or from
+  its thumbnail, makes that module alone coming soon; at the narrowest window
+  in Random the long title is drawn ellipsized, with and without its pill,
+  and the others whole),
   `config-thumbs` (the background thumbnails: one for every module it can
   run, each in a host of its own at 640x480, none for a missing file, no host
   left behind), `list-top` (72 off-screen renders of the dialog, with a
@@ -721,17 +1008,82 @@ only reads it.
   base), `config-cover`
   ("Change cover…" from a cover's own menu against `fakeimport.exe`: its
   arguments, no console window, Import… and the item greyed while it runs,
-  exit 0 reloads the catalog keeping the filter, exit 5 doesn't),
+  exit 0 reloads the catalog keeping the filter, exit 5 doesn't; across the
+  reload the host isn't asked again and a pe32 module's live preview runs
+  on in the same host),
   `rotate-collections` (`/s` with `Collections`: only those releases play,
-  and a byte-identical copy once), `import` (against
-  `fakeimport.exe`: no console window, and exits 5, 2 and 0) and
+  and a byte-identical copy once), `rotate-abi` (`/s` on one monitor staged
+  off every real one, and `/p`, with the six releases: on a host without
+  `abis=` no Intermission module is started, "left out 14", even for a list
+  of only theirs ("left out 2"), and a list of one of theirs and one After
+  Dark module plays that one alone ("left out 1"); with theirs alone
+  imported nothing starts and the window says why, `/s` and `/p`; on today's
+  host they rotate), `rotate-abi-wait` (the host answering late,
+  `FAKEHOST_CAPS_DELAY_MS`: past the 2 s wait the first host starts when it
+  runs out, the rotation keeps theirs and the late answer is only logged;
+  within it, a monitor changing mode retires the window that was up when the
+  saver asked, and the answer still reaches the new one, which leaves theirs
+  out), `screen-abi` (an Intermission module's hosts are asked for 640x480
+  at the 720-line setting, where an After Dark module's get 1280x720: `/s`
+  on a 16:9 monitor staged off every real one rotating between the two, the
+  size following each switch and the first host started on the desktop
+  captured at its own size where the desktop can be read back; the window
+  showing the 640x480 frame at the monitor's full height, bars at the sides
+  only, in `AD_SCR_TEST_CAPTURE`'s picture; a monitor turning 4:3 moves the
+  Intermission module's window with its host and replaces the After Dark
+  module's; `/p` at 320x240; the dialog's live preview and thumbnails at
+  640x480, and Preview's `/s` too), `screen-field` (the same for a module
+  whose catalog entry gives `"screen": "640x480"`, with
+  `tests/fixtures/catalog-seven.json`: a Star Trek module's hosts at 640x480
+  at the 720-line setting, rotating with an After Dark module's 1280x720
+  (two seed pictures planned, where the ABIs alone gave one: each planned
+  picture logs a line, taken or not, so this holds on a desktop that can't
+  be read back too) and with a Star Wars module both 640x480; The Mission's frame at the
+  monitor's full height, bars at the sides only; a monitor turning 4:3 moves
+  its window with its host; `/p` at 320x240; the dialog's live preview at
+  640x480, a thumbnail at the module's own size (800x600 in the test's copy
+  of the catalog, which a 4:3 capture would not give), and Preview's `/s`
+  at 640x480; and with the dialog open on Final Exam from a catalog without
+  the field, previewed at 856x480, an import that only adds its `"screen"`
+  replaces that host with one at 640x480, the live preview's target
+  comparing the screen too), `seed-screens` (a catalog whose modules each
+  give a screen of their own, eleven sizes beside After Dark's, a module of
+  a size left out leading a list of all the others: three pictures planned,
+  each logging a line taken or not, a line counting the nine left out, the
+  first host started without a seed; where the desktop can be read back,
+  the three pictures' sizes and parts and that host's `none taken` line),
+  `config-credit` (the footer's credit
+  in the dialog driven by control ID: shown, named "Made With Love by
+  StarrLord" for UI Automation with the address as its help text, after
+  Import… and before Preview in the tab order; a click, Enter and Space each
+  record one request for the page, `AD_SCR_TEST_OPEN_LOG`, and open nothing;
+  with Star Wars Screen Entertainment alone imported, focused in a wide
+  window and then hidden by narrowing it to its minimum: the focus on
+  Preview, which holds the default-button state the link gave up, so Enter
+  runs Preview's `/s` and the dialog stays open, having saved nothing;
+  off-screen renders at 100% and 150%, light, dark and high contrast, at
+  the first-open size and the narrowest: clear of the assets line's text and
+  of Preview by 24 DIP, centred between them, on the buttons' line; hidden
+  beside the assets line at its longest in the narrowest window; there in
+  the welcome), `import` (against
+  `fakeimport.exe`: no console window, and exits 5, 2 and 0; the first
+  import, from the welcome, asks the host after it and before the module
+  shown starts, and the module's button comes alive) and
   `preview-settings` (the temporary settings file is swept, deleted by the
   preview, and not left behind when the dialog closes mid-preview). The
   interaction tests drive `/s` with `AD_SCR_TEST_INPUT`: `input-play` (Shift,
-  Ctrl and Num Lock never exit; Caps Lock starts the game; arrows, clicks,
+  Ctrl and Num Lock never exit, Num Lock reaching the host as one `NUMLOCK 1`;
+  Caps Lock starts the game; arrows, clicks,
   the wheel and moves are the module's; the cursor shows and the clip is set
   while playing, released after; Caps Lock again, a small move after the
   re-baseline, then a key exits; numbered input lines; the last-exit log),
+  `numlock` (against fakehost with `numlock=1`: every host started with
+  `ADNUMLOCK`, the toggle then; `KEY 144` sends `NUMLOCK 1` right after its
+  key line and a change without a key `NUMLOCK 0` within 250 ms, numbered as
+  the host numbers its lines; a host started while it is on gets
+  `ADNUMLOCK=1` and no line; and with `FAKEHOST_NUMLOCK=0` no `NUMLOCK` line
+  at all, nothing the host doesn't know, and no `ADNUMLOCK` for the hosts
+  started after its answer; Num Lock never ends the saver),
   `input-alt` (Alt ends a game), `input-wake` (the host's wake flag ends it),
   `input-rotate` (rotation waits while playing), `input-monitors` (two staged
   monitors: only window 0's host gets input, and each first host its
@@ -793,7 +1145,10 @@ with sound on, and it only captures.
 The smoke tests open real windows. `/s` briefly covers every monitor, and the
 settings dialog is driven by control ID. They are labelled `gui`: skip them
 with `ctest -LE gui`, or set `AD_SCR_SKIP_GUI_TESTS=1` to have them report
-SKIP. They also skip themselves when there is no interactive desktop.
+SKIP. They also skip themselves when there is no interactive desktop. While
+the monitors are asleep (display powered off), a `/s` pauses its hosts and
+the tests that run one never see a frame: set `AD_SCR_TEST_DISPLAY_ON=1` for
+the run (the tests pass it on to the saver).
 
 ### By hand, before a release
 

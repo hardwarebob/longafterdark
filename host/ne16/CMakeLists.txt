@@ -1,11 +1,16 @@
 # adw_lane_ne16 — the Classic lane: an After Dark 2.x/3.x module (NE .AD) run
 # through the real OLDMOD16.DLL (+ AD_SND, ADXPL300, helpers) on the Win16
 # guest runtime (host/win16), driven as AFTERDAR.SCR drove it through
-# OLDMOD32 (docs/ABI.md §3). See lane.hh.
+# OLDMOD32 (docs/ABI.md §3), or an Intermission module (NE .IMX) driven as
+# INTERMIS.EXE drove it through IMIMXPLY.IMQ. See lane.hh; the module
+# protocols are behind protocol.hh (ad3_protocol.cc, imx_protocol.cc).
 
 add_library(adw_lane_ne16 STATIC
   lane.cc
+  ad3_protocol.cc
   bridge.cc
+  imx_protocol.cc
+  imreader.cc
   package.cc
 )
 target_include_directories(adw_lane_ne16 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
@@ -30,8 +35,31 @@ add_test(NAME ne16.pkg COMMAND adw_ne16_tests --pkg $<TARGET_FILE:adhostwin>)
 set_tests_properties(ne16.pkg PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 # INTERACTION.md: the games' status (Caps Lock, keyboard hooks, LUNATIC's
 # queue), the DOS Shell regression (18000 frames), and the module buttons in
-# configure mode (hidden real dialogs, scripted; state in a temp ADSTATE).
+# configure mode (hidden real dialogs, scripted; state in a temp ADSTATE;
+# Globe's map picked through [-h-] in a folder of the host's own, which a
+# later run loads).
 # Needs the imported assets (all five packages for every case; each absent
 # module is skipped); skips (77) when there are none.
 add_test(NAME ne16.interaction COMMAND adw_ne16_tests --interaction $<TARGET_FILE:adhostwin>)
 set_tests_properties(ne16.interaction PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+# Star Wars Screen Entertainment's Intermission modules (lane.hh "Intermission
+# (IMX)") from an imported package: AD_NE16_SWSE_ROOT (an assets root), else
+# AD_ASSETS_DIR or the installed assets; skips (77) when none holds it. Every
+# module twice, keys the saver does not wake on (BATTLES, VADER), SWTEXT's and
+# TRENCH's passes a second, the reader oracle, a small screen, the desktop
+# seed, a streamed start, sound (effects, and the music at the saver's
+# volume), and VADER's button in configure mode (hidden, scripted; state in a
+# temp ADSTATE).
+add_test(NAME ne16.swse COMMAND adw_ne16_tests --swse $<TARGET_FILE:adhostwin>)
+set_tests_properties(ne16.swse PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+# Star Trek: The Screen Saver's After Dark 2.0 modules (lane.hh "The AD3
+# protocol") from an imported package: AD_NE16_STARTREK_ROOT (an assets root),
+# else AD_ASSETS_DIR or the installed assets; skips (77) when none holds it.
+# Every module twice (AD_SND 1.0, the AD_PREFS.INI seeds), sound captured
+# twice, Scotty's Files' blueprints (masks from 1-bpp DIBs), the two buttons
+# in configure mode (hidden, scripted; state in a temp ADSTATE; Sounder's
+# folder list with H:, and a folder of the host's own chosen through it,
+# which a later run plays), and a scripted Final Exam (Num Lock, answers, the
+# mouse, the wake; headless and streamed).
+add_test(NAME ne16.startrek COMMAND adw_ne16_tests --startrek $<TARGET_FILE:adhostwin>)
+set_tests_properties(ne16.startrek PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)

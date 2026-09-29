@@ -10,21 +10,29 @@
 //      <scratch>/downloads under the copy's file name, so what can be verified
 //      locally is not fetched again (the importer still checks its md5). The
 //      files are looked for in AD_E2E_LOCAL_DIRS (';'-separated), else the
-//      image dir (<repo>/source_iso), the installed data folder's downloads
-//      (%LOCALAPPDATA%\LongAfterDark\downloads, read only) and its
+//      image dirs (AD_SOURCE_ISO_DIR or <repo>/source_iso, and the folders
+//      directly in them: test_util.h image_dirs), the installed data folder's
+//      downloads (%LOCALAPPDATA%\LongAfterDark\downloads, read only) and its
 //      verify\ folder.
 //   1. adimport --download <id> --download-dir <scratch>/downloads --dest
 //      <scratch>/<id>, for every package: exit 0; the import record says kind
-//      "download", a registry URL, verified "image" (the disc images) or
-//      "files" (the Simpsons ZIP), nothing missing, every file a manifest
-//      match; the catalog lists the package's 84 / 46 / 44 / 13 / 15 modules.
-//   2. The Simpsons' other copy (a 2.7 MB ZIP) through --url/--md5, imported
-//      the same way, so the layout of every Simpsons copy is tested.
-//   3. Every registry URL (fallbacks included) answers a small Range request
-//      with the published size, and with the same bytes as the verified file:
-//      the last 64 KiB (the ZIP directory; the end of a disc) and, for an ISO,
-//      the primary volume descriptor.
-// <scratch> is deleted at the end unless AD_E2E_KEEP=1.
+//      "download", a registry URL, verified "image" (the disc images, and
+//      Star Trek: The Screen Saver's pair of disk images) or "files" (the
+//      Simpsons ZIP), nothing missing, every file a manifest match; the
+//      catalog lists the package's 84 / 46 / 44 / 13 / 15 / 14 / 16 modules.
+//   2. Every package's other copies with other bytes (another file name: the
+//      Simpsons' second ZIP; Star Wars Screen Entertainment's Redump BIN and
+//      flat ZIP) through --url/--md5, imported the same way (verified
+//      "image" for a known image, else "files"); a copy of several images
+//      (Star Trek: The Screen Saver's second pair) is fetched part by part
+//      with the library's download() and imported with an --image for each;
+//      so the layout of every copy is tested.
+//   3. Every registry URL (fallbacks and further images included) answers a
+//      small Range request with the published size, and with the same bytes
+//      as the verified file: the last 64 KiB (the ZIP directory; the end of a
+//      disc) and, for an image, the ISO primary volume descriptor's sector.
+// <scratch> is deleted at the end unless AD_E2E_KEEP=1. AD_E2E_PACKAGES=<id>[,<id>...]
+// limits every step to those packages (all when unset).
 #include <windows.h>
 #include <winhttp.h>
 
@@ -33,6 +41,7 @@
 #include <map>
 #include <set>
 
+#include "download.h"
 #include "importer.h"
 #include "md5.h"
 #include "run_process.h"
@@ -50,9 +59,33 @@ struct Expect {
   const char* verified;
 };
 const std::map<std::string, Expect> kExpect = {
-    {"deluxe", {84, "image"}}, {"ad10", {46, "image"}}, {"ad32", {44, "image"}},
-    {"tt", {13, "image"}},     {"simpsons", {15, "files"}},
+    {"deluxe", {84, "image"}}, {"ad10", {46, "image"}},     {"ad32", {44, "image"}},     {"tt", {13, "image"}},
+    {"simpsons", {15, "files"}}, {"swse", {14, "image"}}, {"startrek", {16, "image"}},
 };
+
+// Every file of a copy: its own, then the images of further install disks.
+std::vector<DownloadPart> parts_of(const Download& d) {
+  std::vector<DownloadPart> v = {{d.url, d.file_name, d.size, d.md5}};
+  v.insert(v.end(), d.more_images.begin(), d.more_images.end());
+  return v;
+}
+
+// AD_E2E_PACKAGES: the packages to test (empty = every one).
+bool wanted(const Package& p) {
+  static const std::set<std::string> only = [] {
+    std::set<std::string> ids;
+    const std::string v = getenv("AD_E2E_PACKAGES") ? getenv("AD_E2E_PACKAGES") : "";
+    size_t i = 0;
+    while (i <= v.size()) {
+      size_t j = v.find_first_of(",;", i);
+      if (j == std::string::npos) j = v.size();
+      if (j > i) ids.insert(v.substr(i, j - i));
+      i = j + 1;
+    }
+    return ids;
+  }();
+  return only.empty() || only.count(p.id);
+}
 
 std::vector<fs::path> local_dirs(const fs::path& image_dir) {
   std::vector<fs::path> dirs;
@@ -67,7 +100,7 @@ std::vector<fs::path> local_dirs(const fs::path& image_dir) {
     }
     return dirs;
   }
-  if (!image_dir.empty()) dirs.push_back(image_dir);
+  for (const fs::path& d : test::image_dirs(image_dir)) dirs.push_back(d);
   // The installed data folder's downloads, read only: call this before the
   // sandbox.
   if (const fs::path data = test::installed_data_root(); !data.empty()) {
@@ -175,6 +208,21 @@ Probe probe(const std::string& url, uint64_t from, size_t n) {
   return r;
 }
 
+// The file name adimport gives a --url download (its percent-decoded last
+// path segment; the registry's URLs need no further care).
+std::wstring url_file_name(const std::string& url) {
+  std::string last = url.substr(url.rfind('/') + 1), dec;
+  for (size_t i = 0; i < last.size(); i++) {
+    if (last[i] == '%' && i + 2 < last.size()) {
+      dec.push_back(char(std::stoi(last.substr(i + 1, 2), nullptr, 16)));
+      i += 2;
+    } else {
+      dec.push_back(last[i]);
+    }
+  }
+  return to_wide(dec);
+}
+
 struct Row {
   std::string id, how;
   double seconds = 0;
@@ -205,21 +253,23 @@ int main(int argc, char** argv) {
 
   // ---- 0 + 1: each package --------------------------------------------------------------------
   for (const Package& p : builtin_packages()) {
+    if (!wanted(p)) continue;
     Row row;
     row.id = p.id;
     fprintf(stderr, "==== %s (%s)\n", p.id, p.title);
     std::set<std::wstring> seeded;
     if (seeding) {
-      for (const Download& d : p.downloads) {
-        fs::path to = dl / d.file_name;
-        if (seeded.count(d.file_name) || fs::exists(to)) continue;
-        if (auto from = find_local(dirs, d.size, d.md5)) {
-          bool ok = seed(*from, to);
-          fprintf(stderr, "  seeded %s from %s (%s)\n", to_utf8(to.filename().wstring()).c_str(),
-                  to_utf8(from->wstring()).c_str(), ok ? "verified local copy" : "FAILED");
-          if (ok) seeded.insert(d.file_name);
+      for (const Download& c : p.downloads)
+        for (const DownloadPart& d : parts_of(c)) {
+          fs::path to = dl / d.file_name;
+          if (seeded.count(d.file_name) || fs::exists(to)) continue;
+          if (auto from = find_local(dirs, d.size, d.md5)) {
+            bool ok = seed(*from, to);
+            fprintf(stderr, "  seeded %s from %s (%s)\n", to_utf8(to.filename().wstring()).c_str(),
+                    to_utf8(from->wstring()).c_str(), ok ? "verified local copy" : "FAILED");
+            if (ok) seeded.insert(d.file_name);
+          }
         }
-      }
     }
     row.how = seeded.empty() ? "downloaded" : "local copy";
     fs::path root = scratch / to_wide(p.id);
@@ -256,51 +306,122 @@ int main(int argc, char** argv) {
     rows.push_back(row);
   }
 
-  // ---- 2: the Simpsons' other copies ----------------------------------------------------------
-  const Package* simpsons = find_package("simpsons");
-  for (size_t i = 1; i < simpsons->downloads.size(); i++) {
-    const Download& d = simpsons->downloads[i];
-    fprintf(stderr, "==== simpsons, copy %zu: %s\n", i + 1, d.url);
-    fs::path root = scratch / (L"simpsons-copy" + std::to_wstring(i + 1));
-    ULONGLONG t0 = GetTickCount64();
-    test::ProcessResult pr =
-        test::run_process(exe,
-                          {L"--no-cover-download", L"--download", L"simpsons", L"--url", to_wide(d.url), L"--md5",
-                           to_wide(d.md5), L"--download-dir", dl.wstring(), L"--dest", root.wstring()},
-                          600000);
-    Row row;
-    row.id = "simpsons #" + std::to_string(i + 1);
-    row.how = "downloaded (--url)";
-    row.seconds = (GetTickCount64() - t0) / 1000.0;
-    fprintf(stderr, "%s  adimport exited %d\n", pr.output.c_str(), pr.exit_code);
-    CHECK_EQ(pr.exit_code, 0);
-    if (pr.exit_code == 0) {
-      phosg::JSON j = load(root / L"win" / L"packages" / L"simpsons" / L"import.json");
-      row.verified = j.get_string("verified");
-      CHECK_EQ(row.verified, std::string("files"));
-      CHECK(j.at("missingKnown").as_list().empty());
-      CHECK_EQ(size_t(j.get_int("fileCount")), simpsons->manifest.size());
-      CHECK_EQ(j.at("source").get_string("imageMd5"), std::string(d.md5));
-      phosg::JSON cat = load(root / L"win" / L"catalog-win.json");
-      for (auto& m : cat.at("modules").as_list()) row.modules += m->get_string("package") == "simpsons";
-      CHECK_EQ(row.modules, size_t(15));
+  // ---- 2: every package's copies with other bytes ------------------------------------------------
+  // Copies with the first copy's file name have its bytes (ad32's three);
+  // the others (the Simpsons' second ZIP; swse's BIN and ZIP) are fetched
+  // with --url/--md5, which saves them under the URL's own name — a verified
+  // local copy under the registry's name is linked there first.
+  for (const Package& p : builtin_packages()) {
+    if (!wanted(p)) continue;
+    for (size_t i = 1; i < p.downloads.size(); i++) {
+      const Download& d = p.downloads[i];
+      if (std::wstring_view(d.file_name) == p.downloads[0].file_name) continue;
+      if (!d.more_images.empty()) {
+        // Several images: each part fetched (or a verified local file reused)
+        // with the library's download(), then one --image for each.
+        fprintf(stderr, "==== %s, copy %zu: %zu images from %s\n", p.id, i + 1, 1 + d.more_images.size(), d.url);
+        Row row;
+        row.id = std::string(p.id) + " #" + std::to_string(i + 1);
+        ULONGLONG t0 = GetTickCount64();
+        std::vector<std::wstring> args = {L"--no-cover-download"};
+        bool fetched = true;
+        for (const DownloadPart& q : parts_of(d)) {
+          DownloadOptions o;
+          o.url = q.url;
+          o.dest = dl / q.file_name;
+          o.expected_md5 = q.md5;
+          o.expected_size = q.size;
+          o.log = [](const std::string& s) { fprintf(stderr, "  %s\n", s.c_str()); };
+          try {
+            DownloadResult r = download(o);
+            row.how = r.reused ? "local copy (parts)" : "downloaded (parts)";
+          } catch (const std::exception& e) {
+            fprintf(stderr, "  %s: %s\n", q.url, e.what());
+            fetched = false;
+          }
+          args.insert(args.end(), {L"--image", o.dest.wstring()});
+        }
+        CHECK(fetched);
+        fs::path root = scratch / (to_wide(p.id) + L"-copy" + std::to_wstring(i + 1));
+        args.insert(args.end(), {L"--dest", root.wstring()});
+        test::ProcessResult pr = fetched ? test::run_process(exe, args, 600000) : test::ProcessResult{};
+        row.seconds = (GetTickCount64() - t0) / 1000.0;
+        fprintf(stderr, "%s  adimport exited %d\n", pr.output.c_str(), pr.exit_code);
+        CHECK_EQ(pr.exit_code, 0);
+        if (fetched && pr.exit_code == 0) {
+          phosg::JSON j = load(root / L"win" / L"packages" / to_wide(p.id) / L"import.json");
+          row.verified = j.get_string("verified");
+          CHECK_EQ(row.verified, std::string("image"));
+          CHECK(j.at("missingKnown").as_list().empty());
+          CHECK_EQ(size_t(j.get_int("fileCount")), p.manifest.size());
+          CHECK_EQ(j.at("source").at("parts").as_list().size(), 1 + d.more_images.size());
+          phosg::JSON cat = load(root / L"win" / L"catalog-win.json");
+          for (auto& m : cat.at("modules").as_list()) row.modules += m->get_string("package") == p.id;
+          CHECK_EQ(row.modules, kExpect.at(p.id).modules);
+        }
+        rows.push_back(row);
+        continue;
+      }
+      bool known = false;
+      for (const KnownImage& k : p.images) known = known || (std::string_view(k.md5) == d.md5 && k.size == d.size);
+      const char* want = known ? "image" : "files";
+      fprintf(stderr, "==== %s, copy %zu: %s\n", p.id, i + 1, d.url);
+      const fs::path as = dl / url_file_name(d.url);
+      std::string how = "downloaded (--url)";
+      if (!fs::exists(as) && fs::exists(dl / d.file_name) && fs::file_size(dl / d.file_name) == d.size) {
+        how = seed(dl / d.file_name, as) ? "local copy (--url)" : how;
+      } else if (fs::exists(as)) {
+        how = "local copy (--url)";
+      }
+      fs::path root = scratch / (to_wide(p.id) + L"-copy" + std::to_wstring(i + 1));
+      ULONGLONG t0 = GetTickCount64();
+      test::ProcessResult pr =
+          test::run_process(exe,
+                            {L"--no-cover-download", L"--download", to_wide(p.id), L"--url", to_wide(d.url), L"--md5",
+                             to_wide(d.md5), L"--download-dir", dl.wstring(), L"--dest", root.wstring()},
+                            600000);
+      Row row;
+      row.id = std::string(p.id) + " #" + std::to_string(i + 1);
+      row.how = how;
+      row.seconds = (GetTickCount64() - t0) / 1000.0;
+      fprintf(stderr, "%s  adimport exited %d\n", pr.output.c_str(), pr.exit_code);
+      CHECK_EQ(pr.exit_code, 0);
+      if (pr.exit_code == 0) {
+        const bool deluxe = p.is_deluxe();
+        phosg::JSON j = load(deluxe ? root / L"win" / L"import.json"
+                                    : root / L"win" / L"packages" / to_wide(p.id) / L"import.json");
+        row.verified = j.get_string("verified");
+        CHECK_EQ(row.verified, std::string(want));
+        CHECK(j.at("missingKnown").as_list().empty());
+        CHECK_EQ(size_t(j.get_int("fileCount")), p.manifest.size());
+        if (!deluxe) CHECK_EQ(j.at("source").get_string("imageMd5"), std::string(d.md5));
+        phosg::JSON cat = load(root / L"win" / L"catalog-win.json");
+        for (auto& m : cat.at("modules").as_list()) row.modules += m->get_string("package") == p.id;
+        CHECK_EQ(row.modules, kExpect.at(p.id).modules);
+      }
+      rows.push_back(row);
     }
-    rows.push_back(row);
   }
 
   // ---- 3: every registry URL serves the verified bytes -----------------------------------------
   fprintf(stderr, "==== probing every copy\n");
   size_t probed = 0;
   for (const Package& p : builtin_packages()) {
-    for (const Download& d : p.downloads) {
+    if (!wanted(p)) continue;
+    std::vector<std::pair<DownloadPart, std::string>> every;  // every file of every copy, with the copy's kind
+    for (const Download& c : p.downloads)
+      for (const DownloadPart& q : parts_of(c)) every.push_back({q, c.kind});
+    for (const auto& [d, kind] : every) {
       fs::path local = dl / d.file_name;
+      // A copy fetched with --url in step 2 has the URL's own name.
+      if (!fs::exists(local) || fs::file_size(local) != d.size) local = dl / url_file_name(d.url);
       if (!fs::exists(local) || fs::file_size(local) != d.size) {
         fprintf(stderr, "  %s: no verified local file to compare with\n", d.url);
         test::g_failures++;
         continue;
       }
       std::vector<std::pair<uint64_t, size_t>> ranges = {{d.size - 65536, 65536}};
-      if (std::string_view(d.kind) == "image") ranges.push_back({16 * 2048, 2048});
+      if (kind == "image") ranges.push_back({16 * 2048, 2048});
       for (auto [from, n] : ranges) {
         Probe r = probe(d.url, from, n);
         bool same = r.body == read_range(local, from, n);

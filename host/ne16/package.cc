@@ -48,7 +48,8 @@ bool parse_logpalette(std::string_view d, std::vector<PALETTEENTRY>* out) {
 
 const char* bridge_name(BridgeKind k) { return k == BridgeKind::oldmod16 ? "oldmod16" : "native"; }
 
-Ne16Layout resolve_layout(const std::string& path, const std::string& win, const FileExists& exists) {
+Ne16Layout resolve_layout(const std::string& path, const std::string& win, const FileExists& exists,
+                          const FileExists& dir_exists) {
   Ne16Layout l;
   l.module_path = path;
   l.module_dir = dir_of(path);
@@ -60,6 +61,9 @@ Ne16Layout resolve_layout(const std::string& path, const std::string& win, const
     l.package_root = root;
     l.package_id = file_of(root);
     l.engine_dir = root + "\\ENGINE";
+    // What the installer put in C:\WINDOWS: never a module folder, even the module's own.
+    std::string windows = root + "\\WINDOWS";
+    if (dir_exists && !ieq(file_of(l.module_dir), "WINDOWS") && dir_exists(windows)) l.windows_dir = windows;
     l.search_dirs = {l.module_dir, l.engine_dir};
     return l;
   }
@@ -89,6 +93,80 @@ bool parse_bridge_choice(const std::string& v, bool* is_auto, BridgeKind* forced
 
 BridgeKind choose_bridge(const Ne16Layout& l, const FileExists& exists) {
   return exists(l.engine_dir + "\\OLDMOD16.DLL") ? BridgeKind::oldmod16 : BridgeKind::native;
+}
+
+bool after_dark2(const Ne16Layout& l, const FileExists& exists) {
+  return exists(l.module_dir + "\\" + kAfterDark2Library);
+}
+
+const char* kind_name(ModuleKind k) { return k == ModuleKind::ad3 ? "ad3" : "imx"; }
+
+KindProbe detect_kind(const loader::ne::Image& img, const std::string& file_name) {
+  auto exports = [&](const char* name) { return img.find_ordinal(name).has_value(); };
+  KindProbe p;
+  if (exports("MODULE")) {
+    p.ok = true;
+    p.kind = ModuleKind::ad3;
+    return p;
+  }
+  const bool init = exports("SAVERINIT"), draw = exports("SAVERDRAW");
+  if (init && draw) {
+    // IMIMXPLY's own refusals (2:03c7..2:0404, 2:044d..2:045c): a module
+    // that exports SETCURRSAVER, and a file named IMXX_*.
+    if (exports("SETCURRSAVER")) {
+      p.why = "an Intermission module that exports SETCURRSAVER, which the IMX reader refuses";
+    } else if (file_name.size() >= 5 && ieq(file_name.substr(0, 5), "IMXX_")) {
+      p.why = "an Intermission module named IMXX_*, which the IMX reader refuses";
+    } else {
+      p.ok = true;
+      p.kind = ModuleKind::imx;
+    }
+    return p;
+  }
+  if (exports("SAVERMAIN")) {
+    p.why = "an Intermission reader (it exports SAVERMAIN), not a module";
+  } else if (init || draw) {
+    p.why = std::string("not an Intermission module: it exports ") + (init ? "SAVERINIT" : "SAVERDRAW") + " without " +
+            (init ? "SAVERDRAW" : "SAVERINIT");
+  } else {
+    p.why = "not an After Dark or Intermission module (no MODULE, SAVERINIT or SAVERDRAW export)";
+  }
+  return p;
+}
+
+bool parse_kind_choice(const std::string& v, bool* is_auto, ModuleKind* forced) {
+  *is_auto = true;
+  if (v.empty() || ieq(v, "auto")) return true;
+  if (ieq(v, "ad3") || ieq(v, "imx")) {
+    *is_auto = false;
+    *forced = ieq(v, "ad3") ? ModuleKind::ad3 : ModuleKind::imx;
+    return true;
+  }
+  return false;
+}
+
+const char* reader_name(ReaderKind k) { return k == ReaderKind::imq ? "imq" : "native"; }
+
+bool parse_reader_choice(const std::string& v, bool* is_auto, ReaderKind* forced) {
+  *is_auto = true;
+  if (v.empty() || ieq(v, "auto")) return true;
+  if (ieq(v, "imq") || ieq(v, "native")) {
+    *is_auto = false;
+    *forced = ieq(v, "imq") ? ReaderKind::imq : ReaderKind::native;
+    return true;
+  }
+  return false;
+}
+
+ReaderFile find_reader(const Ne16Layout& l, const FileExists& exists) {
+  ReaderFile r;
+  if (exists(l.engine_dir + "\\" + kImxReader)) {
+    r.host = l.engine_dir + "\\" + kImxReader;
+    r.in_engine_dir = true;
+  } else if (exists(l.module_dir + "\\" + kImxReader)) {
+    r.host = l.module_dir + "\\" + kImxReader;
+  }
+  return r;
 }
 
 AdPalettes palettes_from_scr(const std::string& scr) {

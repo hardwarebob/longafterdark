@@ -112,6 +112,7 @@ RECT frame_screen_rect(const RECT& window, const RectI& fit) {
 
 std::string key_line(int vk, bool down) { return "KEY " + std::to_string(vk & 0xFF) + (down ? " 1" : " 0"); }
 std::string caps_line(bool on) { return on ? "CAPS 1" : "CAPS 0"; }
+std::string numlock_line(bool on) { return on ? "NUMLOCK 1" : "NUMLOCK 0"; }
 std::string mouse_line(int x, int y, uint32_t buttons) {
   return "MOUSE " + std::to_string(x) + " " + std::to_string(y) + " " + std::to_string(buttons & 7);
 }
@@ -175,6 +176,10 @@ bool parse_test_script(const std::string& text, std::vector<TestStep>& out, std:
     } else if (op == "CAPSSTATE") {
       st.op = TestStep::Op::caps_state;
       if (!nums(1)) return fail("CAPSSTATE <0|1>");
+      st.a = st.a != 0;
+    } else if (op == "NUMLOCKSTATE") {
+      st.op = TestStep::Op::numlock_state;
+      if (!nums(1)) return fail("NUMLOCKSTATE <0|1>");
       st.a = st.a != 0;
     } else if (op == "BUTTON") {
       st.op = TestStep::Op::button;

@@ -1,4 +1,5 @@
-// adimport — puts the original Windows After Dark files in place (DESIGN.md
+// adimport — puts the original Windows modules of the known releases (six
+// After Dark releases and Star Wars Screen Entertainment) in place (DESIGN.md
 // §6, PACKAGES.md) and keeps each release's box cover (COVERS.md §2).
 //
 //   adimport --image <image> [--image <image2> …] | --iso <image> | --from <drive or folder>
@@ -51,6 +52,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <optional>
 #include <string>
 #include <vector>
@@ -112,15 +114,15 @@ void usage(FILE* f) {
           "       adimport --gui --refresh-covers [<id> | all] [--force] [--dest <assets root>]\n"
           "                [--download-dir <dir>]\n"
           "\n"
-          "Identifies which of these After Dark releases the source is,\n"
+          "Identifies which of these releases the source is,\n"
           "%s"
           "copies its Windows files into <assets root>\\win (After Dark 4.0 Deluxe: FILES; every\n"
           "other release: packages\\<id>), verifies them, and rewrites the module catalog,\n"
           "<assets root>\\win\\catalog-win.json, over every imported release.\n"
           "  --image <path>      an image of a CD (.iso, or a raw 2352-byte-sector .bin) or of a\n"
           "                      floppy disk (.img/.ima/.vfd/.flp, FAT12/16), or a ZIP of the\n"
-          "                      install files; repeat it for split floppies. --iso is the same\n"
-          "                      option\n"
+          "                      install files or of floppy images; repeat it for every disk of\n"
+          "                      a set. --iso is the same option\n"
           "  --from <dir>        a CD drive (E:\\) or any folder holding a copy of the disc or\n"
           "                      floppies\n"
           "  --download [<id>]   fetch the release's copy from the Internet Archive (After Dark\n"
@@ -557,6 +559,9 @@ int run_cli(const Args& a) {
 int run_list_packages(const Args& a) {
   fs::path root = a.dest.empty() ? default_assets_root() : a.dest;
   printf("packages in %s\n", to_utf8(win_assets_dir(root).wstring()).c_str());
+  // The title column fits the longest title ("Star Wars Screen Entertainment").
+  int title_w = 0;
+  for (const Package& p : builtin_packages()) title_w = std::max(title_w, int(strlen(p.title)));
   for (const PackageState& s : list_packages(root)) {
     std::string state = s.installed ? "installed, " + std::to_string(s.file_count) + " files, verified: " + s.verified +
                                           (s.imported_utc.empty() ? "" : ", " + s.imported_utc)
@@ -570,12 +575,15 @@ int run_list_packages(const Args& a) {
       if (!c.credit.empty() && c.origin != CoverOrigin::user) label += (label.empty() ? "" : ", ") + c.credit;
       if (!label.empty()) state += " (" + label + ")";
     }
-    std::string dl = s.package->downloads.empty()
-                         ? "no download"
-                         : "download " + mb(s.package->downloads.front().size) +
-                               (std::string_view(s.package->downloads.front().kind) == "zip" ? " (ZIP of the install files)"
-                                                                                           : " (disc image)");
-    printf("  %-9s %-29s %s; %s\n", s.package->id, s.package->title, state.c_str(), dl.c_str());
+    std::string dl = "no download";
+    if (!s.package->downloads.empty()) {
+      const Download& d = s.package->downloads.front();
+      dl = "download " + mb(download_size(d)) +
+           (std::string_view(d.kind) == "zip" ? " (ZIP of the install files)"
+            : d.more_images.empty()           ? " (disc image)"
+                                              : " (" + std::to_string(1 + d.more_images.size()) + " floppy images)");
+    }
+    printf("  %-9s %-*s %s; %s\n", s.package->id, title_w, s.package->title, state.c_str(), dl.c_str());
   }
   return 0;
 }

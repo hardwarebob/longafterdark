@@ -53,7 +53,7 @@ class SourcesPage : public Page {
   std::vector<std::filesystem::path> paths;   // image(s) or the folder
   std::string cover_id;                       // change_cover
   std::vector<std::string> cover_ids;         // get_covers: the releases with no cover picture yet
-  // A caution under the cards ("That is not a known After Dark disc…").
+  // A caution under the cards ("That is not a disc Long After Dark knows…").
   void show_caution(const std::wstring& text);
 
  protected:

@@ -1,16 +1,17 @@
 // Lane — the seam between the protocol host and whatever produces frames.
 // The PE32 lane (AD 4 modules on ADXPL510.DLL) and the NE lane (Classic
-// modules on ADXPL300.DLL + OLDMOD16.DLL) plug in here; so does the built-in
-// test pattern.
+// modules on ADXPL300.DLL + OLDMOD16.DLL, and Intermission modules through
+// IMIMXPLY.IMQ) plug in here; so does the built-in test pattern.
 //
 // Lifecycle, driven by run_host():
 //   init(module, ctx)            once; ctx.input already holds ADCVSET values
 //   loop:
-//     on_command(c)              each SET/KEY/CAPS/MOUSE, in arrival order,
+//     on_command(c)              each SET/KEY/CAPS/NUMLOCK/MOUSE, in arrival order,
 //                                after ctx.input has been updated with it
 //     ctx.clock.begin_frame()    (host)
 //     step()                     produce the next frame into ctx.screen
-//     ctx.audio->advance(now)    (host: the audio engine renders up to the step's time)
+//     ctx.audio->advance(now)    (host: the audio engine renders up to the step's time,
+//                                unless the lane advanced it during the step: audio.h)
 //     (host presents ctx.screen)
 //   ctx.audio->shutdown(now)     (host: live sound stops, captures are finalized)
 //   shutdown()                   once, on every exit path after a successful init
@@ -52,7 +53,9 @@ struct LaneStatus {
   bool cursor = false;       // it wants a visible cursor (ADWS_CURSOR)
   bool rotate_ok = false;    // it may be rotated away while interactive (ADWS_ROTATE_OK)
   bool key_filter = false;   // it may consume input without being interactive (ADWS_KEY_FILTER)
-  bool wake = false;         // it asked the saver window to close (ADWS_WAKE)
+  bool wake = false;         // it asked the saver to end, as the user's input would (ADWS_WAKE): it posted
+                             // WM_CLOSE/SC_CLOSE to the saver window, or (ne16) an After Dark 2.0 module
+                             // returned its wake result, 5
   uint32_t source = 0;       // 1 AD4 WantEvents, 2 AD3 0x0E (kStatusSource*)
   uint64_t eaten = 0;        // highest input seq consumed
   // The lowest input seq the guest may still take: posted to a queue it reads
@@ -121,7 +124,13 @@ class Lane {
   // Whether this lane implements configure() (for --capabilities; no module
   // is loaded to answer it).
   virtual bool can_configure() const { return false; }
-  // Run a module's button handler (§6.1). ctx.input holds ADCVSET and ADCAPS;
+  // The module ABIs this lane runs, for --capabilities (abis=): "afterdark"
+  // (After Dark's module protocols) and "intermission" (Delrina Intermission's
+  // .IMX modules; a catalog entry says "abi":"intermission", and no "abi"
+  // means "afterdark"). The pe32 lane runs {afterdark}, the ne16 lane
+  // {afterdark, intermission}.
+  virtual std::vector<std::string> abis() const { return {}; }
+  // Run a module's button handler (§6.1). ctx.input holds ADCVSET, ADCAPS and ADNUMLOCK;
   // ctx.env.state_root is persistent in this mode. The lane may fill
   // *json_out with configure_json(...); when it leaves it empty, adhostwin
   // prints one built from the result alone.

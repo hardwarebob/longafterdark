@@ -58,6 +58,7 @@ const char* command_name(Command::Kind k) {
     case Command::Kind::set: return "SET";
     case Command::Kind::key: return "KEY";
     case Command::Kind::caps: return "CAPS";
+    case Command::Kind::numlock: return "NUMLOCK";
     case Command::Kind::mouse: return "MOUSE";
     case Command::Kind::quit: return "QUIT";
     case Command::Kind::eof: return "EOF";
@@ -97,6 +98,10 @@ bool parse_command(std::string_view line, Command& out) {
     k = Command::Kind::caps;
     ok = nums(1);
     out.a = out.a != 0;
+  } else if (keyword_is(tok[0], "NUMLOCK")) {
+    k = Command::Kind::numlock;
+    ok = nums(1);
+    out.a = out.a != 0;
   } else if (keyword_is(tok[0], "MOUSE")) {
     // The third number is the button bitmask (1 left, 2 right, 4 middle;
     // INTERACTION.md §3.2). 0 and 1 keep their old meaning; anything outside
@@ -115,9 +120,7 @@ bool parse_command(std::string_view line, Command& out) {
 }
 
 void InputState::apply(const Command& c) {
-  if (c.seq && (c.kind == Command::Kind::key || c.kind == Command::Kind::caps ||
-                c.kind == Command::Kind::mouse))
-    input_seq = c.seq;
+  if (c.seq && is_input_line(c.kind)) input_seq = c.seq;
   switch (c.kind) {
     case Command::Kind::set:
       controls[c.a] = c.b;
@@ -132,6 +135,9 @@ void InputState::apply(const Command& c) {
       break;
     case Command::Kind::caps:
       caps = c.a != 0;
+      break;
+    case Command::Kind::numlock:
+      numlock = c.a != 0;
       break;
     case Command::Kind::mouse:
       mouse_x = c.a;

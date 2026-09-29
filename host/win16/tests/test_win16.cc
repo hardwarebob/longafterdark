@@ -1,7 +1,8 @@
 // adw_win16 tests: the LDT (selectors, huge-block tiling), the global and
 // local heaps, Pascal far thunks (argument order, callee pops, DX:AX), far
 // callbacks from a shim into guest code (nested), Catch/Throw, INT 21h/1Ah
-// basics, the VGA ports, a small NE DLL built in memory (imports, prolog
+// basics (the current drive and each drive's current directory, DOS's
+// limit on one), the VGA ports, a small NE DLL built in memory (imports, prolog
 // patching, LibEntry), and — with the imported assets — OLDMOD16.DLL loaded
 // through the module table with its DLLENTRYPOINT, and AD_SND.DLL.
 //
@@ -9,8 +10,10 @@
 //   adw_win16_tests --assets   the asset tests (exit 77 when the assets are absent)
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -25,6 +28,7 @@
 #include "win16/modules16.hh"
 #include "win16/runtime16.hh"
 #include "win16/shim_families16.hh"
+#include "win32/config_script.hh"
 #include "win32/display.hh"
 #include "win32/ini_store.hh"
 #include "win32/vfs.hh"
@@ -403,11 +407,15 @@ void test_dos() {
 
 // ---- a tiny NE DLL built in memory ------------------------------------------------------------------------
 
+// The RT_RCDATA resource 7 build_ne(true) carries (16 bytes at file offset 0x310).
+constexpr char kTestResource[16] = "hello, resource";
+
 // Writes an NE DLL with a code segment and a data segment. The code segment
 // has LibEntry at 0 (returns AX=1 after calling KERNEL.GetVersion through an
 // import) and an exported function at 0x20 with the MSVC prolog
-// `push ds; pop ax; nop; …` that returns DS.
-std::string build_ne() {
+// `push ds; pop ax; nop; …` that returns DS. With `resource`, a resource
+// table holding RT_RCDATA 7 (kTestResource) follows the segment table.
+std::string build_ne(bool resource = false) {
   std::string f(0x40, '\0');
   f[0] = 'M';
   f[1] = 'Z';
@@ -440,10 +448,23 @@ std::string build_ne() {
   entry += char(0x20);
   entry += char(0x00);
   entry += '\0';
+  // Resource table: alignment shift 4; one type (RT_RCDATA) of one resource
+  // (id 7, 16 bytes at 0x310 = 0x31 << 4); the type list's end; no names.
+  if (resource) {
+    w16(res, 0, 4);
+    w16(res, 2, 0x8000 | 10);
+    w16(res, 4, 1);
+    w16(res, 6, 0), w16(res, 8, 0);
+    w16(res, 10, 0x31), w16(res, 12, 1), w16(res, 14, 0x30), w16(res, 16, 0x8007);
+    w16(res, 18, 0), w16(res, 20, 0);
+    w16(res, 22, 0);
+    res.push_back('\0');
+  }
   uint16_t off = 0x40;
   uint16_t seg_off = off;
   off += 16;
   uint16_t res_off = off;
+  off += uint16_t(res.size());
   uint16_t resident_off = off;
   off += uint16_t(resident.size());
   uint16_t modref_off = off;
@@ -500,6 +521,7 @@ std::string build_ne() {
   all.resize(ne);
   all += tables;
   all += segt;
+  all += res;
   all += resident;
   all += modref;
   all += imp;
@@ -509,6 +531,7 @@ std::string build_ne() {
   all += rel;
   all.resize(0x300, '\0');
   all += std::string(0x10, '\0');
+  if (resource) all += std::string(kTestResource, sizeof(kTestResource));
   return all;
 }
 
@@ -1390,6 +1413,1349 @@ void test_overlay16() {
   RemoveDirectoryA(root.c_str());
 }
 
+// ---- Star Wars Screen Entertainment's Win16 surface (README "Intermission modules") -------------------------
+
+// GetTempFileName with uUnique 0 makes the file (STRESS.DLL counts file
+// handles by opening it until the handles run out; every Star Wars module
+// wants 10); SetHandleCount reports the task's table size.
+void test_temp_files() {
+  Machine m;
+  uint16_t ds = m.data(512);
+  uint32_t buf = uint32_t(ds) << 16, pfx = m.rt.static_bytes("t pfx", "str");
+  DosFiles& d = m.rt.state<DosFiles>();
+  uint16_t n1 = uint16_t(api(m, "KERNEL", "GetTempFileName", {w16(0), l16(pfx), w16(0), l16(buf)}));
+  std::string p1 = m.rt.read_str(buf);
+  CHECK(n1 == 0x1234 && p1 == "C:\\WINDOWS\\TEMP\\~str1234.TMP", "uUnique 0: %04X %s", n1, p1.c_str());
+  win32::Vfs::Stat st;
+  CHECK(m.rt.vfs().stat(p1, &st) && !st.dir && st.size == 0, "the file exists, empty");
+  uint16_t n2 = uint16_t(api(m, "KERNEL", "GetTempFileName", {w16(0), l16(pfx), w16(0), l16(buf + 0x100)}));
+  CHECK(n2 == 0x1235 && m.rt.read_str(buf + 0x100) == "C:\\WINDOWS\\TEMP\\~str1235.TMP", "the next number is free (%04X)", n2);
+  // STRESS's GETFREEFILEHANDLES: _lopen until it fails, close them all, OF_DELETE.
+  std::vector<uint16_t> handles;
+  for (int i = 0; i < 300; i++) {
+    uint16_t h = uint16_t(api(m, "KERNEL", "_lopen", {l16(buf), w16(0x40)}));
+    if (h == 0xFFFF) break;
+    handles.push_back(h);
+  }
+  CHECK(handles.size() == 250, "250 handles on the temp file (%zu): at least 10, below STRESS's 256", handles.size());
+  for (uint16_t h : handles) api(m, "KERNEL", "_lclose", {w16(h)});
+  uint16_t of = m.data(160);
+  CHECK((api(m, "KERNEL", "OpenFile", {l16(buf), l16(uint32_t(of) << 16), w16(0x0200)}) & 0xFFFF) == 1 && !d.exists(p1),
+        "OF_DELETE removes it");
+  // A nonzero uUnique names a file and makes none.
+  CHECK((api(m, "KERNEL", "GetTempFileName", {w16(0), l16(pfx), w16(0x42), l16(buf)}) & 0xFFFF) == 0x42 &&
+            m.rt.read_str(buf) == "C:\\WINDOWS\\TEMP\\~str0042.TMP" && !d.exists(m.rt.read_str(buf)),
+        "uUnique 42h: %s, no file", m.rt.read_str(buf).c_str());
+  // TF_FORCEDRIVE: the current directory of that drive (the root while it is
+  // the current directory), TEMP or no TEMP.
+  api(m, "KERNEL", "GetTempFileName", {w16(0x80 | 'C'), l16(pfx), w16(0x10), l16(buf)});
+  CHECK(m.rt.read_str(buf) == "C:\\~str0010.TMP", "TF_FORCEDRIVE, C:\\ current: %s", m.rt.read_str(buf).c_str());
+  // The module folder current, as the lanes make it (mount_imx_disk: C:\SAVER
+  // over a writable upper layer): the file is made there, and opens.
+  m.rt.vfs().mount_overlay("C:\\SAVER", "", "");
+  CHECK(m.rt.vfs().set_cwd("C:\\SAVER"), "C:\\SAVER current");
+  uint16_t nf = uint16_t(api(m, "KERNEL", "GetTempFileName", {w16(0x80 | 'c'), l16(pfx), w16(0), l16(buf)}));
+  std::string pf = m.rt.read_str(buf);
+  CHECK(nf == 0x1234 && pf == "C:\\SAVER\\~str1234.TMP" && d.exists(pf), "TF_FORCEDRIVE, uUnique 0: %04X %s, made",
+        nf, pf.c_str());
+  uint16_t hf = uint16_t(api(m, "KERNEL", "_lopen", {l16(buf), w16(2)}));
+  CHECK(hf != 0xFFFF, "and the module's _lopen of it succeeds");
+  api(m, "KERNEL", "_lclose", {w16(hf)});
+  CHECK((api(m, "KERNEL", "GetTempFileName", {w16(0x80), l16(pfx), w16(0), l16(buf)}) & 0xFFFF) == 0x1235 &&
+            m.rt.read_str(buf) == "C:\\SAVER\\~str1235.TMP",
+        "TF_FORCEDRIVE with drive 0: the current drive's (%s)", m.rt.read_str(buf).c_str());
+  // A drive the guest's disk does not have: TEMP (Wine's GetTempFileName16 too).
+  api(m, "KERNEL", "GetTempFileName", {w16(0x80 | 'D'), l16(pfx), w16(0x11), l16(buf)});
+  CHECK(m.rt.read_str(buf) == "C:\\WINDOWS\\TEMP\\~str0011.TMP", "TF_FORCEDRIVE, no D: drive: %s",
+        m.rt.read_str(buf).c_str());
+  m.rt.vfs().set_cwd("C:\\");
+  // SetHandleCount: Windows' 20, grown to at most 255, never shrunk.
+  CHECK((api(m, "KERNEL", "SetHandleCount", {w16(10)}) & 0xFFFF) == 20, "SetHandleCount(10): 20");
+  CHECK((api(m, "KERNEL", "SetHandleCount", {w16(300)}) & 0xFFFF) == 255, "SetHandleCount(300): 255");
+  CHECK((api(m, "KERNEL", "SetHandleCount", {w16(30)}) & 0xFFFF) == 255, "SetHandleCount(30): still 255");
+  // _hwrite: a huge write, as _hread reads.
+  uint32_t text = m.rt.static_bytes("t hw", "abcdef");
+  uint16_t h = uint16_t(api(m, "KERNEL", "_lcreat", {l16(m.rt.static_bytes("t hwf", "C:\\WINDOWS\\TEMP\\HW.DAT")), w16(0)}));
+  CHECK(api(m, "KERNEL", "_hwrite", {w16(h), l16(text), l16(6)}) == 6, "_hwrite 6 bytes");
+  api(m, "KERNEL", "_lclose", {w16(h)});
+  CHECK(m.rt.vfs().stat("C:\\WINDOWS\\TEMP\\HW.DAT", &st) && st.size == 6, "written");
+}
+
+// FindResource → AccessResource (a DOS handle at the resource's data in the
+// module file) and LoadResource/FreeResource's usage count: a resource freed
+// to zero uses is read afresh (POSTERS edits its locked caption every frame).
+void test_resources() {
+  Machine m;
+  char dir[MAX_PATH];
+  GetTempPathA(MAX_PATH, dir);
+  std::string base = std::string(dir) + "adw_win16_res_" + std::to_string(GetCurrentProcessId());
+  CreateDirectoryA(base.c_str(), nullptr);
+  std::string file = base + "\\RESTEST.DLL";
+  {
+    std::string img = build_ne(true);
+    FILE* fh = fopen(file.c_str(), "wb");
+    fwrite(img.data(), 1, img.size(), fh);
+    fclose(fh);
+  }
+  m.rt.vfs().mount("C:\\AFTERDRK", base, false);
+  uint16_t err = 0;
+  Module16* mod = m.rt.modules().load("C:\\AFTERDRK\\RESTEST.DLL", &err);
+  CHECK(mod != nullptr, "the NE DLL with a resource loads (error %u)", err);
+  if (mod) {
+    uint16_t hi = mod->hinstance;
+    uint16_t hr = uint16_t(api(m, "KERNEL", "FindResource", {w16(hi), l16(7), l16(10)}));
+    CHECK(hr != 0, "FindResource(RT_RCDATA 7)");
+    CHECK(api(m, "KERNEL", "SizeofResource", {w16(hi), w16(hr)}) == 16, "SizeofResource: 16");
+    uint16_t ds = m.data(128);
+    uint32_t buf = uint32_t(ds) << 16;
+    uint16_t hf = uint16_t(api(m, "KERNEL", "AccessResource", {w16(hi), w16(hr)}));
+    CHECK(hf != 0xFFFF && hf >= 5, "AccessResource: a DOS file handle (%04X)", hf);
+    uint32_t got = api(m, "KERNEL", "_hread", {w16(hf), l16(buf), l16(16)});
+    CHECK(got == 16 && m.rt.read_str(buf) == kTestResource, "_hread reads the resource (%u, \"%s\")", got,
+          m.rt.read_str(buf).c_str());
+    CHECK((api(m, "KERNEL", "_lclose", {w16(hf)}) & 0xFFFF) == 0, "_lclose");
+    CHECK((api(m, "KERNEL", "AccessResource", {w16(hi), w16(0x7777)}) & 0xFFFF) == 0xFFFF, "an unknown HRSRC: HFILE_ERROR");
+    // One copy while it is used; the count goes down with FreeResource.
+    uint16_t h1 = uint16_t(api(m, "KERNEL", "LoadResource", {w16(hi), w16(hr)}));
+    uint16_t h2 = uint16_t(api(m, "KERNEL", "LoadResource", {w16(hi), w16(hr)}));
+    CHECK(h1 && h1 == h2, "a loaded resource comes back as the same block (%04X %04X)", h1, h2);
+    uint32_t p = api(m, "KERNEL", "LockResource", {w16(h1)});
+    m.rt.wr8(p, 'J');  // POSTERS appends to its caption in place
+    api(m, "KERNEL", "GlobalUnlock", {w16(h1)});
+    CHECK((api(m, "KERNEL", "FreeResource", {w16(h1)}) & 0xFFFF) == 0 && m.rt.global().find(h1) &&
+              m.rt.read_str(p) == "Jello, resource",
+          "FreeResource with a use left: still loaded, the edit still there");
+    CHECK((api(m, "KERNEL", "FreeResource", {w16(h2)}) & 0xFFFF) == 0 && !m.rt.global().find(h1),
+          "the last FreeResource frees the block");
+    uint16_t h3 = uint16_t(api(m, "KERNEL", "LoadResource", {w16(hi), w16(hr)}));
+    uint32_t p3 = api(m, "KERNEL", "LockResource", {w16(h3)});
+    CHECK(h3 && p3 && m.rt.read_str(p3) == kTestResource, "the next LoadResource reads it afresh (\"%s\")",
+          p3 ? m.rt.read_str(p3).c_str() : "");
+    api(m, "KERNEL", "GlobalUnlock", {w16(h3)});
+    api(m, "KERNEL", "FreeResource", {w16(h3)});
+    // A block that is no resource: FreeResource frees it (USER's DestroyIcon32 did).
+    uint16_t g = uint16_t(api(m, "KERNEL", "GlobalAlloc", {w16(GlobalHeap16::kMoveable), l16(32)}));
+    CHECK((api(m, "KERNEL", "FreeResource", {w16(g)}) & 0xFFFF) == 0 && !m.rt.global().find(g), "FreeResource of a "
+          "plain block frees it");
+    m.rt.modules().free_all();
+  }
+  DeleteFileA(file.c_str());
+  RemoveDirectoryA(base.c_str());
+}
+
+// A packed 8-bit DIB in a fresh global block: header, a 1024-byte colour
+// table (SWSE's identity WORD table unless rgb_table), then the bits (0x428).
+uint32_t packed_dib(Machine& m, int w, int h, bool rgb_table = false) {
+  uint32_t stride = uint32_t((w + 3) & ~3);
+  uint16_t hb = m.rt.global().alloc(GlobalHeap16::kMoveable | GlobalHeap16::kZeroInit, 0x428 + stride * uint32_t(std::abs(h)));
+  uint32_t p = m.rt.global().lock(hb);
+  BITMAPINFOHEADER bi{sizeof(BITMAPINFOHEADER), w, h, 1, 8, BI_RGB, stride * uint32_t(std::abs(h)), 0, 0, 0, 0};
+  m.rt.write_bytes(p, &bi, sizeof(bi));
+  for (uint32_t i = 0; i < 256; i++) {
+    if (rgb_table) m.rt.wr32(p + 40 + 4 * i, 0);  // black everywhere …
+    else m.rt.wr16(p + 40 + 2 * i, uint16_t(i));
+  }
+  if (rgb_table) m.rt.wr32(p + 40 + 4 * 42, 0x0000FF00);  // … but entry 42: green (B, G, R, 0)
+  return p;
+}
+
+// The DIB driver (gdi16.hh): CreateDC("DIB", NULL, NULL, lpPackedDIB) draws
+// into the packed DIB's own bits, as DIB.DRV did, with its colour matching.
+void test_dib_driver() {
+  Machine m;
+  Screen screen(64, 48);
+  m.rt.attach_display(screen);
+  Gdi16& g = m.rt.state<Gdi16>();
+  uint16_t saver = user16_saver_window(m.rt);
+  uint16_t sdc = gdi16_screen_dc(m.rt, saver);
+  const int W = 20, H = 10;
+  const uint32_t stride = 20;
+  uint32_t p = packed_dib(m, W, H);
+  uint32_t drv = m.rt.static_bytes("t DIB", "DIB");
+  uint16_t dc = uint16_t(api(m, "GDI", "CreateDC", {l16(drv), l16(0), l16(0), l16(p)}));
+  CHECK(dc != 0 && g.dc(dc) && g.dc(dc)->dib_device, "CreateDC(\"DIB\") over the packed DIB (%04X)", dc);
+  if (!dc) return;
+  // Bottom-up: row y is at (H-1-y) in memory.
+  auto px = [&](int x, int y) { return m.rt.rd8(Runtime16::huge_add(p, 0x428 + uint32_t(H - 1 - y) * stride + uint32_t(x))); };
+  uint16_t rs = m.data(64);
+  uint32_t rc = uint32_t(rs) << 16;
+  auto fill = [&](int16_t l, int16_t t, int16_t r, int16_t b, uint32_t color) {
+    write16(m.rt, rc, RECT16{l, t, r, b});
+    uint16_t br = uint16_t(api(m, "GDI", "CreateSolidBrush", {l16(color)}));
+    api(m, "USER", "FillRect", {w16(dc), l16(rc), w16(br)});
+    api(m, "GDI", "DeleteObject", {w16(br)});
+  };
+  fill(0, 0, 4, 4, 0x10FF0037);   // DIBINDEX(37h)
+  fill(4, 0, 8, 4, 0x0100005A);   // PALETTEINDEX(5Ah)
+  fill(8, 0, 12, 4, RGB(255, 255, 255));
+  fill(12, 0, 16, 4, RGB(0x80, 0, 0));
+  fill(16, 0, 20, 4, 0x0200C0C0 | (0xC0 << 16));  // PALETTERGB(C0, C0, C0)
+  CHECK(px(1, 1) == 0x37 && px(5, 1) == 0x5A, "DIBINDEX and PALETTEINDEX are the pixel value itself (%02X %02X)", px(1, 1),
+        px(5, 1));
+  CHECK(px(9, 1) == 15 && px(13, 1) == 1 && px(17, 1) == 7,
+        "RGB and PALETTERGB on an index table: the 16 VGA colours (white %u, dark red %u, light grey %u)", px(9, 1),
+        px(13, 1), px(17, 1));
+  CHECK(m.rt.rd8(p + 0x428 + uint32_t(H - 1) * stride + 1) == 0x37, "row 0 is the last in memory (bottom-up)");
+  // The guest writes pixels itself; a blit reads them, indices unchanged.
+  m.rt.wr8(Runtime16::huge_add(p, 0x428 + uint32_t(H - 1 - 5) * stride + 15), 0x77);
+  api(m, "GDI", "BitBlt", {w16(sdc), w16(0), w16(0), w16(W), w16(H), w16(dc), w16(0), w16(0), l16(SRCCOPY)});
+  GdiFlush();
+  CHECK(screen.at(15, 5) == 0x77 && screen.at(1, 1) == 0x37, "a blit to the screen copies the indices (%02X %02X)",
+        screen.at(15, 5), screen.at(1, 1));
+  // Text and lines land in the bits too (a pen of DIBINDEX(9)).
+  uint16_t pen = uint16_t(api(m, "GDI", "CreatePen", {w16(PS_SOLID), w16(1), l16(0x10FF0009)}));
+  uint16_t old_pen = uint16_t(api(m, "GDI", "SelectObject", {w16(dc), w16(pen)}));
+  api(m, "GDI", "MoveTo", {w16(dc), w16(0), w16(8)});
+  api(m, "GDI", "LineTo", {w16(dc), w16(W), w16(8)});
+  CHECK(px(3, 8) == 9 && px(18, 8) == 9, "LineTo with a DIBINDEX pen (%u)", px(3, 8));
+  api(m, "GDI", "SelectObject", {w16(dc), w16(old_pen)});
+  // Not a palette device: the driver's own caps; RealizePalette maps nothing.
+  CHECK(!(api(m, "GDI", "GetDeviceCaps", {w16(dc), w16(RASTERCAPS)}) & RC_PALETTE) &&
+            (api(m, "GDI", "GetDeviceCaps", {w16(dc), w16(HORZRES)}) & 0xFFFF) == W &&
+            (api(m, "GDI", "GetDeviceCaps", {w16(dc), w16(NUMCOLORS)}) & 0xFFFF) == 256,
+        "GetDeviceCaps: the DIB driver's");
+  uint16_t ls = m.data(16);
+  m.rt.wr16(uint32_t(ls) << 16, 0x300);
+  m.rt.wr16((uint32_t(ls) << 16) + 2, 1);
+  m.rt.wr32((uint32_t(ls) << 16) + 4, 0x000000FF);
+  uint16_t pal = uint16_t(api(m, "GDI", "CreatePalette", {l16(uint32_t(ls) << 16)}));
+  api(m, "USER", "SelectPalette", {w16(dc), w16(pal), w16(0)});
+  CHECK((api(m, "USER", "RealizePalette", {w16(dc)}) & 0xFFFF) == 0, "RealizePalette on a DIB DC: nothing");
+  fill(0, 4, 4, 8, 0x01000003);
+  CHECK(px(1, 5) == 3, "PALETTEINDEX ignores the selected palette (%u)", px(1, 5));
+  // A device DC: no bitmap selects into it; GetPixel reads the table's colour.
+  uint16_t bmp = uint16_t(api(m, "GDI", "CreateCompatibleBitmap", {w16(dc), w16(4), w16(4)}));
+  CHECK((api(m, "GDI", "SelectObject", {w16(dc), w16(bmp)}) & 0xFFFF) == 0, "no bitmap selects into a DIB DC");
+  CHECK(api(m, "GDI", "GetPixel", {w16(dc), w16(9), w16(1)}) == RGB(255, 255, 255), "GetPixel: VGA white for 15");
+  // DeleteDC leaves the DIB as it was.
+  CHECK((api(m, "GDI", "DeleteDC", {w16(dc)}) & 0xFFFF) == 1 && px(1, 1) == 0x37 && m.rt.global().find(uint16_t(p >> 16)),
+        "DeleteDC: the bits and their block stay");
+  // An RGB colour table (SWSE's SETDIBUSAGEBI usage 0): the nearest entry.
+  uint32_t q = packed_dib(m, 8, 4, true);
+  uint16_t dc2 = uint16_t(api(m, "GDI", "CreateDC", {l16(drv), l16(0), l16(0), l16(q)}));
+  uint16_t green = uint16_t(api(m, "GDI", "CreateSolidBrush", {l16(RGB(0, 250, 10))}));
+  write16(m.rt, rc, RECT16{0, 0, 8, 4});
+  api(m, "USER", "FillRect", {w16(dc2), l16(rc), w16(green)});
+  CHECK(m.rt.rd8(q + 0x428) == 42, "an RGB table: the nearest entry (%u)", m.rt.rd8(q + 0x428));
+  api(m, "GDI", "DeleteDC", {w16(dc2)});
+  // Top-down (negative biHeight): row 0 first in memory.
+  uint32_t t = packed_dib(m, 8, -4);
+  uint16_t dc3 = uint16_t(api(m, "GDI", "CreateDC", {l16(drv), l16(0), l16(0), l16(t)}));
+  CHECK(dc3 != 0, "a top-down DIB");
+  uint16_t b9 = uint16_t(api(m, "GDI", "CreateSolidBrush", {l16(0x10FF0009)}));
+  write16(m.rt, rc, RECT16{0, 0, 1, 1});
+  api(m, "USER", "FillRect", {w16(dc3), l16(rc), w16(b9)});
+  CHECK(m.rt.rd8(t + 0x428) == 9 && m.rt.rd8(t + 0x428 + 3 * 8) == 0, "top-down: row 0 first");
+  api(m, "GDI", "DeleteDC", {w16(dc3)});
+  // What the driver refuses (and 4-bit DIBs, which it drew but this does not): 0.
+  uint32_t bad = packed_dib(m, 8, 4);
+  m.rt.wr16(bad + 14, 4);
+  CHECK((api(m, "GDI", "CreateDC", {l16(drv), l16(0), l16(0), l16(bad)}) & 0xFFFF) == 0, "a 4-bit DIB: 0");
+  m.rt.wr16(bad + 14, 8);
+  m.rt.wr32(bad + 16, BI_RLE8);
+  CHECK((api(m, "GDI", "CreateDC", {l16(drv), l16(0), l16(0), l16(bad)}) & 0xFFFF) == 0, "a compressed DIB: 0");
+  CHECK((api(m, "GDI", "CreateDC", {l16(drv), l16(0), l16(0), l16(0)}) & 0xFFFF) == 0, "no DIB: 0");
+  CHECK((api(m, "GDI", "CreateDC", {l16(m.rt.static_bytes("t WINGDIB", "WINGDIB")), l16(0), l16(0), l16(p)}) & 0xFFFF) == 0,
+        "another driver: 0");
+}
+
+// DIB bits drawn onto a DC with DIB colour semantics (gdi16.cc dib_xlate,
+// dib_to_indices; DIB.DRV's translation between two colour tables, 1:0653):
+// an index table keeps the source's indices; an RGB table takes each source
+// colour's nearest entry — unless the source's DIB_PAL_COLORS table is the
+// identity, which keeps them there too — and a DIB_PAL_COLORS source's colours
+// are its entries in the DC's palette; deep pixels are matched as colours are
+// (dib_index). A memory DC made compatible with a DIB DC has its colour
+// semantics; GetNearestColor answers the table's colours.
+void test_dib_translation() {
+  Machine m;
+  Screen screen(64, 48);
+  m.rt.attach_display(screen);
+  Gdi16& g = m.rt.state<Gdi16>();
+  uint32_t drv = m.rt.static_bytes("t DIB", "DIB");
+  // Two 8x4 DIB DCs: over an index table, and over an RGB table (black, but entry 42 green).
+  uint32_t ip = packed_dib(m, 8, 4), rp = packed_dib(m, 8, 4, true);
+  uint16_t idc = uint16_t(api(m, "GDI", "CreateDC", {l16(drv), l16(0), l16(0), l16(ip)}));
+  uint16_t rdc = uint16_t(api(m, "GDI", "CreateDC", {l16(drv), l16(0), l16(0), l16(rp)}));
+  CHECK(idc && rdc, "two DIB DCs (%04X %04X)", idc, rdc);
+  if (!idc || !rdc) return;
+  // The destinations' pixels; memory row 0 is their bottom row, where an 8x4
+  // source's row 0 lands (all bottom-up).
+  auto px = [&](uint32_t p, uint32_t i) { return int(m.rt.rd8(p + 0x428 + i)); };
+  // The source: 8x4, 8 bits, pixel values 0..31; an RGB table of bright red
+  // but entry 5 (blue) and entry 7 (a green, not quite pure).
+  uint16_t sh = m.rt.global().alloc(GlobalHeap16::kMoveable | GlobalHeap16::kZeroInit, 40 + 1024 + 32);
+  uint32_t sp = m.rt.global().lock(sh), sbits = sp + 40 + 1024;
+  BITMAPINFOHEADER bi{sizeof(BITMAPINFOHEADER), 8, 4, 1, 8, BI_RGB, 32, 0, 0, 0, 0};
+  m.rt.write_bytes(sp, &bi, sizeof(bi));
+  for (uint32_t i = 0; i < 256; i++) m.rt.wr32(sp + 40 + 4 * i, 0x00FF0000);  // (B, G, R, 0)
+  m.rt.wr32(sp + 40 + 4 * 5, 0x000000FF);
+  m.rt.wr32(sp + 40 + 4 * 7, 0x0000F000);
+  for (uint32_t i = 0; i < 32; i++) m.rt.wr8(sbits + i, uint8_t(i));
+  auto stretch = [&](uint16_t dc, uint16_t usage) {
+    return int16_t(api(m, "GDI", "StretchDIBits", {w16(dc), w16(0), w16(0), w16(8), w16(4), w16(0), w16(0), w16(8),
+                                                   w16(4), l16(sbits), l16(sp), w16(usage), l16(SRCCOPY)}));
+  };
+  auto kept = [&](uint32_t p) {
+    int k = 0;
+    for (uint32_t i = 0; i < 32; i++) k += px(p, i) == int(i);
+    return k;
+  };
+  CHECK(stretch(idc, DIB_RGB_COLORS) == 4 && kept(ip) == 32, "an index-table destination keeps the indices (%d of 32)",
+        kept(ip));
+  CHECK(stretch(rdc, DIB_RGB_COLORS) == 4 && px(rp, 7) == 42 && px(rp, 5) == 0 && px(rp, 3) == 0,
+        "an RGB-table destination: each colour's nearest entry (green-ish %d, blue %d, red %d)", px(rp, 7), px(rp, 5),
+        px(rp, 3));
+  // DIB_PAL_COLORS: an identity table keeps the indices on the RGB table too …
+  for (uint32_t i = 0; i < 256; i++) m.rt.wr16(sp + 40 + 2 * i, uint16_t(i));
+  CHECK(stretch(rdc, DIB_PAL_COLORS) == 4 && kept(rp) == 32, "an identity DIB_PAL_COLORS source keeps its indices (%d)",
+        kept(rp));
+  // … any other goes through the DC's palette (DEFAULT_PALETTE: 14 is green,
+  // 19 white — nearer the green entry than black — and none past 19).
+  m.rt.wr16(sp + 40 + 2 * 3, 14);
+  stretch(rdc, DIB_PAL_COLORS);
+  CHECK(px(rp, 3) == 42 && px(rp, 0) == 0 && px(rp, 19) == 42 && px(rp, 20) == 0,
+        "a DIB_PAL_COLORS source through the DC's palette (%d %d %d %d)", px(rp, 3), px(rp, 0), px(rp, 19), px(rp, 20));
+  // 24-bit pixels (SetDIBitsToDevice, one row at the top): matched as colours
+  // are — on the index table, the VGA colours white 15, dark red 1, green 10, blue 12.
+  const uint8_t deep[12] = {0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x80, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0x00};  // B, G, R
+  uint32_t dp = uint32_t(m.data(64)) << 16;
+  BITMAPINFOHEADER di{sizeof(BITMAPINFOHEADER), 4, 1, 1, 24, BI_RGB, 12, 0, 0, 0, 0};
+  m.rt.write_bytes(dp, &di, sizeof(di));
+  m.rt.write_bytes(dp + 40, deep, sizeof(deep));
+  CHECK((api(m, "GDI", "SetDIBitsToDevice", {w16(idc), w16(0), w16(0), w16(4), w16(1), w16(0), w16(0), w16(0), w16(1),
+                                             l16(dp + 40), l16(dp), w16(DIB_RGB_COLORS)}) &
+         0xFFFF) == 1,
+        "SetDIBitsToDevice of a 24-bit row");
+  const uint32_t top = 3 * 8;  // y 0: the last row in memory
+  CHECK(px(ip, top) == 15 && px(ip, top + 1) == 1 && px(ip, top + 2) == 10 && px(ip, top + 3) == 12,
+        "24-bit pixels on an index table (%d %d %d %d)", px(ip, top), px(ip, top + 1), px(ip, top + 2), px(ip, top + 3));
+  // A memory DC made compatible with the DIB DC: RGB white is 15 there too,
+  // and DIB bits keep their indices.
+  uint16_t mdc = uint16_t(api(m, "GDI", "CreateCompatibleDC", {w16(idc)}));
+  uint16_t bmp = uint16_t(api(m, "GDI", "CreateCompatibleBitmap", {w16(idc), w16(8), w16(4)}));
+  api(m, "GDI", "SelectObject", {w16(mdc), w16(bmp)});
+  CHECK(g.dc(mdc) && g.dc(mdc)->dib_header == ip, "the memory DC has the DIB's colour semantics");
+  uint32_t rc = uint32_t(m.data(16)) << 16;
+  write16(m.rt, rc, RECT16{0, 0, 8, 4});
+  uint16_t white = uint16_t(api(m, "GDI", "CreateSolidBrush", {l16(RGB(255, 255, 255))}));
+  api(m, "USER", "FillRect", {w16(mdc), l16(rc), w16(white)});
+  GdiFlush();
+  Obj16* bo = g.get(bmp, G16::bitmap);
+  CHECK(bo && bo->bmp.bits && bo->bmp.bits[0] == 15, "RGB white is 15 on it (%d)", bo && bo->bmp.bits ? bo->bmp.bits[0] : -1);
+  for (uint32_t i = 0; i < 256; i++) m.rt.wr32(sp + 40 + 4 * i, 0x00FF0000);
+  stretch(mdc, DIB_RGB_COLORS);
+  GdiFlush();
+  std::vector<int> mem_px;
+  for (int y = 0; bo && bo->bmp.bits && y < 4; y++) {
+    for (int x = 0; x < 8; x++) mem_px.push_back(bo->bmp.bits[size_t(y) * bo->bmp.stride + size_t(x)]);
+  }
+  std::sort(mem_px.begin(), mem_px.end());
+  bool all_kept = mem_px.size() == 32;
+  for (size_t i = 0; i < mem_px.size() && all_kept; i++) all_kept = mem_px[i] == int(i);
+  CHECK(all_kept, "DIB bits onto it keep their indices, 0..31 (%zu pixels)", mem_px.size());
+  // GetNearestColor: the table's colours (the VGA colours for an index table).
+  CHECK(api(m, "GDI", "GetNearestColor", {w16(idc), l16(RGB(250, 250, 250))}) == RGB(255, 255, 255) &&
+            api(m, "GDI", "GetNearestColor", {w16(rdc), l16(RGB(10, 200, 10))}) == RGB(0, 255, 0) &&
+            api(m, "GDI", "GetNearestColor", {w16(rdc), l16(RGB(200, 0, 0))}) == RGB(0, 0, 0),
+        "GetNearestColor on DIB DCs");
+  api(m, "GDI", "DeleteDC", {w16(mdc)});
+  api(m, "GDI", "DeleteDC", {w16(idc)});
+  api(m, "GDI", "DeleteDC", {w16(rdc)});
+}
+
+// DIB bits into a monochrome bitmap: real GDI gets the DIB's own colours
+// (gdi16.cc), so white is 1 and black 0 whatever palette the DC holds —
+// StretchDIBits and SetDIBitsToDevice on a memory DC holding one, as SetDIBits
+// always did. Star Trek's AD_MOD.DLL makes Scotty's Files' blueprint masks
+// so: 1-bpp DIBs, white on black, into monochrome bitmaps of a memory DC whose
+// palette holds its white at a slot of its own (PC_RESERVED); as a key colour
+// that white was a dark grey, black in monochrome, and every mask came out
+// empty.
+void test_mono_dib_targets() {
+  Machine m;
+  Screen screen(64, 48);
+  m.rt.attach_display(screen);
+  Gdi16& g = m.rt.state<Gdi16>();
+  uint16_t hwnd = user16_saver_window(m.rt);
+  uint16_t sdc = gdi16_screen_dc(m.rt, hwnd);
+  // A palette of black and a reserved white, realized: the white gets slot 10.
+  uint32_t lp = uint32_t(m.data(64)) << 16;
+  m.rt.wr16(lp, 0x300);
+  m.rt.wr16(lp + 2, 2);
+  m.rt.wr32(lp + 4, 0x00000000);
+  m.rt.wr32(lp + 8, 0x01FFFFFF);  // R, G, B = FF, flags PC_RESERVED
+  uint16_t pal = uint16_t(api(m, "GDI", "CreatePalette", {l16(lp)}));
+  api(m, "USER", "SelectPalette", {w16(sdc), w16(pal), w16(0)});
+  api(m, "USER", "RealizePalette", {w16(sdc)});
+  Obj16* po = g.get(pal, G16::palette);
+  CHECK(po && po->pal->map.size() == 2 && po->pal->map[1] >= 10, "the reserved white has a slot of its own (%d)",
+        po && po->pal->map.size() == 2 ? po->pal->map[1] : -1);
+  uint16_t mdc = uint16_t(api(m, "GDI", "CreateCompatibleDC", {w16(sdc)}));
+  api(m, "USER", "SelectPalette", {w16(mdc), w16(pal), w16(0)});
+  uint16_t mono = uint16_t(api(m, "GDI", "CreateBitmap", {w16(16), w16(2), w16(1), w16(1), l16(0)}));
+  api(m, "GDI", "SelectObject", {w16(mdc), w16(mono)});
+  // The DIB: 16x2, 1 bpp, colour 0 white and 1 black; each row black, white, white, black by fours.
+  uint32_t dp = uint32_t(m.data(128)) << 16, bits = dp + 48;
+  BITMAPINFOHEADER bi{sizeof(BITMAPINFOHEADER), 16, 2, 1, 1, BI_RGB, 8, 0, 0, 2, 0};
+  m.rt.write_bytes(dp, &bi, sizeof(bi));
+  m.rt.wr32(dp + 40, 0x00FFFFFF);
+  m.rt.wr32(dp + 44, 0x00000000);
+  for (uint32_t row = 0; row < 2; row++) {
+    m.rt.wr8(bits + 4 * row, 0xF0);
+    m.rt.wr8(bits + 4 * row + 1, 0x0F);
+  }
+  auto rows = [&]() {
+    GdiFlush();
+    uint8_t b[4] = {};
+    Obj16* bo = g.get(mono, G16::bitmap);
+    if (bo && bo->host) GetBitmapBits(static_cast<HBITMAP>(bo->host), 4, b);
+    char s[16];
+    snprintf(s, sizeof(s), "%02X%02X %02X%02X", b[0], b[1], b[2], b[3]);
+    return std::string(s);
+  };
+  // White (1) where the DIB is white: 0000 1111 1111 0000 on both rows.
+  api(m, "GDI", "PatBlt", {w16(mdc), w16(0), w16(0), w16(16), w16(2), l16(BLACKNESS)});
+  CHECK(int16_t(api(m, "GDI", "StretchDIBits", {w16(mdc), w16(0), w16(0), w16(16), w16(2), w16(0), w16(0), w16(16),
+                                                w16(2), l16(bits), l16(dp), w16(DIB_RGB_COLORS), l16(SRCCOPY)})) == 2 &&
+            rows() == "0FF0 0FF0",
+        "StretchDIBits into a monochrome bitmap: white is 1 (%s)", rows().c_str());
+  api(m, "GDI", "PatBlt", {w16(mdc), w16(0), w16(0), w16(16), w16(2), l16(BLACKNESS)});
+  CHECK((api(m, "GDI", "SetDIBitsToDevice", {w16(mdc), w16(0), w16(0), w16(16), w16(2), w16(0), w16(0), w16(0), w16(2),
+                                             l16(bits), l16(dp), w16(DIB_RGB_COLORS)}) &
+         0xFFFF) == 2 &&
+            rows() == "0FF0 0FF0",
+        "SetDIBitsToDevice into a monochrome bitmap: white is 1 (%s)", rows().c_str());
+  // Source origins reach real GDI as given. A second DIB whose two rows differ
+  // (bottom-up: first in memory the bottom row, white 0-3 and black 4-15;
+  // then the top row, black 0-7, white 8-11, black 12-15): its top row's
+  // x 8..15 — XSrc 8 and YSrc 1 counted from the bottom — onto x 4..11 of the
+  // bitmap's row 1 by StretchDIBits, and onto row 0 by SetDIBitsToDevice from
+  // a band holding the top row alone (start scan 1, one line). A swapped or
+  // dropped origin or start scan draws nothing or the wrong row.
+  uint32_t bits2 = dp + 56;
+  m.rt.wr8(bits2, 0x0F);
+  m.rt.wr8(bits2 + 1, 0xFF);
+  m.rt.wr8(bits2 + 4, 0xFF);
+  m.rt.wr8(bits2 + 5, 0x0F);
+  api(m, "GDI", "PatBlt", {w16(mdc), w16(0), w16(0), w16(16), w16(2), l16(BLACKNESS)});
+  int16_t so = int16_t(api(m, "GDI", "StretchDIBits", {w16(mdc), w16(4), w16(1), w16(8), w16(1), w16(8), w16(1),
+                                                       w16(8), w16(1), l16(bits2), l16(dp), w16(DIB_RGB_COLORS),
+                                                       l16(SRCCOPY)}));
+  CHECK(rows() == "0000 0F00", "StretchDIBits into a monochrome bitmap from source (8, 1): %s (%d)", rows().c_str(),
+        so);
+  api(m, "GDI", "PatBlt", {w16(mdc), w16(0), w16(0), w16(16), w16(2), l16(BLACKNESS)});
+  uint32_t sd = api(m, "GDI", "SetDIBitsToDevice", {w16(mdc), w16(4), w16(0), w16(8), w16(1), w16(8), w16(1), w16(1),
+                                                    w16(1), l16(bits2 + 4), l16(dp), w16(DIB_RGB_COLORS)}) &
+                0xFFFF;
+  CHECK(rows() == "0F00 0000", "SetDIBitsToDevice into a monochrome bitmap from (8, 1), band of scan 1: %s (%u)",
+        rows().c_str(), sd);
+  // SetDIBits into the bitmap itself, as before.
+  api(m, "GDI", "PatBlt", {w16(mdc), w16(0), w16(0), w16(16), w16(2), l16(BLACKNESS)});
+  CHECK((api(m, "GDI", "SetDIBits", {w16(mdc), w16(mono), w16(0), w16(2), l16(bits), l16(dp), w16(DIB_RGB_COLORS)}) &
+         0xFFFF) == 2 &&
+            rows() == "0FF0 0FF0",
+        "SetDIBits: the same (%s)", rows().c_str());
+  // The path's bounds: into a colour (8-bit) bitmap of a memory DC, both
+  // calls keep the key table — the DIB's colours become hardware indices as
+  // ever (colour 0 red: the static red; with the monochrome path's real
+  // colours on the key table it would be some grey level's index instead).
+  uint16_t cdc = uint16_t(api(m, "GDI", "CreateCompatibleDC", {w16(sdc)}));
+  uint16_t col = uint16_t(api(m, "GDI", "CreateCompatibleBitmap", {w16(sdc), w16(16), w16(2)}));
+  api(m, "GDI", "SelectObject", {w16(cdc), w16(col)});
+  m.rt.wr32(dp + 40, 0x00FF0000);
+  auto at4 = [&]() {
+    GdiFlush();
+    Obj16* co = g.get(col, G16::bitmap);
+    return co && co->bmp.bpp == 8 && co->bmp.bits ? g.index_rgb(co->bmp.bits[4]) : COLORREF(0xFFFFFFFF);
+  };
+  api(m, "GDI", "PatBlt", {w16(cdc), w16(0), w16(0), w16(16), w16(2), l16(BLACKNESS)});
+  api(m, "GDI", "StretchDIBits", {w16(cdc), w16(0), w16(0), w16(16), w16(2), w16(0), w16(0), w16(16), w16(2), l16(bits),
+                                  l16(dp), w16(DIB_RGB_COLORS), l16(SRCCOPY)});
+  CHECK(at4() == RGB(255, 0, 0), "StretchDIBits into a colour bitmap: the key table, red stays red (%06lX)",
+        (unsigned long)at4());
+  api(m, "GDI", "PatBlt", {w16(cdc), w16(0), w16(0), w16(16), w16(2), l16(BLACKNESS)});
+  api(m, "GDI", "SetDIBitsToDevice", {w16(cdc), w16(0), w16(0), w16(16), w16(2), w16(0), w16(0), w16(0), w16(2),
+                                      l16(bits), l16(dp), w16(DIB_RGB_COLORS)});
+  CHECK(at4() == RGB(255, 0, 0), "SetDIBitsToDevice into a colour bitmap: the key table, red stays red (%06lX)",
+        (unsigned long)at4());
+  // Which of a DIB's colours become 1: the rule of real GDI, which the path
+  // hands the DIB to (its colour table; a DIB_PAL_COLORS table as the DC's
+  // palette maps it). Only the table's entry nearest white is 1 — the first
+  // of equal ones — and every other entry is 0, however light: beside a
+  // white, yellow, light grey and FFFBF0 are 0 (by nearness each would be 1);
+  // without one, light grey, the nearest, is 1. An 8-bit DIB 16x2 whose
+  // pixel i is colour i; the monochrome bitmap's first row, a character per
+  // colour, through each of the three calls.
+  uint32_t dp8 = uint32_t(m.data(1024)) << 16;
+  auto mono_of = [&](const std::vector<uint32_t>& table, uint16_t usage, int call) {
+    BITMAPINFOHEADER h8{sizeof(BITMAPINFOHEADER), 16, 2, 1, 8, BI_RGB, 32, 0, 0, DWORD(table.size()), 0};
+    m.rt.write_bytes(dp8, &h8, sizeof(h8));
+    uint32_t at = dp8 + sizeof(h8);
+    for (uint32_t c : table) {
+      if (usage == DIB_PAL_COLORS) {
+        m.rt.wr16(at, uint16_t(c));
+        at += 2;
+      } else {
+        m.rt.wr32(at, c);  // 0xRRGGBB, little-endian: the RGBQUAD blue, green, red, 0
+        at += 4;
+      }
+    }
+    uint32_t px = dp8 + 0x200;
+    for (uint32_t row = 0; row < 2; row++) {
+      for (uint32_t i = 0; i < 16; i++) m.rt.wr8(px + 16 * row + i, uint8_t(i < table.size() ? i : 0));
+    }
+    api(m, "GDI", "PatBlt", {w16(mdc), w16(0), w16(0), w16(16), w16(2), l16(BLACKNESS)});
+    if (call == 0) {
+      api(m, "GDI", "StretchDIBits", {w16(mdc), w16(0), w16(0), w16(16), w16(2), w16(0), w16(0), w16(16), w16(2), l16(px),
+                                      l16(dp8), w16(usage), l16(SRCCOPY)});
+    } else if (call == 1) {
+      api(m, "GDI", "SetDIBitsToDevice", {w16(mdc), w16(0), w16(0), w16(16), w16(2), w16(0), w16(0), w16(0), w16(2),
+                                          l16(px), l16(dp8), w16(usage)});
+    } else {
+      api(m, "GDI", "SetDIBits", {w16(mdc), w16(mono), w16(0), w16(2), l16(px), l16(dp8), w16(usage)});
+    }
+    GdiFlush();
+    uint8_t b[4] = {};
+    Obj16* bo = g.get(mono, G16::bitmap);
+    if (bo && bo->host) GetBitmapBits(static_cast<HBITMAP>(bo->host), 4, b);
+    std::string s;
+    for (size_t i = 0; i < table.size(); i++) s += ((b[i >> 3] >> (7 - (i & 7))) & 1) ? '1' : '0';
+    return s;
+  };
+  const char* calls[] = {"StretchDIBits", "SetDIBitsToDevice", "SetDIBits"};
+  for (int call = 0; call < 3; call++) {
+    std::string mixed = mono_of({0x000000, 0xFFFF00, 0xC0C0C0, 0xFFFFFF, 0x808080, 0xFFFBF0, 0x00FFFF, 0x404040},
+                                DIB_RGB_COLORS, call);
+    CHECK(mixed == "00010000", "%s: black, yellow, light grey, WHITE, grey, FFFBF0, cyan, dark grey -> %s (white alone 1)",
+          calls[call], mixed.c_str());
+    std::string no_white = mono_of({0x808080, 0xC0C0C0, 0x000000, 0xFFFF00}, DIB_RGB_COLORS, call);
+    CHECK(no_white == "0100", "%s: grey, LIGHT GREY, black, yellow -> %s (the nearest white alone 1)", calls[call],
+          no_white.c_str());
+    std::string two = mono_of({0x000000, 0xFFFFFF, 0x808080, 0xFFFFFF}, DIB_RGB_COLORS, call);
+    CHECK(two == "0100", "%s: black, WHITE, grey, white -> %s (the first of two whites alone 1)", calls[call], two.c_str());
+  }
+  // DIB_PAL_COLORS: the entries as the DC's palette maps them. A palette of
+  // white, yellow, light grey and black; the table 1, 2, 0, 3 (the palette's
+  // indices themselves, as colours, would make the last entry the nearest white).
+  m.rt.wr16(lp, 0x300);
+  m.rt.wr16(lp + 2, 4);
+  m.rt.wr32(lp + 4, 0x00FFFFFF);   // white
+  m.rt.wr32(lp + 8, 0x0000FFFF);   // yellow: R, G, B = FF, FF, 00
+  m.rt.wr32(lp + 12, 0x00C0C0C0);  // light grey
+  m.rt.wr32(lp + 16, 0x00000000);  // black
+  uint16_t pal4 = uint16_t(api(m, "GDI", "CreatePalette", {l16(lp)}));
+  api(m, "USER", "SelectPalette", {w16(sdc), w16(pal4), w16(0)});
+  api(m, "USER", "RealizePalette", {w16(sdc)});
+  api(m, "USER", "SelectPalette", {w16(mdc), w16(pal4), w16(0)});
+  for (int call = 0; call < 3; call++) {
+    std::string pc = mono_of({1, 2, 0, 3}, DIB_PAL_COLORS, call);
+    CHECK(pc == "0010", "%s, DIB_PAL_COLORS: yellow, light grey, WHITE, black through the palette -> %s", calls[call],
+          pc.c_str());
+  }
+  api(m, "USER", "SelectPalette", {w16(mdc), w16(pal), w16(0)});
+  api(m, "GDI", "DeleteDC", {w16(cdc)});
+  api(m, "GDI", "DeleteObject", {w16(col)});
+  api(m, "GDI", "DeleteDC", {w16(mdc)});
+  api(m, "GDI", "DeleteObject", {w16(mono)});
+}
+
+// GetSystemPaletteUse, MulDiv, PaintRgn, CreateHatchBrush,
+// CreateDIBPatternBrush (on the screen and on a DIB DC), GlobalWire/UnWire.
+void test_gdi_additions() {
+  Machine m;
+  Screen screen(64, 48);
+  m.rt.attach_display(screen);
+  Gdi16& g = m.rt.state<Gdi16>();
+  uint16_t saver = user16_saver_window(m.rt);
+  uint16_t hdc = gdi16_screen_dc(m.rt, saver);
+  CHECK((api(m, "GDI", "GetSystemPaletteUse", {w16(hdc)}) & 0xFFFF) == SYSPAL_STATIC, "SYSPAL_STATIC");
+  api(m, "GDI", "SetSystemPaletteUse", {w16(hdc), w16(SYSPAL_NOSTATIC)});
+  CHECK((api(m, "GDI", "GetSystemPaletteUse", {w16(hdc)}) & 0xFFFF) == SYSPAL_NOSTATIC, "after SetSystemPaletteUse");
+  api(m, "GDI", "SetSystemPaletteUse", {w16(hdc), w16(SYSPAL_STATIC)});
+  // MulDiv: rounded, halves away from zero; -32768 for 0 and overflow.
+  struct {
+    int16_t a, b, c, r;
+  } md[] = {{10, 10, 3, 33},    {10, 20, 3, 67},       {-10, 20, 3, -67},     {10, -20, 3, -67},  {-10, -20, 3, 67},
+            {5, 1, 2, 3},       {-5, 1, 2, -3},        {1, 1, -2, -1},        {300, 200, -7, -8571}, {7, 1, 0, -32768},
+            {32767, 2, 1, -32768}, {-32768, 1, 1, -32768}, {32767, 1, 1, 32767}, {0, -5, 3, 0},      {250, 480, 640, 188}};
+  for (const auto& t : md) {
+    CHECK(gdi16_muldiv(t.a, t.b, t.c) == t.r, "MulDiv(%d, %d, %d) = %d, not %d", t.a, t.b, t.c, t.r, gdi16_muldiv(t.a, t.b, t.c));
+  }
+  CHECK(int16_t(api(m, "GDI", "MulDiv", {w16(uint16_t(-10)), w16(20), w16(3)})) == -67, "MulDiv through the thunk");
+  // PaintRgn: the DC's brush.
+  uint16_t rgn = uint16_t(api(m, "GDI", "CreateRectRgn", {w16(2), w16(2), w16(6), w16(6)}));
+  uint16_t red = uint16_t(api(m, "GDI", "CreateSolidBrush", {l16(RGB(255, 0, 0))}));
+  api(m, "GDI", "SelectObject", {w16(hdc), w16(red)});
+  CHECK((api(m, "GDI", "PaintRgn", {w16(hdc), w16(rgn)}) & 0xFFFF) == 1, "PaintRgn");
+  GdiFlush();
+  const RGBQUAD& q = screen.palette()[screen.at(3, 3)];
+  CHECK(q.rgbRed == 255 && q.rgbGreen == 0 && screen.at(7, 7) == 0, "the region is red, the rest untouched");
+  // CreateHatchBrush: a hatch in the colour over the background.
+  uint16_t hb = uint16_t(api(m, "GDI", "CreateHatchBrush", {w16(HS_CROSS), l16(RGB(0, 0, 255))}));
+  Obj16* ho = g.get(hb, G16::brush);
+  CHECK(ho && ho->style == BS_HATCHED && ho->hatch == HS_CROSS, "a hatched brush");
+  api(m, "GDI", "SetBkColor", {w16(hdc), l16(RGB(255, 255, 255))});
+  api(m, "GDI", "SelectObject", {w16(hdc), w16(hb)});
+  api(m, "GDI", "PatBlt", {w16(hdc), w16(16), w16(16), w16(16), w16(16), l16(PATCOPY)});
+  GdiFlush();
+  int blue = 0, white = 0;
+  for (int y = 16; y < 32; y++) {
+    for (int x = 16; x < 32; x++) {
+      const RGBQUAD& c = screen.palette()[screen.at(x, y)];
+      blue += c.rgbBlue == 255 && c.rgbRed == 0;
+      white += c.rgbBlue == 255 && c.rgbRed == 255;
+    }
+  }
+  CHECK(blue > 16 && white > 16, "the cross hatch: %d blue, %d white", blue, white);
+  // CreateDIBPatternBrush: an 8x8 checker of indices 21h and 0, entry 21h red.
+  uint16_t hd = m.rt.global().alloc(GlobalHeap16::kMoveable | GlobalHeap16::kZeroInit, 40 + 1024 + 64);
+  uint32_t dp = m.rt.global().lock(hd);
+  BITMAPINFOHEADER bi{sizeof(BITMAPINFOHEADER), 8, 8, 1, 8, BI_RGB, 64, 0, 0, 0, 0};
+  m.rt.write_bytes(dp, &bi, sizeof(bi));
+  m.rt.wr32(dp + 40 + 4 * 0x21, 0x00FF0000);  // red (B, G, R, 0)
+  for (uint32_t i = 0; i < 64; i++) m.rt.wr8(dp + 40 + 1024 + i, ((i / 8 + i % 8) & 1) ? 0x21 : 0);
+  m.rt.global().unlock(hd);
+  uint16_t pb = uint16_t(api(m, "GDI", "CreateDIBPatternBrush", {w16(hd), w16(DIB_RGB_COLORS)}));
+  CHECK(pb && g.get(pb, G16::brush) && !g.get(pb, G16::brush)->dib_pattern.empty(), "CreateDIBPatternBrush keeps a copy");
+  api(m, "KERNEL", "GlobalFree", {w16(hd)});
+  api(m, "GDI", "SelectObject", {w16(hdc), w16(pb)});
+  api(m, "GDI", "PatBlt", {w16(hdc), w16(32), w16(0), w16(8), w16(8), l16(PATCOPY)});
+  GdiFlush();
+  auto rgb = [&](int x, int y) {
+    const RGBQUAD& c = screen.palette()[screen.at(x, y)];
+    return RGB(c.rgbRed, c.rgbGreen, c.rgbBlue);
+  };
+  CHECK((rgb(32, 0) == RGB(0, 0, 0) || rgb(32, 0) == RGB(255, 0, 0)) && rgb(32, 0) != rgb(33, 0),
+        "on the screen: the pattern's colours (%06lX %06lX)", rgb(32, 0), rgb(33, 0));
+  // On a DIB DC (index table): the pattern's own indices.
+  uint32_t p = packed_dib(m, 8, 8);
+  uint16_t dc = uint16_t(api(m, "GDI", "CreateDC", {l16(m.rt.static_bytes("t DIB", "DIB")), l16(0), l16(0), l16(p)}));
+  api(m, "GDI", "SelectObject", {w16(dc), w16(pb)});
+  api(m, "GDI", "PatBlt", {w16(dc), w16(0), w16(0), w16(8), w16(8), l16(PATCOPY)});
+  std::set<uint8_t> seen;
+  for (uint32_t i = 0; i < 64; i++) seen.insert(m.rt.rd8(p + 0x428 + i));
+  CHECK(seen == std::set<uint8_t>({0, 0x21}), "on a DIB DC: indices 0 and 21h (%zu values)", seen.size());
+  // R2_MASKPEN with it (RCLOCK's fills): dest AND pattern, on the indices.
+  for (uint32_t i = 0; i < 64; i++) m.rt.wr8(p + 0x428 + i, 0x33);
+  api(m, "GDI", "SetROP2", {w16(dc), w16(R2_MASKPEN)});
+  uint16_t rgn2 = uint16_t(api(m, "GDI", "CreateRectRgn", {w16(0), w16(0), w16(8), w16(8)}));
+  api(m, "GDI", "FillRgn", {w16(dc), w16(rgn2), w16(pb)});
+  seen.clear();
+  for (uint32_t i = 0; i < 64; i++) seen.insert(m.rt.rd8(p + 0x428 + i));
+  CHECK(seen == std::set<uint8_t>({0, 0x21 & 0x33}), "FillRgn under R2_MASKPEN: 33h AND the pattern (%zu values)", seen.size());
+  api(m, "GDI", "DeleteDC", {w16(dc)});
+  // A DIB pattern brush's own bitmap (made from the DIB, never the guest's)
+  // is deleted with it: a brush made and deleted every frame never fills the
+  // handle table (6,144 slots), and each pair gets the same handles back —
+  // CreateBrushIndirect's BS_DIBPATTERN alike. BS_PATTERN's bitmap is the
+  // guest's and stays.
+  uint16_t hd2 = m.rt.global().alloc(GlobalHeap16::kMoveable | GlobalHeap16::kZeroInit, 40 + 1024 + 64);
+  m.rt.write_bytes(m.rt.global().lock(hd2), &bi, sizeof(bi));
+  m.rt.global().unlock(hd2);
+  uint32_t lb = uint32_t(m.data(16)) << 16;
+  m.rt.wr16(lb, BS_DIBPATTERN);
+  m.rt.wr32(lb + 2, DIB_RGB_COLORS);
+  m.rt.wr16(lb + 6, hd2);
+  for (int indirect = 0; indirect < 2; indirect++) {
+    uint16_t first = 0;
+    int made = 0;
+    bool same = true;
+    for (int i = 0; i < 7000; i++) {
+      uint16_t b = uint16_t(indirect ? api(m, "GDI", "CreateBrushIndirect", {l16(lb)})
+                                     : api(m, "GDI", "CreateDIBPatternBrush", {w16(hd2), w16(DIB_RGB_COLORS)}));
+      if (!b) break;
+      made++;
+      if (!first) first = b;
+      same &= b == first;
+      api(m, "GDI", "DeleteObject", {w16(b)});
+    }
+    CHECK(made == 7000 && same, "%s: 7000 brushes made and deleted, one handle (%d, %04X)",
+          indirect ? "CreateBrushIndirect(BS_DIBPATTERN)" : "CreateDIBPatternBrush", made, first);
+  }
+  CHECK((api(m, "GDI", "CreateSolidBrush", {l16(RGB(1, 2, 3))}) & 0xFFFF) != 0, "the table has room afterwards");
+  // A stale handle the guest deletes twice may name the brush's bitmap (its
+  // freed slot was reused for it); the object that takes the slot next is
+  // not deleted with the brush.
+  uint16_t stale = uint16_t(api(m, "GDI", "CreateCompatibleBitmap", {w16(hdc), w16(8), w16(8)}));
+  api(m, "GDI", "DeleteObject", {w16(stale)});
+  uint16_t sb = uint16_t(api(m, "GDI", "CreateDIBPatternBrush", {w16(hd2), w16(DIB_RGB_COLORS)}));
+  api(m, "GDI", "DeleteObject", {w16(stale)});
+  uint16_t other = uint16_t(api(m, "GDI", "CreateSolidBrush", {l16(RGB(4, 5, 6))}));
+  CHECK(other == stale && (api(m, "GDI", "DeleteObject", {w16(sb)}) & 0xFFFF) == 1 && g.get(other, G16::brush),
+        "a brush in the stale slot (%04X, %04X) outlives the pattern brush deleted after it", other, stale);
+  uint16_t pat = uint16_t(api(m, "GDI", "CreateCompatibleBitmap", {w16(hdc), w16(8), w16(8)}));
+  m.rt.wr16(lb, BS_PATTERN);
+  m.rt.wr16(lb + 6, pat);
+  uint16_t patb = uint16_t(api(m, "GDI", "CreateBrushIndirect", {l16(lb)}));
+  CHECK(patb && (api(m, "GDI", "DeleteObject", {w16(patb)}) & 0xFFFF) == 1 && g.get(pat, G16::bitmap),
+        "BS_PATTERN: deleting the brush leaves the guest's bitmap");
+  // GlobalWire: a lock; GlobalUnWire TRUE once unlocked.
+  uint16_t gw = uint16_t(api(m, "KERNEL", "GlobalAlloc", {w16(GlobalHeap16::kMoveable), l16(64)}));
+  uint32_t wp = api(m, "KERNEL", "GlobalWire", {w16(gw)});
+  CHECK(wp == (uint32_t(gw | 1) << 16) && (m.rt.global().flags(gw) & 0xFF) == 1, "GlobalWire locks (%08X)", wp);
+  CHECK((api(m, "KERNEL", "GlobalUnWire", {w16(gw)}) & 0xFFFF) == 1 && (m.rt.global().flags(gw) & 0xFF) == 0,
+        "GlobalUnWire unlocks");
+}
+
+// GetMenu, GetWindowTask, GetNextWindow, EnumChildWindows — with the
+// synthetic desktop JAWAS walks (EnumWindows, EnumChildWindows).
+void test_window_queries() {
+  Machine m;
+  Screen screen(64, 48);
+  m.rt.attach_display(screen);
+  uint16_t saver = user16_saver_window(m.rt);
+  uint16_t task = uint16_t(api(m, "KERNEL", "GetCurrentTask", {}));
+  CHECK((api(m, "USER", "GetWindowTask", {w16(saver)}) & 0xFFFF) == task && task, "the saver window is this task's");
+  CHECK((api(m, "USER", "GetMenu", {w16(saver)}) & 0xFFFF) == 0, "no menu on the saver window");
+  CHECK((api(m, "USER", "GetWindowTask", {w16(0x1234)}) & 0xFFFF) == 0, "no window: no task");
+  std::vector<uint16_t> seen;
+  m.rt.shims().add("TESTCB", 2, "CHILDPROC", Conv16::pascal_, true, 6, [&](Call16& c) {
+    seen.push_back(c.w());
+    c.l();
+    c.ret(1);
+  });
+  uint32_t cb = m.rt.thunk_far(*m.rt.shims().find_name("TESTCB", "CHILDPROC"));
+  uint32_t cls = m.rt.static_bytes("t STATIC", "STATIC");
+  auto create = [&](uint32_t style, uint16_t parent, uint16_t menu) {
+    return uint16_t(api(m, "USER", "CreateWindow", {l16(cls), l16(cls), l16(style), w16(0), w16(0), w16(8), w16(8),
+                                                    w16(parent), w16(menu), w16(0), l16(0)}));
+  };
+  uint16_t top = create(WS_POPUP | WS_VISIBLE, 0, 0x0F44);
+  uint16_t k1 = create(WS_CHILD | WS_VISIBLE, top, 1), k11 = create(WS_CHILD, k1, 2), k2 = create(WS_CHILD, top, 3);
+  CHECK((api(m, "USER", "GetMenu", {w16(top)}) & 0xFFFF) == 0x0F44 && (api(m, "USER", "GetMenu", {w16(k1)}) & 0xFFFF) == 0,
+        "a top-level window's menu; none for a child");
+  CHECK((api(m, "USER", "EnumChildWindows", {w16(top), l16(cb), l16(0)}) & 0xFFFF) == 1 && seen.size() == 3 &&
+            seen[0] == k1 && seen[1] == k11 && seen[2] == k2,
+        "EnumChildWindows: each child, then its own (%zu)", seen.size());
+  seen.clear();
+  CHECK((api(m, "USER", "EnumChildWindows", {w16(0), l16(cb), l16(0)}) & 0xFFFF) == 0 && seen.empty(),
+        "EnumChildWindows(NULL): nothing, FALSE");
+  // The synthetic desktop: Program Manager is another task's and has a menu bar.
+  m.rt.shims().add("TESTCB", 3, "TOPPROC", Conv16::pascal_, true, 6, [&](Call16& c) {
+    c.w();
+    c.l();
+    c.ret(1);
+  });
+  api(m, "USER", "EnumWindows", {l16(m.rt.thunk_far(*m.rt.shims().find_name("TESTCB", "TOPPROC"))), l16(0)});
+  uint16_t pm = uint16_t(api(m, "USER", "FindWindow", {l16(m.rt.static_bytes("t Progman", "Progman")), l16(0)}));
+  uint16_t pm_task = uint16_t(api(m, "USER", "GetWindowTask", {w16(pm)}));
+  CHECK(pm && pm_task && pm_task != task && (api(m, "KERNEL", "IsTask", {w16(pm_task)}) & 0xFFFF) &&
+            (api(m, "KERNEL", "IsTask", {w16(task)}) & 0xFFFF),
+        "Program Manager: another (valid) task");
+  CHECK((api(m, "USER", "GetMenu", {w16(pm)}) & 0xFFFF) != 0, "Program Manager has a menu bar");
+  // GetNextWindow: GetWindow's two sibling steps.
+  uint16_t next = uint16_t(api(m, "USER", "GetNextWindow", {w16(saver), w16(GW_HWNDNEXT)}));
+  CHECK(next && next == uint16_t(api(m, "USER", "GetWindow", {w16(saver), w16(GW_HWNDNEXT)})) &&
+            uint16_t(api(m, "USER", "GetNextWindow", {w16(next), w16(GW_HWNDPREV)})) == saver,
+        "GetNextWindow NEXT/PREV");
+  CHECK((api(m, "USER", "GetNextWindow", {w16(saver), w16(GW_CHILD)}) & 0xFFFF) == 0, "GetNextWindow takes no GW_CHILD");
+  // EnumChildWindows of the desktop: the top-level windows and theirs.
+  seen.clear();
+  uint16_t desk = uint16_t(api(m, "USER", "GetDesktopWindow", {}));
+  api(m, "USER", "EnumChildWindows", {w16(desk), l16(cb), l16(0)});
+  std::vector<uint16_t> want = {saver, top, k1, k11, k2, pm};
+  CHECK(seen == want, "the desktop's children: %zu windows", seen.size());
+}
+
+// wsprintf: a %s far pointer to nothing reads as "" (SWTEXT's configure
+// dialog passes a near pointer).
+void test_wsprintf_bad_pointer() {
+  Machine m;
+  uint16_t ds = m.data(256);
+  uint32_t buf = uint32_t(ds) << 16, fmt = m.rt.static_bytes("t fmt", "[%s|%d]");
+  // cdecl: the last argument is pushed first.
+  uint16_t n = uint16_t(api(m, "USER", "_wsprintf", {w16(7), l16(0xC0000E24), l16(fmt), l16(buf)}));
+  CHECK(m.rt.read_str(buf) == "[|7]" && n == 4, "an unreadable %%s: \"\" (\"%s\", %u)", m.rt.read_str(buf).c_str(), n);
+  uint32_t ok = m.rt.static_bytes("t ok", "ok");
+  api(m, "USER", "_wsprintf", {w16(8), l16(ok), l16(fmt), l16(buf)});
+  CHECK(m.rt.read_str(buf) == "[ok|8]", "a good one still reads (%s)", m.rt.read_str(buf).c_str());
+}
+
+// ChooseFont: cancelled in the saver; in configure mode a real dialog, which
+// a hidden (scripted) run cannot answer: cancelled, counted as shown.
+void test_choosefont() {
+  Machine m;
+  Screen screen(64, 48);
+  m.rt.attach_display(screen);
+  uint16_t ds = m.data(256);
+  uint32_t cf = uint32_t(ds) << 16;
+  m.rt.wr32(cf, 0x2E);
+  m.rt.wr32(cf + 8, cf + 0x80);  // lpLogFont
+  m.rt.wr32(cf + 0x0E, 0x2041);  // CF_SCREENFONTS | CF_INITTOLOGFONTSTRUCT | CF_LIMITSIZE (SWTEXT's)
+  m.rt.write_str(cf + 0x80 + 18, "Arial", 32);
+  CHECK((api(m, "COMMDLG", "ChooseFont", {l16(cf)}) & 0xFFFF) == 0, "the saver: cancelled");
+  win32::ConfigScript script;
+  script.set_hidden(true);
+  Configure16 cfg;
+  cfg.script = &script;
+  enable_real_dialogs16(m.rt, &cfg);
+  CHECK((api(m, "COMMDLG", "ChooseFont", {l16(cf)}) & 0xFFFF) == 0 && cfg.shown == 1,
+        "configure mode, hidden: cancelled (shown %d)", cfg.shown);
+  CHECK(m.rt.read_str(cf + 0x80 + 18) == "Arial", "the LOGFONT untouched");
+}
+
+// WING.1008 takes 8 argument bytes (WING.DLL's retf 8), not the table's 6:
+// a call leaves the caller's stack balanced.
+void test_wing_signature() {
+  Machine m;
+  Shim16Entry* e = m.rt.shims().find_name("WING", "WinGCreateHalftoneBrush");
+  CHECK(e && e->arg_bytes == 8 && e->conv == Conv16::pascal_ && e->ordinal == 1008, "WinGCreateHalftoneBrush: 8 bytes");
+  // push hdc; push colour (dword); push dither; lcall; retf
+  uint32_t fp = e ? m.rt.thunk_far(*e) : 0;
+  std::vector<uint8_t> code = {0x6A, 0x01, 0x68, 0x00, 0x00, 0x68, 0xFF, 0x00, 0x6A, 0x02};
+  append(code, {0x9A, uint8_t(fp), uint8_t(fp >> 8), uint8_t(fp >> 16), uint8_t(fp >> 24), 0xCB});
+  uint16_t sp0 = m.rt.cpu().registers().r_sp();
+  m.rt.call_far(uint32_t(m.code(code)) << 16, {});
+  CHECK(m.rt.last_sp_after() == sp0, "the stack is balanced after the call (%04X vs %04X)", m.rt.last_sp_after(), sp0);
+}
+
+// GetModuleHandle finds the system DLLs Windows 95 always has loaded before
+// anything imports them (INTRMLIB's and ANTSW's LibEntry ask for MMSYSTEM).
+void test_resident_modules() {
+  Machine m;
+  uint32_t mm = api(m, "KERNEL", "GetModuleHandle", {l16(m.rt.static_bytes("t mm", "MMSYSTEM"))});
+  CHECK((mm & 0xFFFF) != 0, "GetModuleHandle(\"MMSYSTEM\") before any import (%08X)", mm);
+  CHECK(api(m, "KERNEL", "GetModuleHandle", {l16(m.rt.static_bytes("t mmd", "mmsystem.dll"))}) == mm, "by file name too");
+  CHECK((api(m, "KERNEL", "GetModuleHandle", {l16(m.rt.static_bytes("t snd", "SOUND"))}) & 0xFFFF) != 0, "SOUND");
+  CHECK((api(m, "KERNEL", "GetModuleHandle", {l16(m.rt.static_bytes("t fp", "WIN87EM"))}) & 0xFFFF) == 0,
+        "WIN87EM is loaded on demand only: 0");
+  CHECK(api(m, "KERNEL", "GetProcAddress", {w16(uint16_t(mm)), l16(m.rt.static_bytes("t wo", "waveOutGetNumDevs"))}) != 0,
+        "GetProcAddress into it");
+}
+
+// INT 2Fh AX=1684h (a VxD's API entry point): none, ES:DI = 0:0, as Windows
+// answered for a VxD that is not there (INTRMLIB's LibEntry asks for three).
+void test_int2f_vxd() {
+  Machine m;
+  uint16_t ds = m.data(16);
+  // mov ax,ds_sel; mov es,ax; mov di,5555h; mov bx,0028h; mov ax,1684h; int 2Fh; mov ax,es; mov dx,di; retf
+  std::vector<uint8_t> code = {0xB8, uint8_t(ds), uint8_t(ds >> 8), 0x8E, 0xC0, 0xBF, 0x55, 0x55, 0xBB, 0x28, 0x00,
+                               0xB8, 0x84, 0x16, 0xCD, 0x2F, 0x8C, 0xC0, 0x89, 0xFA, 0xCB};
+  uint32_t r = m.rt.call_far(uint32_t(m.code(code)) << 16, {});
+  CHECK(r == 0, "ES:DI = 0:0 (%08X)", r);
+}
+
+// user16_dispatch_guest (INTERMIS's loop between saver calls): the guest's
+// own posted messages and due timers go to their procedures; task messages
+// are counted; host-posted and input messages stay for the lane.
+void test_dispatch_guest() {
+  Machine m;
+  m.clock.begin_frame();  // frame 0
+  Screen screen(64, 48);
+  m.rt.attach_display(screen);
+  InputState in;
+  m.rt.set_input(&in);
+  struct Got {
+    uint16_t hwnd, msg, wp;
+    uint32_t lp;
+  };
+  std::vector<Got> got, timer_calls;
+  m.rt.shims().add("TESTWP", 1, "PUMPPROC", Conv16::pascal_, false, 10, [&](Call16& c) {
+    Got g{c.w(), c.w(), c.w(), c.l()};
+    if (g.msg != WM_CREATE) got.push_back(g);
+    c.ret32(0);
+  });
+  m.rt.shims().add("TESTWP", 2, "TIMERPROC", Conv16::pascal_, true, 10, [&](Call16& c) {
+    Got g{c.w(), c.w(), c.w(), c.l()};
+    timer_calls.push_back(g);
+    c.ret(0);
+  });
+  uint16_t ds = m.data(256);
+  uint32_t d = uint32_t(ds) << 16;
+  m.rt.write_str(d, "PUMPCLS", 16);
+  m.rt.wr32(d + 0x20 + 2, m.rt.thunk_far(*m.rt.shims().find_name("TESTWP", "PUMPPROC")));
+  m.rt.wr32(d + 0x20 + 22, d);
+  api(m, "USER", "RegisterClass", {l16(d + 0x20)});
+  uint16_t hwnd = uint16_t(api(m, "USER", "CreateWindow", {l16(d), l16(d), l16(WS_POPUP), w16(0), w16(0), w16(8), w16(8),
+                                                             w16(0), w16(0), w16(0), l16(0)}));
+  uint16_t task = uint16_t(api(m, "KERNEL", "GetCurrentTask", {}));
+  api(m, "USER", "PostMessage", {w16(hwnd), w16(WM_USER + 1), w16(2), l16(3)});
+  user16_post_host(m.rt, hwnd, 0x3B9, 5, 6);  // MM_WOM_DONE: the lane's (user16_dispatch_host)
+  api(m, "USER", "PostAppMessage", {w16(task), w16(WM_MOUSEMOVE), w16(0xFFFF), l16(0)});
+  user16_post_input(m.rt, WM_KEYDOWN, 'A', key_lparam('A', true, false), 9);
+  api(m, "USER", "PostMessage", {w16(0x7770), w16(WM_USER + 7), w16(0), l16(0)});
+  api(m, "USER", "PostMessage", {w16(hwnd), w16(WM_USER + 2), w16(4), l16(5)});
+  int n = user16_dispatch_guest(m.rt);
+  CHECK(n == 4, "four messages handled (%d)", n);
+  CHECK(got.size() == 2 && got[0].msg == WM_USER + 1 && got[0].wp == 2 && got[0].lp == 3 && got[1].msg == WM_USER + 2,
+        "the window's own messages, in order (%zu)", got.size());
+  uint32_t msg = d + 0x80;
+  CHECK((api(m, "USER", "PeekMessage", {l16(msg), w16(0), w16(WM_KEYFIRST), w16(WM_KEYLAST), w16(PM_NOREMOVE)}) & 0xFFFF) &&
+            m.rt.rd16(msg + 2) == WM_KEYDOWN,
+        "the tagged input is still there");
+  got.clear();
+  CHECK(user16_dispatch_host(m.rt) == 1 && got.size() == 1 && got[0].msg == 0x3B9, "the host's message is still the host's");
+  StepReport16 r = user16_end_step(m.rt);
+  CHECK(r.task_posts == 1 && r.last_task_msg == WM_MOUSEMOVE, "the task message counted (%u, %04X)", r.task_posts,
+        r.last_task_msg);
+  // Timers: WM_TIMER to the window, the TIMERPROC's call, once each when due.
+  got.clear();
+  api(m, "USER", "SetTimer", {w16(hwnd), w16(5), w16(10), l16(0)});
+  uint16_t tid = uint16_t(api(m, "USER", "SetTimer", {w16(0), w16(0), w16(10),
+                                                      l16(m.rt.thunk_far(*m.rt.shims().find_name("TESTWP", "TIMERPROC")))}));
+  CHECK(user16_dispatch_guest(m.rt) == 0 && got.empty(), "not due yet");
+  m.clock.begin_frame();  // frame 1: 16.7 ms on
+  CHECK(user16_dispatch_guest(m.rt) == 2, "both timers fire");
+  CHECK(got.size() == 1 && got[0].msg == WM_TIMER && got[0].wp == 5 && timer_calls.size() == 1 &&
+            timer_calls[0].msg == WM_TIMER && timer_calls[0].wp == tid,
+        "WM_TIMER 5 to the window, the TIMERPROC for timer %u", tid);
+  CHECK(user16_dispatch_guest(m.rt) == 0, "and not again until due");
+  // A due timer that an earlier callback of the same pump sets again (a 5 s
+  // timeout restarted: SetTimer on its hwnd and id resets it, as on Windows)
+  // waits for its new time, as GetMessage's own timer check has it.
+  api(m, "USER", "KillTimer", {w16(hwnd), w16(5)});
+  api(m, "USER", "KillTimer", {w16(0), w16(tid)});
+  int resets = 0;
+  m.rt.shims().add("TESTWP", 3, "RESETPROC", Conv16::pascal_, true, 10, [&](Call16& c) {
+    if (!resets++) api(m, "USER", "SetTimer", {w16(hwnd), w16(7), w16(5000), l16(0)});
+    c.ret(0);
+  });
+  api(m, "USER", "SetTimer",
+      {w16(hwnd), w16(6), w16(10), l16(m.rt.thunk_far(*m.rt.shims().find_name("TESTWP", "RESETPROC")))});
+  api(m, "USER", "SetTimer", {w16(hwnd), w16(7), w16(10), l16(0)});
+  got.clear();
+  auto timer7 = [&] {
+    int k = 0;
+    for (const Got& x : got) k += x.msg == WM_TIMER && x.wp == 7;
+    return k;
+  };
+  m.clock.begin_frame();  // both due
+  CHECK(user16_dispatch_guest(m.rt) == 1 && resets == 1 && timer7() == 0,
+        "timer 6's procedure ran and set timer 7 again: 7 does not fire (%d)", timer7());
+  for (int f = 0; f < 60; f++) {
+    m.clock.begin_frame();
+    user16_dispatch_guest(m.rt);
+  }
+  CHECK(timer7() == 0, "nor within a second");
+  for (int f = 0; f < 250; f++) {
+    m.clock.begin_frame();
+    user16_dispatch_guest(m.rt);
+  }
+  CHECK(timer7() == 1, "it fires at its new time, 5 s on (%d)", timer7());
+  m.rt.set_input(nullptr);
+}
+
+// seed_intermission: the SYSTEM.INI / SWSE.INI / ANTSW.INI seeds, read as
+// seed ⊕ file, never written out.
+void test_intermission_seeds() {
+  char base[MAX_PATH];
+  GetTempPathA(MAX_PATH, base);
+  std::string upper = std::string(base) + "adw_win16_imseed_" + std::to_string(GetCurrentProcessId());
+  {
+    Machine m;
+    m.rt.vfs().mount_overlay("C:\\WINDOWS", "", upper);
+    IntermissionSeeds s;
+    s.volume = 150;
+    s.swse_gdi = true;
+    seed_intermission(m.rt, s);
+    win32::IniStore& ini = profiles16(m.rt);
+    auto get = [&](const char* f, const char* sec, const char* k) {
+      return ini.get(std::string("C:\\WINDOWS\\") + f, sec, k).value_or("(none)");
+    };
+    CHECK(get("SYSTEM.INI", "boot", "display.drv") == "pnpdrvr.drv", "SYSTEM.INI [boot] display.drv");
+    CHECK(get("SWSE.INI", "technology", "display.drv") == "pnpdrvr.drv" && get("SWSE.INI", "technology", "WinGFound") == "1" &&
+              get("SWSE.INI", "technology", "DibBlit") == "GDI",
+          "SWSE.INI [technology]: GDI");
+    CHECK(get("ANTSW.INI", "Intermission", "Volume") == "100" && get("ANTSW.INI", "Intermission", "Saver Path") == "C:\\AFTERDRK",
+          "ANTSW.INI [Intermission]: Volume clamped to 100, Saver Path the guest directory");
+    // The guest reads them through its own calls; its writes never carry them.
+    uint16_t ds = m.data(128);
+    uint32_t buf = uint32_t(ds) << 16;
+    uint32_t tech = m.rt.static_bytes("t tech", "technology"), blit = m.rt.static_bytes("t blit", "DibBlit"),
+             swse = m.rt.static_bytes("t swse", "SWSE.INI"), def = m.rt.static_bytes("t def", "WinG");
+    api(m, "KERNEL", "GetPrivateProfileString", {l16(tech), l16(blit), l16(def), l16(buf), w16(16), l16(swse)});
+    CHECK(m.rt.read_str(buf) == "GDI", "GetPrivateProfileString sees the seed (%s)", m.rt.read_str(buf).c_str());
+    uint32_t sec = m.rt.static_bytes("t sec", "Darth Vader"), key = m.rt.static_bytes("t key", "Delay"),
+             val = m.rt.static_bytes("t val", "30");
+    api(m, "KERNEL", "WritePrivateProfileString", {l16(sec), l16(key), l16(val), l16(swse)});
+  }
+  std::string ini;
+  if (FILE* f = fopen((upper + "\\SWSE.INI").c_str(), "rb")) {
+    char b[256] = {};
+    fread(b, 1, 255, f);
+    fclose(f);
+    ini = b;
+  }
+  CHECK(ini.find("Delay=30") != std::string::npos && ini.find("technology") == std::string::npos,
+        "the written SWSE.INI has the module's key and no seeds (%s)", ini.c_str());
+  DeleteFileA((upper + "\\SWSE.INI").c_str());
+  RemoveDirectoryA(upper.c_str());
+  Machine m2;
+  seed_intermission(m2.rt, IntermissionSeeds{});
+  CHECK(!profiles16(m2.rt).get("C:\\WINDOWS\\SWSE.INI", "technology", "DibBlit") &&
+            profiles16(m2.rt).get("C:\\WINDOWS\\ANTSW.INI", "Intermission", "Volume").value_or("") == "0",
+        "without SWSE.DLL: no [technology]; sound off: Volume 0");
+}
+
+// After Dark 2.0's profile seeds (seed_after_dark2): AD_PREFS.INI [After Dark]
+// Path and [Sound] SoundDriver under the empty virtual file, read through the
+// guest's own calls as AD_MOD.DLL and AD_SND make them; a module's write
+// (AD_SND's [Sound] Mute) never carries them.
+void test_after_dark2_seeds() {
+  char base[MAX_PATH];
+  GetTempPathA(MAX_PATH, base);
+  std::string upper = std::string(base) + "adw_win16_ad2seed_" + std::to_string(GetCurrentProcessId());
+  {
+    Machine m;
+    m.rt.vfs().mount_overlay("C:\\WINDOWS", "", upper);
+    CHECK(!profiles16(m.rt).get("C:\\WINDOWS\\AD_PREFS.INI", "After Dark", "Path"), "no Path before the seeds");
+    seed_after_dark2(m.rt);
+    win32::IniStore& ini = profiles16(m.rt);
+    CHECK(ini.get("C:\\WINDOWS\\AD_PREFS.INI", "After Dark", "Path").value_or("") == "C:\\AFTERDRK\\" &&
+              ini.get("C:\\WINDOWS\\AD_PREFS.INI", "Sound", "SoundDriver").value_or("") == "AD_MME.DRV",
+          "[After Dark] Path=C:\\AFTERDRK\\, [Sound] SoundDriver=AD_MME.DRV");
+    uint16_t ds = m.data(256);
+    uint32_t buf = uint32_t(ds) << 16;
+    uint32_t ad = m.rt.static_bytes("t ad", "After Dark"), path = m.rt.static_bytes("t path", "PATH"),
+             empty = m.rt.static_bytes("t empty", ""), prefs = m.rt.static_bytes("t prefs", "ad_prefs.ini"),
+             sound = m.rt.static_bytes("t sound", "Sound"), drv = m.rt.static_bytes("t drv", "SoundDriver"),
+             mute = m.rt.static_bytes("t mute", "Mute"), no = m.rt.static_bytes("t no", "NO");
+    api(m, "KERNEL", "GetPrivateProfileString", {l16(ad), l16(path), l16(empty), l16(buf), w16(0xA0), l16(prefs)});
+    CHECK(m.rt.read_str(buf) == "C:\\AFTERDRK\\", "AD_MOD's read: %s", m.rt.read_str(buf).c_str());
+    CHECK((api(m, "KERNEL", "WritePrivateProfileString", {l16(sound), l16(mute), l16(no), l16(prefs)}) & 0xFFFF) == 1,
+          "AD_SND's [Sound] Mute write");
+    api(m, "KERNEL", "GetPrivateProfileString", {l16(sound), l16(drv), l16(empty), l16(buf), w16(0xA0), l16(prefs)});
+    CHECK(m.rt.read_str(buf) == "AD_MME.DRV", "the seed still shows under the written file (%s)", m.rt.read_str(buf).c_str());
+  }
+  std::string ini;
+  if (FILE* f = fopen((upper + "\\AD_PREFS.INI").c_str(), "rb")) {
+    char b[256] = {};
+    fread(b, 1, 255, f);
+    fclose(f);
+    ini = b;
+  }
+  CHECK(ini.find("Mute=NO") != std::string::npos && ini.find("Path") == std::string::npos &&
+            ini.find("SoundDriver") == std::string::npos,
+        "the written AD_PREFS.INI has the module's key and no seeds (%s)", ini.c_str());
+  DeleteFileA((upper + "\\AD_PREFS.INI").c_str());
+  RemoveDirectoryA(upper.c_str());
+}
+
+// GetKeyState's toggle bit (bit 0): Caps Lock's from the CAPS line, Num
+// Lock's from the NUMLOCK line (Final Exam starts its exam when it changes);
+// GetAsyncKeyState's bit 0 stays "pressed since the last call".
+void test_toggle_keys() {
+  VirtualClock clock{VirtualClock::Mode::fixed_step, 16667};
+  InputState in;
+  Runtime16 rt{Runtime16Options{}, clock, &in};
+  register_all16(rt);
+  auto call = [&](const char* fn, int vk) {
+    return uint16_t(rt.call_far(rt.thunk_far(*rt.shims().find_name("USER", fn)), {w16(uint16_t(vk))}));
+  };
+  CHECK(call("GetKeyState", VK_NUMLOCK) == 0 && call("GetKeyState", VK_CAPITAL) == 0, "both toggles off");
+  in.numlock = true;
+  CHECK(call("GetKeyState", VK_NUMLOCK) == 1 && call("GetKeyState", VK_CAPITAL) == 0, "NUMLOCK 1: Num Lock's toggle alone");
+  in.numlock = false;
+  in.caps = true;
+  CHECK(call("GetKeyState", VK_NUMLOCK) == 0 && call("GetKeyState", VK_CAPITAL) == 1, "CAPS 1: Caps Lock's alone");
+  in.numlock = true;
+  in.keys.set(VK_NUMLOCK);
+  CHECK(call("GetKeyState", VK_NUMLOCK) == 0x8001, "held and toggled: 8001 (%04X)", call("GetKeyState", VK_NUMLOCK));
+  CHECK(call("GetAsyncKeyState", VK_NUMLOCK) == 0x8001 && call("GetAsyncKeyState", VK_NUMLOCK) == 0x8000,
+        "GetAsyncKeyState: pressed since the last call, then down only");
+  CHECK(call("GetKeyState", VK_SCROLL) == 0, "no other key has a toggle");
+}
+
+// INT 21h with these registers, as the guest's `int 21h` and KERNEL.DOS3Call
+// reach it: AX, DX, DS (when given) and SI; the AX and carry it leaves.
+struct Dos21 {
+  uint16_t ax;
+  bool cf;
+};
+Dos21 int21(Machine& m, uint16_t ax, uint16_t dx, uint16_t ds = 0, uint16_t si = 0) {
+  auto& r = m.rt.cpu().registers();
+  if (ds) m.rt.cpu().load_segment(SegReg::DS, ds);
+  r.w_ax(ax);
+  r.w_dx(dx);
+  r.w_si(si);
+  m.rt.set_carry(false);
+  dos_int21(m.rt);
+  return {r.r_ax(), (r.read_eflags() & 1) != 0};
+}
+
+// Directories for the drive tests, below `dir` mounted as C:\AFTERDRK (11
+// characters): five D1234567s (56), then D123456.8 — C:\AFTERDRK\…\D123456.8
+// is 66 characters, all a DOS current directory held — and D1234567.9 beside
+// it, 67.
+std::string deep_dir(const std::string& dir) {
+  std::string d = dir;
+  for (int i = 0; i < 5; i++) {
+    d += "\\D1234567";
+    CreateDirectoryA(d.c_str(), nullptr);
+  }
+  CreateDirectoryA((d + "\\D123456.8").c_str(), nullptr);
+  CreateDirectoryA((d + "\\D1234567.9").c_str(), nullptr);
+  return d;
+}
+
+void remove_deep_dir(const std::string& dir) {
+  std::string d = dir + "\\D1234567\\D1234567\\D1234567\\D1234567\\D1234567";
+  RemoveDirectoryA((d + "\\D123456.8").c_str());
+  RemoveDirectoryA((d + "\\D1234567.9").c_str());
+  for (int i = 0; i < 5; i++) {
+    RemoveDirectoryA(d.c_str());
+    d = d.substr(0, d.find_last_of('\\'));
+  }
+}
+
+// DlgDirList and LB_DIR with DDL_DRIVES (configure mode, on real, never
+// shown windows): "[-c-]", and "[-h-]" once the host's drives are mounted
+// as H:; DlgDirSelect makes "[-h-]" "h:", and listing it lists H:\ (the
+// drives) — Sounder's "Sounds.." folder dialog reaching the user's .WAVs.
+// The list moves the guest's DOS to the drive and directory it lists, each
+// drive keeping its own, and does not enter a folder deeper than a DOS
+// current directory could be.
+void test_dir_list_drives() {
+  char base[MAX_PATH];
+  GetTempPathA(MAX_PATH, base);
+  std::string dir = std::string(base) + "adw_win16_ddl_" + std::to_string(GetCurrentProcessId());
+  CreateDirectoryA(dir.c_str(), nullptr);
+  CreateDirectoryA((dir + "\\SUB").c_str(), nullptr);
+  if (FILE* f = fopen((dir + "\\JIM.WAV").c_str(), "wb")) fclose(f);
+  // A folder of the host's own (under no mount), which the guest reaches
+  // through H:; its name is its own 8.3 name, so no alias of it can shift.
+  char hname[16];
+  snprintf(hname, sizeof(hname), "H%07lX", (unsigned long)(GetCurrentProcessId() & 0xFFFFFFF));
+  std::string hdir = std::string(base) + hname;
+  CreateDirectoryA(hdir.c_str(), nullptr);
+  if (FILE* f = fopen((hdir + "\\HOST.WAV").c_str(), "wb")) fclose(f);
+  {
+    Machine m;
+    m.rt.vfs().mount("C:\\AFTERDRK", dir, false);
+    win32::ConfigScript script;
+    script.set_hidden(true);
+    Configure16 cfg;
+    cfg.script = &script;
+    enable_real_dialogs16(m.rt, &cfg);
+    HWND dlg = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 200, 200, nullptr, nullptr, nullptr, nullptr);
+    HWND list = CreateWindowExW(0, L"LISTBOX", L"", WS_CHILD | LBS_HASSTRINGS, 0, 0, 100, 100, dlg,
+                                reinterpret_cast<HMENU>(uintptr_t(204)), nullptr, nullptr);
+    CreateWindowExW(0, L"STATIC", L"", WS_CHILD, 0, 120, 100, 20, dlg, reinterpret_cast<HMENU>(uintptr_t(203)), nullptr, nullptr);
+    CHECK(dlg && list, "the real windows (error %lu)", GetLastError());
+    uint16_t h16 = real_hwnd16(m.rt, dlg);
+    uint16_t ds = m.data(256);
+    uint32_t spec = uint32_t(ds) << 16, out = spec + 128;
+    auto items = [&]() {
+      std::string all;
+      LRESULT n = SendMessageW(list, LB_GETCOUNT, 0, 0);
+      for (LRESULT i = 0; i < n; i++) {
+        wchar_t t[64] = {};
+        SendMessageW(list, LB_GETTEXT, WPARAM(i), LPARAM(t));
+        std::string s;
+        for (const wchar_t* p = t; *p; p++) s += char(*p);
+        all += (all.empty() ? "" : " ") + s;
+      }
+      return all;
+    };
+    auto dir_list = [&](const std::string& s) {
+      m.rt.write_str(spec, s, 128);
+      return api(m, "USER", "DlgDirList", {w16(h16), l16(spec), w16(204), w16(203), w16(DDL_EXCLUSIVE | DDL_DRIVES | DDL_DIRECTORY)}) & 0xFFFF;
+    };
+    CHECK(dir_list("C:\\AFTERDRK\\*.WAV") == 1 && items() == "[..] [SUB] [-c-]", "no H:: [-c-] alone (%s)", items().c_str());
+    m.rt.vfs().mount_host_drives(/*short_names=*/true);
+    CHECK(dir_list("C:\\AFTERDRK\\*.WAV") == 1 && items() == "[..] [SUB] [-c-] [-h-]", "H: mounted: [-h-] after [-c-] (%s)",
+          items().c_str());
+    // LB_DIR (Win16 WM_USER + 0x0E) lists the same.
+    SendMessageW(list, LB_RESETCONTENT, 0, 0);
+    m.rt.write_str(spec, "C:\\AFTERDRK\\*.*", 64);
+    api(m, "USER", "SendMessage", {w16(real_hwnd16(m.rt, list)), w16(WM_USER + 0x0E), w16(DDL_DRIVES | DDL_DIRECTORY), l16(spec)});
+    CHECK(items() == "JIM.WAV [..] [SUB] [-c-] [-h-]", "LB_DIR: files, directories, both drives (%s)", items().c_str());
+    SendMessageW(list, LB_SETCURSEL, 4, 0);
+    CHECK((api(m, "USER", "DlgDirSelect", {w16(h16), l16(out), w16(204)}) & 0xFFFF) == 1 && m.rt.read_str(out) == "h:",
+          "DlgDirSelect on [-h-]: h: (%s)", m.rt.read_str(out).c_str());
+    wchar_t shown[64] = {};
+    CHECK(dir_list("h:*.WAV") == 1 && items().find("[-c-] [-h-]") != std::string::npos && items().rfind("[", 0) == 0 &&
+              GetDlgItemTextW(dlg, 203, shown, 64) && std::wstring(shown) == L"H:\\",
+          "h: lists H:\\, the host's drives (%s)", items().c_str());
+    // The drive and directory the list moves to are the guest's DOS's: walked
+    // down from H:\ as a module does ("C\*.WAV", …) to this test's folder on
+    // the host, the guest's getcwd() (INT 21h AH=19h, then AH=47h) names it,
+    // drive and all (it said C: whatever the list showed, and a module saved
+    // SoundPath=C:\C\…); "c:" then lists C:'s own directory, where the list
+    // left it, and "h:" H:'s.
+    auto static_text = [&]() {
+      wchar_t t[128] = {};
+      GetDlgItemTextW(dlg, 203, t, 128);
+      std::string s;
+      for (const wchar_t* p = t; *p; p++) s += char(*p);
+      return s;
+    };
+    uint16_t ds2 = m.data(128);
+    auto getcwd = [&]() {
+      auto& r = m.rt.cpu().registers();
+      m.rt.cpu().load_segment(SegReg::DS, ds2);
+      r.w_ax(0x1900);
+      dos_int21(m.rt);
+      char letter = char('A' + (r.r_ax() & 0xFF));
+      r.w_ax(0x4700);
+      r.w_dx(0);
+      r.w_si(0);
+      dos_int21(m.rt);
+      return std::string(1, letter) + ":\\" + m.rt.read_str(uint32_t(ds2) << 16);
+    };
+    const std::string g = m.rt.vfs().host_to_guest(hdir);
+    bool walked = g.rfind("H:\\", 0) == 0;
+    for (size_t i = 3; walked && i < g.size();) {
+      size_t j = g.find('\\', i);
+      if (j == std::string::npos) j = g.size();
+      walked = dir_list(g.substr(i, j - i) + "\\*.WAV") == 1;
+      i = j + 1;
+    }
+    if (g.size() <= kMaxCurDir) {
+      CHECK(walked && items() == "[..] [-c-] [-h-]" && static_text() == g && getcwd() == g &&
+                m.rt.read_str(spec) == "*.WAV",
+            "walked to %s: getcwd() %s, static %s (%s)", g.c_str(), getcwd().c_str(), static_text().c_str(), items().c_str());
+    } else {
+      CHECK(!walked, "%s is deeper than DOS's current directory: not entered", g.c_str());
+    }
+    std::string h_dir = getcwd();
+    CHECK(dir_list("c:*.WAV") == 1 && static_text() == "C:\\AFTERDRK" && getcwd() == "C:\\AFTERDRK",
+          "c: lists C:'s own directory (%s, getcwd() %s)", static_text().c_str(), getcwd().c_str());
+    CHECK(dir_list("h:*.WAV") == 1 && static_text() == h_dir && getcwd() == h_dir,
+          "h: lists H:'s own directory again (%s)", static_text().c_str());
+    // A folder deeper than DOS's current directory could be (66 characters
+    // with the drive) is not entered: 0, and the list, the static, the spec
+    // and the current directory stay.
+    deep_dir(dir);
+    const std::string d56 = "C:\\AFTERDRK\\D1234567\\D1234567\\D1234567\\D1234567\\D1234567";
+    CHECK(dir_list(d56 + "\\*.WAV") == 1 && items() == "[..] [D123456.8] [D1234567.9] [-c-] [-h-]",
+          "C:\\AFTERDRK\\…\\D1234567 (%s)", items().c_str());
+    CHECK(dir_list("D1234567.9\\*.WAV") == 0 && items() == "[..] [D123456.8] [D1234567.9] [-c-] [-h-]" &&
+              static_text() == d56 && m.rt.read_str(spec) == "D1234567.9\\*.WAV" && getcwd() == d56,
+          "D1234567.9 (67 characters) refused: %s, static %s, spec %s", items().c_str(), static_text().c_str(),
+          m.rt.read_str(spec).c_str());
+    CHECK(dir_list("D123456.8\\*.WAV") == 1 && items() == "[..] [-c-] [-h-]" && static_text() == d56 + "\\D123456.8" &&
+              getcwd() == d56 + "\\D123456.8",
+          "D123456.8 (66 characters) entered: %s (%s)", getcwd().c_str(), items().c_str());
+    DestroyWindow(dlg);
+  }
+  remove_deep_dir(dir);
+  DeleteFileA((dir + "\\JIM.WAV").c_str());
+  RemoveDirectoryA((dir + "\\SUB").c_str());
+  RemoveDirectoryA(dir.c_str());
+  DeleteFileA((hdir + "\\HOST.WAV").c_str());
+  RemoveDirectoryA(hdir.c_str());
+}
+
+// The current drive and directories as DOS kept them (dos16.hh): AH=19h
+// reports the current directory's drive, AH=0Eh selects a drive the guest's
+// disk has (C:, and H: with the host's drives mounted) and reports the letters
+// to H:, AH=3Bh sets the directory of its path's drive and leaves the current
+// drive, AH=47h reports any drive's own directory (DL 0 the current one, 3 C:,
+// 8 H:), whole; "C:name" resolves against C:'s own directory in every file
+// call, and TF_FORCEDRIVE's temp file goes there. A directory deeper than a
+// DOS current directory could be (66 characters with its drive) is refused
+// with error 3 and nothing changes — before, AH=19h said C: whatever the
+// current directory's drive, AH=0Eh selected nothing, and AH=47h returned the
+// current directory, cut to 63 characters, whichever drive DL named.
+void test_dos_drives() {
+  char base[MAX_PATH];
+  GetTempPathA(MAX_PATH, base);
+  std::string dir = std::string(base) + "adw_win16_drv_" + std::to_string(GetCurrentProcessId());
+  CreateDirectoryA(dir.c_str(), nullptr);
+  CreateDirectoryA((dir + "\\SUB").c_str(), nullptr);
+  if (FILE* f = fopen((dir + "\\SUB\\X.TXT").c_str(), "wb")) {
+    fputs("sub", f);
+    fclose(f);
+  }
+  deep_dir(dir);
+  const std::string d66 = "C:\\AFTERDRK\\D1234567\\D1234567\\D1234567\\D1234567\\D1234567\\D123456.8";
+  const std::string d67 = "C:\\AFTERDRK\\D1234567\\D1234567\\D1234567\\D1234567\\D1234567\\D1234567.9";
+  CHECK(d66.size() == kMaxCurDir && d67.size() == kMaxCurDir + 1, "the test's paths: %zu and %zu characters", d66.size(),
+        d67.size());
+  {
+    Machine m;
+    win32::Vfs& vfs = m.rt.vfs();
+    vfs.mount("C:\\AFTERDRK", dir, false);
+    vfs.set_cwd("C:\\AFTERDRK");
+    uint16_t ds = m.data(512);
+    uint32_t buf = uint32_t(ds) << 16, path = buf + 0x100;
+    auto getcwd = [&](uint8_t drive, Dos21* res = nullptr) {
+      m.rt.write_str(buf, "(untouched)", 64);
+      Dos21 d = int21(m, 0x4700, drive, ds, 0);
+      if (res) *res = d;
+      return d.cf ? std::string("(error)") : m.rt.read_str(buf);
+    };
+    auto chdir = [&](const std::string& p) {
+      m.rt.write_str(path, p, 128);
+      return int21(m, 0x3B00, uint16_t(path), ds);
+    };
+    auto drive = [&]() { return int(int21(m, 0x1900, 0).ax & 0xFF); };
+    Dos21 r{};
+    CHECK(drive() == 2 && getcwd(0, &r) == "AFTERDRK" && r.ax == 0x0100 && getcwd(3) == "AFTERDRK",
+          "C:\\AFTERDRK current: AH=19h 2, AH=47h \"%s\" (DL 0) and \"%s\" (DL 3)", getcwd(0).c_str(), getcwd(3).c_str());
+    CHECK(getcwd(8, &r) == "(error)" && r.ax == doserr::kInvalidDrive, "no H: before the host's drives are mounted (%04X)",
+          r.ax);
+    vfs.mount_host_drives(/*short_names=*/true);
+    CHECK(getcwd(8) == "", "H: mounted, never visited: its root (\"%s\")", getcwd(8).c_str());
+    CHECK(getcwd(4, &r) == "(error)" && r.cf && r.ax == doserr::kInvalidDrive && getcwd(27, &r) == "(error)",
+          "no D: (or drive 27): error 15 (%04X)", r.ax);
+    // AH=0Eh: an absent drive changes nothing; H: becomes the current drive at its root.
+    CHECK((int21(m, 0x0E00, 3).ax & 0xFF) == kLastDrive && drive() == 2 && vfs.cwd() == "C:\\AFTERDRK",
+          "AH=0Eh D:: 8 letters, still C: (%s)", vfs.cwd().c_str());
+    CHECK((int21(m, 0x0E00, 7).ax & 0xFF) == 8 && drive() == 7 && vfs.cwd() == "H:\\" && getcwd(0) == "" &&
+              getcwd(3) == "AFTERDRK",
+          "AH=0Eh H:: H: current at its root, C: keeps C:\\AFTERDRK (%s, \"%s\")", vfs.cwd().c_str(), getcwd(3).c_str());
+    // AH=3Bh on C: from H:: C:'s directory moves, the current drive stays H:.
+    r = chdir("C:\\AFTERDRK\\SUB");
+    CHECK(!r.cf && drive() == 7 && getcwd(3) == "AFTERDRK\\SUB" && getcwd(0) == "",
+          "AH=3Bh C:\\AFTERDRK\\SUB with H: current: C:'s own, H: stays (%d, \"%s\")", drive(), getcwd(3).c_str());
+    // "C:name" is C:'s own directory's, in the file calls too.
+    DosFiles& files = m.rt.state<DosFiles>();
+    CHECK(vfs.full_path("C:X.TXT") == "C:\\AFTERDRK\\SUB\\X.TXT" && files.exists("C:X.TXT") &&
+              vfs.full_path("c:") == "C:\\AFTERDRK\\SUB" && vfs.full_path("\\X") == "H:\\X",
+          "C:X.TXT = %s, c: = %s", vfs.full_path("C:X.TXT").c_str(), vfs.full_path("c:").c_str());
+    uint16_t h = uint16_t(api(m, "KERNEL", "_lopen", {l16(m.rt.static_bytes("t cx", "C:X.TXT")), w16(0)}));
+    char got[4] = {};
+    if (h != 0xFFFF) {
+      files.read(h, buf, 3);
+      m.rt.read_bytes(buf, got, 3);
+      api(m, "KERNEL", "_lclose", {w16(h)});
+    }
+    CHECK(h != 0xFFFF && std::string(got, 3) == "sub", "_lopen(\"C:X.TXT\") reads C:\\AFTERDRK\\SUB\\X.TXT (%s)",
+          std::string(got, 3).c_str());
+    uint32_t tmp = uint32_t(m.data(160)) << 16, pfx = m.rt.static_bytes("t pfx", "str");
+    api(m, "KERNEL", "GetTempFileName", {w16(0x80 | 'C'), l16(pfx), w16(0x10), l16(tmp)});
+    std::string t1 = m.rt.read_str(tmp);
+    api(m, "KERNEL", "GetTempFileName", {w16(0x80), l16(pfx), w16(0x11), l16(tmp)});
+    std::string t2 = m.rt.read_str(tmp);
+    CHECK(t1 == "C:\\AFTERDRK\\SUB\\~str0010.TMP" && t2 == "H:\\~str0011.TMP",
+          "TF_FORCEDRIVE: C:'s own directory (%s), the current drive's (%s)", t1.c_str(), t2.c_str());
+    // Back to C: (AH=0Eh): its own directory again.
+    int21(m, 0x0E00, 2);
+    CHECK(drive() == 2 && vfs.cwd() == "C:\\AFTERDRK\\SUB" && getcwd(8) == "", "AH=0Eh C:: at C:\\AFTERDRK\\SUB (%s)",
+          vfs.cwd().c_str());
+    // DOS's limit: 66 characters with the drive; AH=47h hands out all 63 after "C:\".
+    r = chdir(d66);
+    std::string w66 = getcwd(0);
+    CHECK(!r.cf && vfs.cwd() == d66 && w66 == d66.substr(3) && w66.size() == 63,
+          "AH=3Bh to 66 characters: current; AH=47h whole (%zu: %s)", w66.size(), w66.c_str());
+    r = chdir(d67);
+    CHECK(r.cf && r.ax == doserr::kPathNotFound && vfs.cwd() == d66 && getcwd(0) == w66,
+          "AH=3Bh to 67 characters: error 3 (%04X), nothing changes (%s)", r.ax, vfs.cwd().c_str());
+    CHECK(dos_chdir(m.rt, d67, /*select_drive=*/true) == -int(doserr::kPathNotFound) && vfs.cwd() == d66,
+          "dos_chdir (DlgDirList's) refuses it too");
+    r = chdir("..");
+    CHECK(!r.cf && vfs.cwd() == d66.substr(0, d66.find_last_of('\\')), "AH=3Bh ..: %s", vfs.cwd().c_str());
+    for (const char* bad : {"C:\\AFTERDRK\\NOSUCH", "C:\\AFTERDRK\\SUB\\X.TXT", "C:\\AFTERDRK\\S*", ""}) {
+      std::string before = vfs.cwd();
+      r = chdir(bad);
+      CHECK(r.cf && r.ax == doserr::kPathNotFound && vfs.cwd() == before, "AH=3Bh \"%s\": error 3 (%04X)", bad, r.ax);
+    }
+    // Vfs::set_cwd (Win32's SetCurrentDirectory) takes existing directories
+    // only (it took any path below a mount that was not a file).
+    std::string before = vfs.cwd();
+    CHECK(!vfs.set_cwd("C:\\AFTERDRK\\NOSUCH") && !vfs.set_cwd("C:\\AFTERDRK\\SUB\\X.TXT") && vfs.cwd() == before &&
+              vfs.set_cwd("C:\\AFTERDRK") && vfs.cwd() == "C:\\AFTERDRK",
+          "set_cwd: only an existing directory (%s)", vfs.cwd().c_str());
+  }
+  remove_deep_dir(dir);
+  DeleteFileA((dir + "\\SUB\\X.TXT").c_str());
+  RemoveDirectoryA((dir + "\\SUB").c_str());
+  RemoveDirectoryA(dir.c_str());
+}
+
 int run_unit() {
   test_template_converter();
   test_message_table();
@@ -1415,6 +2781,24 @@ int run_unit() {
   test_seeds();
   test_system_bitmaps();
   test_frame_time();
+  test_temp_files();
+  test_resources();
+  test_dib_driver();
+  test_dib_translation();
+  test_mono_dib_targets();
+  test_gdi_additions();
+  test_window_queries();
+  test_wsprintf_bad_pointer();
+  test_choosefont();
+  test_wing_signature();
+  test_resident_modules();
+  test_int2f_vxd();
+  test_dispatch_guest();
+  test_intermission_seeds();
+  test_after_dark2_seeds();
+  test_toggle_keys();
+  test_dir_list_drives();
+  test_dos_drives();
   printf("%d/%d checks passed\n", checks - failures, checks);
   return failures ? 1 : 0;
 }

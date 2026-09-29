@@ -2,6 +2,8 @@
 // import.json records (both versions) when it lists, catalogues or recovers
 // installed packages. The library does not depend on phosg (the tests use
 // phosg to check the importer's output independently), so this is its own.
+// It also holds json_escape, the string escaping those records are written
+// with.
 #pragma once
 
 #include <cstdint>
@@ -39,5 +41,11 @@ struct JsonValue {
 // nullopt when `text` is not one complete JSON value (trailing whitespace
 // allowed). Nesting deeper than 64 levels is refused.
 std::optional<JsonValue> parse_json(std::string_view text);
+
+// The inside of a JSON string for `s` (import.json's): '"', '\\' and the C0
+// controls escaped, everything else as it is. The result is UTF-8 whatever
+// `s` holds: a byte that starts no well-formed UTF-8 sequence is written as
+// U+FFFD (winutil.h to_valid_utf8), so a record always reads as UTF-8 JSON.
+std::string json_escape(std::string_view s);
 
 }  // namespace adw::import

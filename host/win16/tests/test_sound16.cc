@@ -10,10 +10,24 @@
 //     pause/reset/close errors, MM_WOM_* to a window and to a function;
 //   * the mciSendString grammar, MM_MCINOTIFY at a song's end, dispatched by
 //     the lane's pump; SUPERSEDED/ABORTED before a command's own notify;
-//   * CALLBACK_FUNCTION delivered at the next API call, never re-entrantly;
+//   * CALLBACK_FUNCTION delivered at the next API call, never re-entrantly; a
+//     procedure that answers each MM_MOM_DONE/MM_WOM_DONE with another request
+//     takes one step per delivery point (ADMIPS=0, a 1.1 s late one);
+//   * midiOut's raw port: open (one client, the mapper or device 0), short,
+//     long (MIDIHDR flags), reset, close, MM_MOM_* to a window and to a
+//     function, patch caching refused; honest failures without an engine;
+//   * multimedia timer events: periodic and one-shot calls at their periods,
+//     missed periods caught up (at most 250 ms of them), kill, the 16-event
+//     table, re-entrancy, a one-shot set again from its own procedure keeping
+//     its schedule, the MIDI a procedure sends dated at its periods, no engine
+//     needed, determinism;
 //   * the MCISEQ.DRV / TOOLHELP gates;
 //   * the real engine (adw/core/audio.h make_engine): a synchronous sound's
-//     charged time, MS-ADPCM, and a real song's MM_MCINOTIFY.
+//     charged time, MS-ADPCM, a real song's MM_MCINOTIFY, a timer-driven
+//     sequencer's notes in the .mid log (plus what 250 callbacks a virtual
+//     second cost the host), also in the ne16 lane's order (frames of work
+//     without a call, the engine rendered up to the next due point), and a
+//     timer procedure's `play … to` reckoned from the song's real start.
 // A scripted engine (FakeEngine) stands in for most cases, so the lane's side
 // is checked against exact, hand-computed times.
 #include <windows.h>
@@ -340,6 +354,20 @@ class FakeEngine final : public audio::Engine {
     songs.erase(it);
     calls.push_back("close_song");
   }
+  // Raw MIDI: every call, with the time passed and the time the engine took
+  // (never earlier than the latest seen, as the real one).
+  struct Midi {
+    std::string what;  // "short", "long", "reset"
+    uint32_t msg = 0;
+    std::vector<uint8_t> bytes;
+    uint64_t asked = 0, t = 0;
+  };
+  std::vector<Midi> midi;
+  void midi_short(uint32_t msg, audio::Time t) override { midi.push_back({"short", msg, {}, t, T(t)}); }
+  void midi_long(std::span<const uint8_t> b, audio::Time t) override {
+    midi.push_back({"long", 0, std::vector<uint8_t>(b.begin(), b.end()), t, T(t)});
+  }
+  void midi_reset(audio::Time t) override { midi.push_back({"reset", 0, {}, t, T(t)}); }
   void set_bus_gain(audio::Bus b, audio::Gain g, audio::Time t) override {
     T(t);
     bus[int(b)] = g;
@@ -391,16 +419,20 @@ struct Rig {
   VirtualClock clock{VirtualClock::Mode::fixed_step, 1000};
   Runtime16 rt;
   FakeEngine fake;
-  explicit Rig(bool enabled = true, bool sound_device = true, audio::Engine* engine = nullptr)
-      : rt(options(sound_device), clock), fake(enabled) {
+  // insns_per_us 0: no modeled instruction time, so peek_us() is the frame
+  // grid exactly and times can be checked to the µs.
+  explicit Rig(bool enabled = true, bool sound_device = true, audio::Engine* engine = nullptr,
+               uint32_t insns_per_us = 100)
+      : rt(options(sound_device, insns_per_us), clock), fake(enabled) {
     clock.set_read_step_us(0);
     clock.begin_frame();
     register_all16(rt);
     attach_audio16(rt, engine ? engine : &fake);
   }
-  static Runtime16Options options(bool sound_device) {
+  static Runtime16Options options(bool sound_device, uint32_t insns_per_us = 100) {
     Runtime16Options o;
     o.sound_device = sound_device;
+    o.insns_per_us = insns_per_us;
     return o;
   }
   uint32_t api(const char* module, const char* name, std::initializer_list<Arg16> args) {
@@ -574,8 +606,19 @@ void test_disabled() {
     rt.write_bytes(buf + 256, ima.data(), ima.size());
     CHECK((api("waveOutOpen", {l16(0), w16(0), l16(buf + 256), l16(0), l16(0), l16(1)}) & 0xFFFF) == 0,
           "pass %d: a format query succeeds as it always did", pass);
-    CHECK(!rt.shims().find_name("MMSYSTEM", "waveOutWrite")->fn && !rt.shims().find_name("MMSYSTEM", "midiOutOpen")->fn,
-          "pass %d: waveOutWrite/midiOutOpen stay unimplemented", pass);
+    CHECK(!rt.shims().find_name("MMSYSTEM", "waveOutWrite")->fn, "pass %d: waveOutWrite stays unimplemented", pass);
+    // No MIDI device: midiOutOpen fails honestly and zeroes the handle (a
+    // signature-only one returned 0 without writing it); no handle is valid.
+    rt.wr16(buf, 0x1234);
+    CHECK((api("midiOutOpen", {l16(buf), w16(0xFFFF), l16(0), l16(0), l16(0)}) & 0xFFFF) == 6 && rt.rd16(buf) == 0,
+          "pass %d: midiOutOpen(MIDI_MAPPER) = MMSYSERR_NODRIVER, handle 0", pass);
+    rt.wr16(buf, 0x1234);
+    CHECK((api("midiOutOpen", {l16(buf), w16(0), l16(0), l16(0), l16(0)}) & 0xFFFF) == 2 && rt.rd16(buf) == 0,
+          "pass %d: midiOutOpen(0) = MMSYSERR_BADDEVICEID, handle 0", pass);
+    CHECK((api("midiOutShortMsg", {w16(0xE000), l16(0x00403C90)}) & 0xFFFF) == 5 &&
+              (api("midiOutReset", {w16(0xE000)}) & 0xFFFF) == 5 && (api("midiOutClose", {w16(0xE000)}) & 0xFFFF) == 5,
+          "pass %d: every midiOut handle is invalid", pass);
+    CHECK(off.midi.empty(), "pass %d: the engine hears nothing", pass);
     uint16_t err = 0;
     CHECK(rt.modules().load("MCISEQ.DRV", &err) == nullptr, "pass %d: no MCISEQ.DRV", pass);
     Module16* mm = rt.modules().load("MMSYSTEM.DLL", &err);
@@ -637,9 +680,7 @@ void test_devices() {
             g.api16("MMSYSTEM", "auxGetVolume", {w16(0), l16(buf)}) == 0 && g.rt.rd32(buf) == 0x11112222 &&
             g.fake.bus[1] == audio::gain_from_mm(0x20003000),
         "aux 0 (CD) is stored and moves no bus");
-  CHECK(g.api16("MMSYSTEM", "midiOutOpen", {l16(buf), w16(0), l16(0), l16(0), l16(0)}) == 8 &&
-            g.api16("MMSYSTEM", "midiOutShortMsg", {w16(1), l16(0x90)}) == 8,
-        "the rest of midiOut: MMSYSERR_NOTSUPPORTED");
+  CHECK(g.api16("MMSYSTEM", "midiOutShortMsg", {w16(1), l16(0x90)}) == 5, "midiOutShortMsg on no handle: INVALHANDLE");
 
   // ADSOUNDDEV=0: no wave device, sound on or off; the MIDI device stays.
   Rig n(true, false);
@@ -952,6 +993,526 @@ void test_wom_function() {
   CHECK(r.size() == 4 && r[3][0] == 0x3BC, "WOM_CLOSE after the DONEs");
 }
 
+// ---- midiOut: the raw port ----------------------------------------------------------------------------------
+
+void make_midi_header(Rig& g, uint32_t hdr, uint32_t data, uint32_t bytes) {
+  std::vector<uint8_t> z(28, 0);
+  g.rt.write_bytes(hdr, z.data(), z.size());
+  g.rt.wr32(hdr, data);
+  g.rt.wr32(hdr + 4, bytes);
+}
+
+std::vector<const FakeEngine::Midi*> midi_calls(const FakeEngine& f, const char* what) {
+  std::vector<const FakeEngine::Midi*> v;
+  for (const FakeEngine::Midi& m : f.midi) {
+    if (m.what == what) v.push_back(&m);
+  }
+  return v;
+}
+
+void test_midi_out() {
+  Rig g(true, true, nullptr, 0);
+  uint16_t rec = g.data(512);
+  uint16_t hwnd = make_window(g, rec);
+  uint32_t mem = uint32_t(g.data(0x1000)) << 16;
+  uint32_t phmo = mem, idp = mem + 0x10, hdr = mem + 0x40, data = mem + 0x100;
+  auto open = [&](uint32_t p, uint16_t dev, uint32_t cb, uint32_t flags) {
+    return g.api16("MMSYSTEM", "midiOutOpen", {l16(p), w16(dev), l16(cb), l16(0), l16(flags)});
+  };
+  // Refusals, each leaving the handle zeroed.
+  g.rt.wr16(phmo, 0x1111);
+  CHECK(open(phmo, 1, 0, 0) == 2 && g.rt.rd16(phmo) == 0, "device 1: MMSYSERR_BADDEVICEID");
+  CHECK(open(phmo, 0xFFFF, 0, 0x00040000) == 10, "an unknown callback type: MMSYSERR_INVALFLAG");
+  CHECK(open(0, 0xFFFF, 0, 0) == 11, "no handle pointer: MMSYSERR_INVALPARAM");
+  CHECK(open(phmo, 0xFFFF, 0x1234, 0x00010000) == 11, "CALLBACK_WINDOW to no window: MMSYSERR_INVALPARAM");
+  CHECK(open(phmo, 0xFFFF, 0, 0x00030000) == 11, "CALLBACK_FUNCTION NULL: MMSYSERR_INVALPARAM");
+  // SWSE's open is the mapper's with CALLBACK_NULL; here a window callback, to see MM_MOM_*.
+  CHECK(open(phmo, 0xFFFF, hwnd, 0x00010000) == 0, "midiOutOpen(MIDI_MAPPER, CALLBACK_WINDOW)");
+  uint16_t h = g.rt.rd16(phmo);
+  CHECK(h >= 0xE000 && (h & 3) == 0, "a handle (%04X)", h);
+  g.rt.wr16(mem + 2, 0x2222);
+  CHECK(open(mem + 2, 0, 0, 0) == 4 && g.rt.rd16(mem + 2) == 0, "one client at a time: MMSYSERR_ALLOCATED");
+  CHECK(g.api16("MMSYSTEM", "midiOutGetID", {w16(h), l16(idp)}) == 0 && g.rt.rd16(idp) == 0xFFFF,
+        "midiOutGetID: MIDI_MAPPER, as opened");
+  CHECK(g.api16("MMSYSTEM", "midiOutGetID", {w16(h), l16(0)}) == 11, "midiOutGetID(NULL): MMSYSERR_INVALPARAM");
+  audio16_pump(g.rt);
+  std::vector<Rec> r = window_records(g, rec);
+  CHECK(r.size() == 1 && r[0].msg == 0x3C7 && r[0].wp == h && r[0].lp == 0, "MM_MOM_OPEN(hmo, 0): %s",
+        records_text(r).c_str());
+  // Short messages reach the engine as they are, dated now.
+  g.to(5000);
+  CHECK(g.api16("MMSYSTEM", "midiOutShortMsg", {w16(h), l16(0x00643C90)}) == 0, "midiOutShortMsg");
+  CHECK(g.api16("MMSYSTEM", "midiOutShortMsg", {w16(h), l16(0x0000503E)}) == 0, "running status goes through");
+  auto sh = midi_calls(g.fake, "short");
+  CHECK(sh.size() == 2 && sh[0]->msg == 0x00643C90 && sh[0]->asked == 5000 && sh[1]->msg == 0x0000503E,
+        "the engine got both, at 5 ms (%zu)", sh.size());
+  // Long messages: the header must be prepared; the buffer is taken at once.
+  const std::vector<uint8_t> sysex = {0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7};
+  g.rt.write_bytes(data, sysex.data(), sysex.size());
+  make_midi_header(g, hdr, data, uint32_t(sysex.size()));
+  CHECK(g.api16("MMSYSTEM", "midiOutLongMsg", {w16(h), l16(hdr), w16(28)}) == 64, "unprepared: MIDIERR_UNPREPARED");
+  CHECK(g.api16("MMSYSTEM", "midiOutPrepareHeader", {w16(h), l16(hdr), w16(27)}) == 11,
+        "a MIDIHDR shorter than 28 bytes: MMSYSERR_INVALPARAM");
+  g.rt.wr32(hdr, 0);
+  CHECK(g.api16("MMSYSTEM", "midiOutPrepareHeader", {w16(h), l16(hdr), w16(28)}) == 11, "no data: MMSYSERR_INVALPARAM");
+  g.rt.wr32(hdr, data);
+  CHECK(g.api16("MMSYSTEM", "midiOutPrepareHeader", {w16(h), l16(hdr), w16(28)}) == 0 &&
+            g.rt.rd32(hdr + 16) == 0x02,
+        "prepared: MHDR_PREPARED");
+  g.to(6000);
+  CHECK(g.api16("MMSYSTEM", "midiOutLongMsg", {w16(h), l16(hdr), w16(28)}) == 0 && g.rt.rd32(hdr + 16) == 0x03,
+        "sent: MHDR_DONE when the call returns (flags %X)", g.rt.rd32(hdr + 16));
+  auto lg = midi_calls(g.fake, "long");
+  CHECK(lg.size() == 1 && lg[0]->bytes == sysex && lg[0]->asked == 6000, "the engine got the SysEx at 6 ms");
+  g.rt.wr8(data, 0x00);
+  CHECK(lg.size() == 1 && lg[0]->bytes[0] == 0xF0, "copied at the call");
+  CHECK(window_records(g, rec).size() == 1, "MM_MOM_DONE waits for a delivery point");
+  audio16_pump(g.rt);
+  r = window_records(g, rec);
+  CHECK(r.size() == 2 && r[1].msg == 0x3C9 && r[1].wp == h && r[1].lp == hdr, "MM_MOM_DONE(hmo, lpMidiHdr): %s",
+        records_text(r).c_str());
+  CHECK(g.api16("MMSYSTEM", "midiOutUnprepareHeader", {w16(h), l16(hdr), w16(28)}) == 0 && g.rt.rd32(hdr + 16) == 0x01,
+        "unprepared again");
+  g.rt.wr32(hdr + 16, 0x06);
+  CHECK(g.api16("MMSYSTEM", "midiOutUnprepareHeader", {w16(h), l16(hdr), w16(28)}) == 65 &&
+            g.api16("MMSYSTEM", "midiOutLongMsg", {w16(h), l16(hdr), w16(28)}) == 65,
+        "MHDR_INQUEUE: MIDIERR_STILLPLAYING");
+  // No patch caching (the caps have no MIDICAPS_CACHE), no driver messages.
+  CHECK(g.api16("MMSYSTEM", "midiOutCachePatches", {w16(h), w16(0), l16(data), w16(2)}) == 8 &&
+            g.api16("MMSYSTEM", "midiOutCacheDrumPatches", {w16(h), w16(0), l16(data), w16(2)}) == 8,
+        "patch caching: MMSYSERR_NOTSUPPORTED");
+  CHECK((g.api("MMSYSTEM", "midiOutMessage", {w16(h), w16(0x800), l16(0), l16(0)}) & 0xFFFF) == 8,
+        "midiOutMessage: MMSYSERR_NOTSUPPORTED");
+  // Reset, close.
+  g.to(7000);
+  CHECK(g.api16("MMSYSTEM", "midiOutReset", {w16(h)}) == 0, "midiOutReset");
+  auto rs = midi_calls(g.fake, "reset");
+  CHECK(rs.size() == 1 && rs[0]->asked == 7000, "the engine resets at 7 ms");
+  CHECK(g.api16("MMSYSTEM", "midiOutClose", {w16(h)}) == 0, "midiOutClose");
+  audio16_pump(g.rt);
+  r = window_records(g, rec);
+  CHECK(r.size() == 3 && r[2].msg == 0x3C8 && r[2].wp == h, "MM_MOM_CLOSE last: %s", records_text(r).c_str());
+  CHECK(g.api16("MMSYSTEM", "midiOutClose", {w16(h)}) == 5 &&
+            g.api16("MMSYSTEM", "midiOutShortMsg", {w16(h), l16(0x90)}) == 5 &&
+            g.api16("MMSYSTEM", "midiOutCachePatches", {w16(h), w16(0), l16(data), w16(2)}) == 5,
+        "a closed handle: MMSYSERR_INVALHANDLE");
+  // Free again: device 0 with no callback.
+  CHECK(open(phmo, 0, 0, 0) == 0 && g.api16("MMSYSTEM", "midiOutGetID", {w16(g.rt.rd16(phmo)), l16(idp)}) == 0 &&
+            g.rt.rd16(idp) == 0,
+        "reopened as device 0");
+  CHECK(g.fake.midi.size() == 4, "nothing else reached the engine (%zu)", g.fake.midi.size());
+}
+
+// A DriverCallback(h, msg, dwInstance, dwParam1, dwParam2), FAR PASCAL, that
+// answers every `msg` notification by sending its buffer again,
+// fn(h, dwParam1, size) — midiOutLongMsg(hmo, lpMidiHdr, 28) from
+// MM_MOM_DONE, waveOutWrite(hwo, lpWaveHdr, 32) from MM_WOM_DONE: the usual
+// Win16 way to stream buffers. DATA:0 counts its calls; past `limit` it stops
+// answering, so a runaway chain ends there instead of hanging the test.
+std::vector<uint8_t> resender(uint16_t data, uint32_t fn, uint16_t msg, uint8_t size, uint16_t limit) {
+  std::vector<uint8_t> v = {0x55, 0x8B, 0xEC, 0x06,                              // push bp; mov bp,sp; push es
+                            0xB8, uint8_t(data), uint8_t(data >> 8), 0x8E, 0xC0,  // mov ax,DATA; mov es,ax
+                            0x26, 0xFF, 0x06, 0x00, 0x00,                        // inc word es:[0]
+                            0x26, 0x81, 0x3E, 0x00, 0x00, uint8_t(limit), uint8_t(limit >> 8),  // cmp word es:[0],limit
+                            0x77, 0x00,                                          // ja done
+                            0x81, 0x7E, 0x12, uint8_t(msg), uint8_t(msg >> 8),   // cmp word [bp+12h],msg
+                            0x75, 0x00,                                          // jne done
+                            0xFF, 0x76, 0x14,                                    // push h
+                            0xFF, 0x76, 0x0C, 0xFF, 0x76, 0x0A,                  // push dwParam1 (the header)
+                            0x6A, size,                                          // push size
+                            0x9A, uint8_t(fn), uint8_t(fn >> 8), uint8_t(fn >> 16), uint8_t(fn >> 24)};
+  const size_t ja = 22, jne = 29;
+  v[ja] = uint8_t(v.size() - (ja + 1));
+  v[jne] = uint8_t(v.size() - (jne + 1));
+  append(v, {0x07, 0x5D, 0xCA, 0x10, 0x00});  // done: pop es; pop bp; retf 10h
+  return v;
+}
+
+// Guest work with no API call: `outer` × 65535 LOOP iterations (15: about
+// 10 ms at 100 instructions a µs).
+std::vector<uint8_t> busy_work(uint8_t outer) {
+  return {0xB3, outer,                // mov bl,outer
+          0xB9, 0xFF, 0xFF,           // again: mov cx,0FFFFh
+          0xE2, 0xFE,                 // loop $
+          0xFE, 0xCB, 0x75, 0xF7,     // dec bl; jnz again
+          0xCB};                      // retf
+}
+
+// A procedure that answers each notification with a request whose own
+// notification is due at once takes one step per delivery point: what it
+// causes waits for a later one, whatever its date, so a delivery ends even
+// when virtual time stands still inside it (ADMIPS=0) or the delivery point
+// comes more than the 1 s cap on uncharged instructions late.
+void test_resend_chain() {
+  for (uint32_t ips : {0u, 100u}) {
+    // midiOutLongMsg from MM_MOM_DONE.
+    Rig g(true, true, nullptr, ips);
+    uint16_t cnt = g.data(64);
+    auto calls = [&] { return int(g.rt.rd16(uint32_t(cnt) << 16)); };
+    uint32_t lm = g.rt.thunk_far(*g.rt.shims().find_name("MMSYSTEM", "midiOutLongMsg"));
+    uint16_t cs = g.code(resender(cnt, lm, 0x3C9, 28, 100));
+    uint32_t mem = uint32_t(g.data(0x400)) << 16;
+    uint32_t phmo = mem, hdr = mem + 0x40, data = mem + 0x100;
+    CHECK(g.api16("MMSYSTEM", "midiOutOpen", {l16(phmo), w16(0xFFFF), l16(uint32_t(cs) << 16), l16(0), l16(0x00030000)}) ==
+              0,
+          "ips %u: midiOutOpen(CALLBACK_FUNCTION)", ips);
+    uint16_t h = g.rt.rd16(phmo);
+    g.rt.wr8(data, 0x90), g.rt.wr8(data + 1, 60), g.rt.wr8(data + 2, 64);
+    make_midi_header(g, hdr, data, 3);
+    g.api("MMSYSTEM", "midiOutPrepareHeader", {w16(h), l16(hdr), w16(28)});  // MM_MOM_OPEN called here
+    g.to(10000);
+    g.api("MMSYSTEM", "midiOutLongMsg", {w16(h), l16(hdr), w16(28)});
+    const int c0 = calls();
+    g.to(10000 + 1100000);  // 1.1 s late, at the lane's pump
+    const uint64_t t1 = g.now();
+    audio16_pump(g.rt);
+    CHECK(calls() == c0 + 1, "ips %u: one MM_MOM_DONE call at a delivery point 1.1 s late; the answer's waits (%d)",
+          ips, calls() - c0);
+    g.tick();
+    CHECK(calls() == c0 + 1 + (ips ? 1 : 0), "ips %u: the next API call is a later delivery point only if time moved (%d)",
+          ips, calls() - c0);
+    for (int k = 0; k < 3; k++) {
+      g.to(g.now() + 1000);
+      g.tick();
+    }
+    CHECK(calls() == c0 + 4 + (ips ? 1 : 0), "ips %u: one step per delivery point (%d)", ips, calls() - c0);
+    // What each step sends is dated at its own call: the first answer at the
+    // MM_MOM_DONE's time, the next ones at the delivery points after it.
+    auto lg = midi_calls(g.fake, "long");
+    CHECK(lg.size() >= 3 && lg[1]->asked >= 10000 && lg[1]->asked < 10100 && lg[2]->asked > t1,
+          "ips %u: dated %llu, then %llu", ips, lg.size() >= 3 ? (unsigned long long)lg[1]->asked : 0ull,
+          lg.size() >= 3 ? (unsigned long long)lg[2]->asked : 0ull);
+  }
+  for (uint32_t ips : {0u, 100u}) {
+    // The same, empty, WAVEHDR written again from MM_WOM_DONE: the stream
+    // finishes it at once (the real engine).
+    audio::Config cfg;
+    cfg.guest_sound = true;
+    std::unique_ptr<audio::Engine> engine = audio::make_engine(cfg);
+    Rig g(true, true, engine.get(), ips);
+    uint16_t cnt = g.data(64);
+    auto calls = [&] { return int(g.rt.rd16(uint32_t(cnt) << 16)); };
+    uint32_t wr = g.rt.thunk_far(*g.rt.shims().find_name("MMSYSTEM", "waveOutWrite"));
+    uint16_t cs = g.code(resender(cnt, wr, 0x3BD, 32, 100));
+    uint32_t mem = uint32_t(g.data(0x400)) << 16;
+    uint32_t phwo = mem, fmt = mem + 0x20, hdr = mem + 0x40, data = mem + 0x100;
+    std::vector<uint8_t> f = audio::waveformat_bytes(audio::pcm_format(11025, 1, 8));
+    g.rt.write_bytes(fmt, f.data(), f.size());
+    CHECK(g.api16("MMSYSTEM", "waveOutOpen",
+                  {l16(phwo), w16(0), l16(fmt), l16(uint32_t(cs) << 16), l16(0), l16(0x00030000)}) == 0,
+          "ips %u: waveOutOpen(CALLBACK_FUNCTION), real engine", ips);
+    uint16_t h = g.rt.rd16(phwo);
+    make_header(g, hdr, data, 0);  // an empty buffer
+    g.api("MMSYSTEM", "waveOutPrepareHeader", {w16(h), l16(hdr), w16(32)});  // MM_WOM_OPEN called here
+    g.to(10000);
+    g.api("MMSYSTEM", "waveOutWrite", {w16(h), l16(hdr), w16(32)});
+    const int c0 = calls();
+    g.to(10000 + 1100000);
+    audio16_pump(g.rt);
+    CHECK(calls() == c0 + 1, "ips %u: one MM_WOM_DONE call at a late delivery point (%d)", ips, calls() - c0);
+    for (int k = 0; k < 3; k++) {
+      g.to(g.now() + 1000);
+      audio16_pump(g.rt);
+    }
+    CHECK(calls() == c0 + 4, "ips %u: then one per delivery point (%d)", ips, calls() - c0);
+    CHECK((g.rt.rd32(hdr + 16) & 0x11) == 0x01, "ips %u: the header written last is done already (%X)", ips,
+          g.rt.rd32(hdr + 16));
+    engine->shutdown(g.now());
+  }
+}
+
+// MM_MOM_* to a CALLBACK_FUNCTION: at the first API call at or after them, in order.
+void test_midi_function() {
+  Rig g;
+  uint16_t rec = g.data(512);
+  uint32_t tgt = g.rt.thunk_far(*g.rt.shims().find_name("MMSYSTEM", "timeGetTime"));
+  uint16_t cs = g.code(function_recorder(rec, tgt));
+  uint32_t mem = uint32_t(g.data(0x400)) << 16;
+  uint32_t phmo = mem, hdr = mem + 0x40, data = mem + 0x100;
+  auto recs = [&] {
+    std::vector<std::array<uint16_t, 4>> out;
+    uint32_t base = uint32_t(rec) << 16;
+    for (uint16_t i = 0; i < g.rt.rd16(base); i++) {
+      uint32_t e = base + 8 + 8u * i;
+      out.push_back({g.rt.rd16(e), g.rt.rd16(e + 2), g.rt.rd16(e + 4), g.rt.rd16(e + 6)});
+    }
+    return out;
+  };
+  CHECK(g.api16("MMSYSTEM", "midiOutOpen", {l16(phmo), w16(0xFFFF), l16(uint32_t(cs) << 16), l16(0x55), l16(0x00030000)}) ==
+            0,
+        "CALLBACK_FUNCTION open");
+  uint16_t h = g.rt.rd16(phmo);
+  CHECK(recs().empty(), "nothing is called inside midiOutOpen");
+  g.rt.wr8(data, 0xF8);
+  make_midi_header(g, hdr, data, 1);
+  g.api("MMSYSTEM", "midiOutPrepareHeader", {w16(h), l16(hdr), w16(28)});
+  g.api("MMSYSTEM", "midiOutLongMsg", {w16(h), l16(hdr), w16(28)});
+  g.api("MMSYSTEM", "midiOutClose", {w16(h)});
+  auto r = recs();
+  // MOM_OPEN came due at the open and went at the next call (PrepareHeader),
+  // MOM_DONE at the call after LongMsg (Close); MOM_CLOSE waits for the next.
+  CHECK(r.size() == 2 && r[0][0] == 0x3C7 && r[0][1] == h && r[1][0] == 0x3C9 && r[1][2] == uint16_t(hdr),
+        "MOM_OPEN, then MOM_DONE(lpMidiHdr), each at the first API call after it (%zu)", r.size());
+  g.tick();
+  r = recs();
+  CHECK(r.size() == 3 && r[2][0] == 0x3C8, "then MOM_CLOSE (%zu)", r.size());
+  bool flat = true;
+  for (const auto& x : r) flat &= x[3] == 1;
+  CHECK(flat, "never re-entered");
+}
+
+// ---- multimedia timer events --------------------------------------------------------------------------------
+
+// A TimeProc(wID, wMsg, dwUser, dw1, dw2), FAR PASCAL — MEMMIDI's
+// MIDITIMERPROC shape (retf 10h). DATA:2 counts the nesting depth; entries
+// from DATA:8 hold wID, wMsg, dwUser's low word and the depth at entry. With
+// `midi` it sends midiOutShortMsg(DATA:4, 0x00403C90) — an API call, so a
+// delivery point where nothing may be delivered re-entrantly; with `rearm`
+// it sets itself again, once, DATA:6 ms on (timeSetEvent, TIME_ONESHOT).
+std::vector<uint8_t> timeproc_recorder(uint16_t data, uint32_t midi = 0, uint32_t rearm = 0) {
+  const uint8_t dl = uint8_t(data), dh = uint8_t(data >> 8);
+  auto far_call = [](std::vector<uint8_t>& v, uint32_t fp) {
+    append(v, {0x9A, uint8_t(fp), uint8_t(fp >> 8), uint8_t(fp >> 16), uint8_t(fp >> 24)});
+  };
+  std::vector<uint8_t> v = {0x55, 0x8B, 0xEC, 0x06, 0x53, 0xB8, dl, dh, 0x8E, 0xC0,  // push bp.. mov es,DATA
+                            0x26, 0xFF, 0x06, 0x02, 0x00,                         // inc word es:[2] (depth)
+                            0x26, 0x8B, 0x1E, 0x00, 0x00,                         // mov bx,es:[0]
+                            0xC1, 0xE3, 0x03, 0x83, 0xC3, 0x08,                   // shl bx,3; add bx,8
+                            0x8B, 0x46, 0x14, 0x26, 0x89, 0x07,                   // wID
+                            0x8B, 0x46, 0x12, 0x26, 0x89, 0x47, 0x02,             // wMsg
+                            0x8B, 0x46, 0x0E, 0x26, 0x89, 0x47, 0x04,             // dwUser lo
+                            0x26, 0xA1, 0x02, 0x00, 0x26, 0x89, 0x47, 0x06,       // depth
+                            0x26, 0xFF, 0x06, 0x00, 0x00};                        // inc word es:[0]
+  if (midi) {
+    append(v, {0x26, 0xFF, 0x36, 0x04, 0x00,  // push word es:[4] (hmo)
+               0x68, 0x40, 0x00,              // push 0040h
+               0x68, 0x90, 0x3C});            // push 3C90h: note on, key 60, velocity 64
+    far_call(v, midi);
+    append(v, {0xB8, dl, dh, 0x8E, 0xC0});
+  }
+  if (rearm) {
+    append(v, {0x26, 0xFF, 0x36, 0x06, 0x00,  // push word es:[6] (wDelay)
+               0x6A, 0x00,                    // wResolution
+               0x0E, 0x6A, 0x00,              // lpFunction = CS:0000 (this procedure)
+               0xFF, 0x76, 0x10, 0xFF, 0x76, 0x0E,  // dwUser
+               0x6A, 0x00});                  // TIME_ONESHOT
+    far_call(v, rearm);
+    append(v, {0xB8, dl, dh, 0x8E, 0xC0});
+  }
+  append(v, {0x26, 0xFF, 0x0E, 0x02, 0x00,  // dec word es:[2]
+             0x5B, 0x07, 0x5D, 0xCA, 0x10, 0x00});
+  return v;
+}
+
+struct TimerRec {
+  uint16_t id, msg, user, depth;
+};
+std::vector<TimerRec> timer_records(Rig& g, uint16_t data) {
+  std::vector<TimerRec> out;
+  uint32_t base = uint32_t(data) << 16;
+  for (uint16_t i = 0; i < g.rt.rd16(base); i++) {
+    uint32_t e = base + 8 + 8u * i;
+    out.push_back({g.rt.rd16(e), g.rt.rd16(e + 2), g.rt.rd16(e + 4), g.rt.rd16(e + 6)});
+  }
+  return out;
+}
+
+uint16_t set_timer(Rig& g, uint16_t delay, uint16_t cs, uint32_t user, bool periodic) {
+  return g.api16("MMSYSTEM", "timeSetEvent", {w16(delay), w16(delay), l16(uint32_t(cs) << 16), l16(user), w16(periodic)});
+}
+
+void test_timers() {
+  // Exact times: no modeled instruction time, so peek_us() is the 1 ms frame grid.
+  Rig g(true, true, nullptr, 0);
+  uint16_t rec = g.data(4096);
+  uint32_t midi = g.rt.thunk_far(*g.rt.shims().find_name("MMSYSTEM", "midiOutShortMsg"));
+  uint16_t cs = g.code(timeproc_recorder(rec, midi));
+  uint32_t mem = uint32_t(g.data(0x100)) << 16;
+  CHECK(g.api16("MMSYSTEM", "midiOutOpen", {l16(mem), w16(0xFFFF), l16(0), l16(0), l16(0)}) == 0, "SWSE's midiOutOpen");
+  g.rt.wr16((uint32_t(rec) << 16) + 4, g.rt.rd16(mem));
+  // The timer's caps and periods.
+  CHECK(g.api16("MMSYSTEM", "timeGetDevCaps", {l16(mem + 8), w16(4)}) == 0 && g.rt.rd16(mem + 8) == 1 &&
+            g.rt.rd16(mem + 10) == 0xFFFF,
+        "timeGetDevCaps: 1 .. 65535 ms");
+  CHECK(g.api16("MMSYSTEM", "timeGetDevCaps", {l16(mem + 8), w16(2)}) == 129 &&
+            g.api16("MMSYSTEM", "timeGetDevCaps", {l16(0), w16(4)}) == 129,
+        "a short TIMECAPS or none: TIMERR_STRUCT");
+  CHECK(g.api16("MMSYSTEM", "timeBeginPeriod", {w16(4)}) == 0 && g.api16("MMSYSTEM", "timeEndPeriod", {w16(4)}) == 0 &&
+            g.api16("MMSYSTEM", "timeBeginPeriod", {w16(0)}) == 97 && g.api16("MMSYSTEM", "timeEndPeriod", {w16(0)}) == 97,
+        "timeBeginPeriod/timeEndPeriod: TIMERR_NOERROR, 0 ms TIMERR_NOCANDO");
+  CHECK(set_timer(g, 0, cs, 0, true) == 0 &&
+            g.api16("MMSYSTEM", "timeSetEvent", {w16(4), w16(4), l16(0), l16(0), w16(1)}) == 0,
+        "no delay or no procedure: no event");
+  // MEMMIDI's: timeSetEvent(4, 4, MIDITIMERPROC, song, TIME_PERIODIC).
+  g.to(10000);
+  const uint64_t t0 = g.now();
+  uint16_t id = set_timer(g, 4, cs, 0x12345678, true);
+  CHECK(id != 0, "a periodic event (%u)", id);
+  g.to(t0 + 3000);
+  g.tick();
+  CHECK(timer_records(g, rec).empty(), "nothing before its first period");
+  // A delivery point every millisecond: one call per period, 4 ms apart.
+  for (uint64_t ms = 4; ms <= 40; ms++) {
+    g.to(t0 + ms * 1000);
+    g.tick();
+  }
+  auto r = timer_records(g, rec);
+  bool shape = r.size() == 10;
+  for (const TimerRec& x : r) shape &= x.id == id && x.msg == 0 && x.user == 0x5678 && x.depth == 1;
+  CHECK(shape, "TimeProc(wID, 0, dwUser, 0, 0) ten times in 40 ms, never nested (%zu)", r.size());
+  auto sh = midi_calls(g.fake, "short");
+  bool dated = sh.size() == 10;
+  for (size_t k = 0; k < sh.size() && dated; k++) dated = sh[k]->asked == t0 + 4000 * (k + 1) && sh[k]->msg == 0x00403C90;
+  CHECK(dated, "the MIDI it sent is dated at its periods (%zu)", sh.size());
+  // No delivery point for 12 ms, then one: three calls there, in order, their
+  // MIDI still dated on the 4 ms grid.
+  g.to(t0 + 52000);
+  g.tick();
+  r = timer_records(g, rec);
+  sh = midi_calls(g.fake, "short");
+  CHECK(r.size() == 13 && sh.size() == 13 && sh[10]->asked == t0 + 44000 && sh[11]->asked == t0 + 48000 &&
+            sh[12]->asked == t0 + 52000,
+        "missed periods caught up at the next delivery point (%zu)", r.size());
+  // The lane's pump is a delivery point too.
+  g.to(t0 + 56000);
+  audio16_pump(g.rt);
+  CHECK(timer_records(g, rec).size() == 14, "delivered by the pump");
+  // 2 s without a delivery point: 62 periods (250 ms of them) caught up, the
+  // 438 before them dropped; the event keeps its grid.
+  g.to(t0 + 2056000);
+  g.tick();
+  r = timer_records(g, rec);
+  sh = midi_calls(g.fake, "short");
+  CHECK(r.size() == 14 + 62 && sh.size() == r.size() && sh[14]->asked == t0 + 1812000 && sh.back()->asked == t0 + 2056000,
+        "a long stall catches up 250 ms of periods (%zu, first at %llu)", r.size(),
+        (unsigned long long)(sh.size() > 14 ? sh[14]->asked - t0 : 0));
+  Timer16Stats st = timer16_stats(g.rt);
+  CHECK(st.active == 1 && st.calls == 76 && st.dropped == 438, "stats: %zu active, %llu calls, %llu dropped", st.active,
+        (unsigned long long)st.calls, (unsigned long long)st.dropped);
+  // Killed: no more calls; a second kill finds nothing.
+  CHECK(g.api16("MMSYSTEM", "timeKillEvent", {w16(id)}) == 0 && g.api16("MMSYSTEM", "timeKillEvent", {w16(id)}) == 97,
+        "timeKillEvent: TIMERR_NOERROR, then TIMERR_NOCANDO");
+  g.to(t0 + 2100000);
+  g.tick();
+  CHECK(timer_records(g, rec).size() == 76, "no call after the kill");
+  // TIME_ONESHOT: one call, then the event is gone.
+  clear_records(g, rec);
+  uint64_t t1 = g.now();
+  uint16_t one = set_timer(g, 10, cs, 0xABCD, false);
+  CHECK(one != 0 && one != id, "a one-shot event (%u)", one);
+  g.to(t1 + 9000);
+  g.tick();
+  CHECK(timer_records(g, rec).empty(), "not before 10 ms");
+  g.to(t1 + 30000);
+  g.tick();
+  r = timer_records(g, rec);
+  CHECK(r.size() == 1 && r[0].id == one && r[0].user == 0xABCD, "one call (%zu)", r.size());
+  CHECK(g.api16("MMSYSTEM", "timeKillEvent", {w16(one)}) == 97, "a one-shot event is gone once called");
+  // 16 events at most.
+  std::vector<uint16_t> ids;
+  for (int i = 0; i < 17; i++) ids.push_back(set_timer(g, 1000, cs, 0, true));
+  CHECK(std::count(ids.begin(), ids.end(), uint16_t(0)) == 1 && ids[16] == 0, "16 events, the 17th refused");
+  for (uint16_t x : ids) g.api("MMSYSTEM", "timeKillEvent", {w16(x)});
+  CHECK(timer16_stats(g.rt).active == 0, "all killed");
+}
+
+// A one-shot event set again by its own procedure keeps its schedule however
+// late the delivery points come: the procedure's calls are dated from its due time.
+void test_timer_chain() {
+  Rig g(true, true, nullptr, 0);
+  uint16_t rec = g.data(1024);
+  uint32_t set = g.rt.thunk_far(*g.rt.shims().find_name("MMSYSTEM", "timeSetEvent"));
+  uint16_t cs = g.code(timeproc_recorder(rec, 0, set));
+  g.rt.wr16((uint32_t(rec) << 16) + 6, 5);  // 5 ms
+  g.to(1000);
+  uint64_t t0 = g.now();
+  CHECK(set_timer(g, 5, cs, 0x2222, false) != 0, "a one-shot event");
+  g.to(t0 + 17000);
+  g.tick();
+  auto r = timer_records(g, rec);
+  CHECK(r.size() == 3, "due at 5, 10 and 15 ms: three calls at 17 ms (%zu)", r.size());
+  g.to(t0 + 19000);
+  g.tick();
+  CHECK(timer_records(g, rec).size() == 3, "the next is due at 20 ms, not 22");
+  g.to(t0 + 20000);
+  g.tick();
+  r = timer_records(g, rec);
+  bool ok = r.size() == 4;
+  for (const TimerRec& x : r) ok &= x.user == 0x2222 && x.depth == 1;
+  CHECK(ok, "the fourth at 20 ms (%zu)", r.size());
+  CHECK(timer16_stats(g.rt).active == 1, "one event set at a time");
+  // After a long stall such a chain is bounded like a periodic event: a 1 ms
+  // chain 2 s behind catches up 250 ms of calls, not 2000.
+  Rig h(true, true, nullptr, 0);
+  uint16_t rec2 = h.data(4096);
+  uint32_t set2 = h.rt.thunk_far(*h.rt.shims().find_name("MMSYSTEM", "timeSetEvent"));
+  uint16_t cs2 = h.code(timeproc_recorder(rec2, 0, set2));
+  h.rt.wr16((uint32_t(rec2) << 16) + 6, 1);  // 1 ms
+  h.to(1000);
+  uint64_t t1 = h.now();
+  set_timer(h, 1, cs2, 0x3333, false);
+  h.to(t1 + 2000000);
+  h.tick();
+  size_t n = timer_records(h, rec2).size();
+  CHECK(n >= 250 && n <= 252, "a 1 ms chain 2 s behind: %zu calls", n);
+}
+
+// Timer events are the clock's, not sound's: without an enabled engine they
+// still run (sound-off answers otherwise unchanged).
+void test_timers_without_engine() {
+  Rig g(false, true, nullptr, 0);
+  uint16_t rec = g.data(512);
+  uint16_t cs = g.code(timeproc_recorder(rec));
+  CHECK(!audio16_enabled(g.rt) && g.rt.audio_due() == UINT64_MAX, "sound off, nothing due");
+  audio16_pump(g.rt);
+  CHECK(g.api16("MMSYSTEM", "midiOutGetNumDevs", {}) == 0, "still no MIDI device");
+  g.to(2000);
+  uint64_t t0 = g.now();
+  uint16_t id = set_timer(g, 4, cs, 0x0707, true);
+  CHECK(id != 0, "timeSetEvent without an engine");
+  g.to(t0 + 8000);
+  audio16_pump(g.rt);
+  auto r = timer_records(g, rec);
+  CHECK(r.size() == 2 && r[0].user == 0x0707 && r[1].id == id, "two periods, delivered by the pump (%zu)", r.size());
+  g.to(t0 + 12000);
+  g.tick();
+  CHECK(timer_records(g, rec).size() == 3, "and at an API call");
+  CHECK(g.fake.midi.empty() && g.fake.calls.empty(), "the disabled engine is never called");
+  audio16_close(g.rt);
+  g.to(t0 + 40000);
+  g.tick();
+  CHECK(timer_records(g, rec).size() == 3 && timer16_stats(g.rt).active == 0, "the run's end kills the events");
+}
+
+// The same script twice: the same calls, at the same virtual times.
+void test_timer_determinism() {
+  auto run = [] {
+    Rig g;  // with modeled instruction time
+    uint16_t rec = g.data(4096);
+    uint32_t midi = g.rt.thunk_far(*g.rt.shims().find_name("MMSYSTEM", "midiOutShortMsg"));
+    uint16_t cs = g.code(timeproc_recorder(rec, midi));
+    uint32_t mem = uint32_t(g.data(0x40)) << 16;
+    g.api("MMSYSTEM", "midiOutOpen", {l16(mem), w16(0xFFFF), l16(0), l16(0), l16(0)});
+    g.rt.wr16((uint32_t(rec) << 16) + 4, g.rt.rd16(mem));
+    set_timer(g, 4, cs, 1, true);
+    for (int i = 1; i <= 300; i++) {
+      g.to(uint64_t(i) * 1700);
+      if (i % 3) g.tick();
+      else audio16_pump(g.rt);
+    }
+    std::vector<uint64_t> out;
+    for (const auto& m : g.fake.midi) out.push_back(m.asked);
+    return out;
+  };
+  std::vector<uint64_t> a = run(), b = run();
+  CHECK(!a.empty() && a == b, "identical runs (%zu calls)", a.size());
+  // With instructions modeled each call is dated a few µs after its period
+  // (the procedure's own work before it calls, rounded to the µs): 4 ms apart.
+  bool grid = a.size() > 100;
+  for (size_t k = 1; k < a.size() && grid; k++) grid = a[k] - a[k - 1] >= 3998 && a[k] - a[k - 1] <= 4002;
+  CHECK(grid, "4000 us apart");
+}
+
 // ---- MCI -------------------------------------------------------------------------------------------------
 
 void test_mci() {
@@ -1134,6 +1695,243 @@ void test_real_engine() {
   engine->shutdown(g.now());
 }
 
+// The .mid event log's channel messages: (ms, bytes). Format 0, explicit status bytes (AUDIO.md §6.6).
+std::vector<std::pair<uint64_t, std::vector<uint8_t>>> read_mid_log(const std::string& path) {
+  std::vector<std::pair<uint64_t, std::vector<uint8_t>>> out;
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) return out;
+  std::vector<uint8_t> b;
+  for (int ch; (ch = fgetc(f)) != EOF;) b.push_back(uint8_t(ch));
+  fclose(f);
+  size_t i = 22;  // MThd (14) + MTrk header (8)
+  uint64_t ms = 0;
+  auto vlq = [&] {
+    uint32_t v = 0;
+    while (i < b.size()) {
+      uint8_t x = b[i++];
+      v = (v << 7) | (x & 0x7F);
+      if (!(x & 0x80)) break;
+    }
+    return v;
+  };
+  while (i < b.size()) {
+    ms += vlq();
+    if (i >= b.size()) break;
+    uint8_t st = b[i];
+    if (st == 0xFF) {
+      i += 2;
+      i += vlq();
+    } else if (st == 0xF0 || st == 0xF7) {
+      i++;
+      i += vlq();
+    } else {
+      size_t n = (st & 0xF0) == 0xC0 || (st & 0xF0) == 0xD0 ? 2 : 3;
+      if (i + n > b.size()) break;
+      out.push_back({ms, std::vector<uint8_t>(b.begin() + ptrdiff_t(i), b.begin() + ptrdiff_t(i + n))});
+      i += n;
+    }
+  }
+  return out;
+}
+
+// The real engine under a self-sequencing guest: a 4 ms timer procedure that
+// plays a note each period, delivered once per 60 Hz frame (a module that
+// makes no call between frames). The .mid log still has the notes 4 ms apart:
+// the procedure's calls are dated at its periods. Also measures what 250
+// callbacks a virtual second cost the host.
+void test_real_engine_midi() {
+  char tmp[MAX_PATH];
+  GetTempPathA(MAX_PATH, tmp);
+  const std::string wav = std::string(tmp) + "adw_sound16_" + std::to_string(GetCurrentProcessId()) + "_midi.wav";
+  const std::string mid = wav.substr(0, wav.size() - 4) + ".mid";
+  auto frames = [](Rig& g, audio::Engine& e, int from, int to) {
+    for (int f = from; f <= to; f++) {
+      g.to(uint64_t(f) * 16667);
+      audio16_pump(g.rt);
+      e.advance(g.now());
+    }
+  };
+  {
+    audio::Config cfg;
+    cfg.guest_sound = true;
+    cfg.capture_wav = wav;
+    cfg.capture_mid = mid;
+    std::unique_ptr<audio::Engine> engine = audio::make_engine(cfg);
+    Rig g(true, true, engine.get());
+    uint16_t rec = g.data(0x8000);
+    uint32_t midi = g.rt.thunk_far(*g.rt.shims().find_name("MMSYSTEM", "midiOutShortMsg"));
+    uint16_t cs = g.code(timeproc_recorder(rec, midi));
+    uint32_t mem = uint32_t(g.data(0x40)) << 16;
+    CHECK(g.api16("MMSYSTEM", "midiOutOpen", {l16(mem), w16(0xFFFF), l16(0), l16(0), l16(0)}) == 0, "real engine: open");
+    uint16_t h = g.rt.rd16(mem);
+    g.rt.wr16((uint32_t(rec) << 16) + 4, h);
+    frames(g, *engine, 1, 1);
+    uint16_t id = set_timer(g, 4, cs, 0, true);
+    frames(g, *engine, 2, 61);  // one virtual second
+    g.api("MMSYSTEM", "timeKillEvent", {w16(id)});
+    g.api("MMSYSTEM", "midiOutReset", {w16(h)});
+    g.api("MMSYSTEM", "midiOutClose", {w16(h)});
+    audio16_close(g.rt);
+    engine->shutdown(g.now());
+    CHECK(engine->stats().midi_events >= 250, "MIDI events: %llu", (unsigned long long)engine->stats().midi_events);
+  }
+  auto log = read_mid_log(mid);
+  std::vector<uint64_t> ons;
+  for (const auto& [ms, m] : log) {
+    if (m.size() == 3 && m[0] == 0x90 && m[2] > 0) ons.push_back(ms);
+  }
+  bool spaced = ons.size() >= 245 && ons.size() <= 251;
+  for (size_t k = 1; k < ons.size() && spaced; k++) spaced = ons[k] - ons[k - 1] >= 3 && ons[k] - ons[k - 1] <= 5;
+  CHECK(spaced, "%zu note-ons 4 ms apart in the log, though delivered once a frame", ons.size());
+  size_t resets = 0;
+  for (const auto& [ms, m] : log) resets += m.size() == 3 && m[0] == 0xB0 && m[1] == 123;
+  CHECK(resets == 1 && !log.empty() && log.back().second == std::vector<uint8_t>({0xB0, 123, 0}),
+        "midiOutReset ends it: note-off, sustain off, all notes off");
+  DeleteFileA(wav.c_str());
+  DeleteFileA(mid.c_str());
+
+  // The cost of 250 callbacks a virtual second (each a nested call_far and a
+  // midiOutShortMsg into the engine), against the same frames without the event.
+  auto host_ms = [&](bool timer) {
+    audio::Config cfg;
+    cfg.guest_sound = true;
+    std::unique_ptr<audio::Engine> engine = audio::make_engine(cfg);
+    Rig g(true, true, engine.get());
+    uint16_t rec = g.data(0x8000);
+    uint32_t midi = g.rt.thunk_far(*g.rt.shims().find_name("MMSYSTEM", "midiOutShortMsg"));
+    uint16_t cs = g.code(timeproc_recorder(rec, midi));
+    uint32_t mem = uint32_t(g.data(0x40)) << 16;
+    g.api("MMSYSTEM", "midiOutOpen", {l16(mem), w16(0xFFFF), l16(0), l16(0), l16(0)});
+    g.rt.wr16((uint32_t(rec) << 16) + 4, g.rt.rd16(mem));
+    if (timer) set_timer(g, 4, cs, 0, true);
+    LARGE_INTEGER f0, a, b;
+    QueryPerformanceFrequency(&f0);
+    QueryPerformanceCounter(&a);
+    for (int f = 1; f <= 600; f++) {  // 10 virtual seconds at 60 Hz, a call and the pump per frame
+      g.to(uint64_t(f) * 16667);
+      g.tick();
+      audio16_pump(g.rt);
+      engine->advance(g.now());
+    }
+    QueryPerformanceCounter(&b);
+    uint64_t calls = timer16_stats(g.rt).calls;
+    engine->shutdown(g.now());
+    return std::make_pair(double(b.QuadPart - a.QuadPart) * 1000.0 / double(f0.QuadPart), calls);
+  };
+  auto base = host_ms(false), with = host_ms(true);
+  CHECK(with.second >= 2490 && with.second <= 2500, "2500 callbacks in 10 virtual seconds (%llu)",
+        (unsigned long long)with.second);
+  printf("timer cost: %llu callbacks in 10 virtual s: %.1f ms host (%.1f without the event): %.2f us per callback\n",
+         (unsigned long long)with.second, with.first, base.first,
+         with.second ? (with.first - base.first) * 1000.0 / double(with.second) : 0.0);
+}
+
+// The same sequencer in the ne16 lane's order: the pump, then a DRAWFRAME of
+// ~10 ms guest work that makes no API call (the periods due meanwhile wait for
+// the next frame's pump), the frame's time settled, and the engine rendered —
+// only up to Runtime16::audio_due(), the next due point, as the lane's step
+// end does, so the late periods' notes keep their dates. Rendered to the
+// guest's time instead, they would be clamped to the frame's end.
+void test_real_engine_midi_lane_order() {
+  char tmp[MAX_PATH];
+  GetTempPathA(MAX_PATH, tmp);
+  const std::string wav = std::string(tmp) + "adw_sound16_" + std::to_string(GetCurrentProcessId()) + "_lane.wav";
+  const std::string mid = wav.substr(0, wav.size() - 4) + ".mid";
+  {
+    audio::Config cfg;
+    cfg.guest_sound = true;
+    cfg.capture_wav = wav;
+    cfg.capture_mid = mid;
+    std::unique_ptr<audio::Engine> engine = audio::make_engine(cfg);
+    Rig g(true, true, engine.get());
+    uint16_t rec = g.data(0x8000);
+    uint32_t midi = g.rt.thunk_far(*g.rt.shims().find_name("MMSYSTEM", "midiOutShortMsg"));
+    uint16_t cs = g.code(timeproc_recorder(rec, midi));
+    uint16_t work = g.code(busy_work(15));
+    uint32_t mem = uint32_t(g.data(0x40)) << 16;
+    g.api("MMSYSTEM", "midiOutOpen", {l16(mem), w16(0xFFFF), l16(0), l16(0), l16(0)});
+    uint16_t h = g.rt.rd16(mem);
+    g.rt.wr16((uint32_t(rec) << 16) + 4, h);
+    set_timer(g, 4, cs, 0, true);
+    for (int f = 1; f <= 60; f++) {
+      g.to(uint64_t(f) * 16667);
+      audio16_pump(g.rt);
+      g.rt.call_far(uint32_t(work) << 16, {});
+      g.rt.settle_time();
+      engine->advance(std::min(g.rt.peek_us(), g.rt.audio_due()));
+    }
+    g.api("MMSYSTEM", "midiOutReset", {w16(h)});
+    audio16_close(g.rt);
+    engine->shutdown(g.now());
+  }
+  std::vector<uint64_t> ons;
+  for (const auto& [ms, m] : read_mid_log(mid)) {
+    if (m.size() == 3 && m[0] == 0x90 && m[2] > 0) ons.push_back(ms);
+  }
+  std::map<uint64_t, int> gaps;
+  for (size_t k = 1; k < ons.size(); k++) gaps[ons[k] - ons[k - 1]]++;
+  bool spaced = ons.size() >= 245 && ons.size() <= 255;
+  for (const auto& [gap, n] : gaps) spaced &= gap >= 3 && gap <= 5;
+  std::string hist;
+  for (const auto& [gap, n] : gaps) hist += " " + std::to_string(gap) + ":" + std::to_string(n);
+  CHECK(spaced, "%zu note-ons 4 ms apart, frames of 10 ms work without a call (gaps ms:count%s)", ons.size(), hist.c_str());
+  DeleteFileA(wav.c_str());
+  DeleteFileA(mid.c_str());
+}
+
+// A timer procedure's `play … to n notify`: MCI is dated at the delivery
+// point, not at the procedure's due time (no interrupt-time API), so the song
+// plays its n ms before it stops and the notify goes — also when the engine
+// was rendered past the procedure's due time before it was delivered.
+void test_mci_from_procedure() {
+  audio::Config cfg;
+  cfg.guest_sound = true;
+  std::unique_ptr<audio::Engine> engine = audio::make_engine(cfg);
+  Rig g(true, true, engine.get());
+  g.rt.vfs().mount_overlay("C:\\AFTERDRK", "", "");
+  g.rt.vfs().add_virtual_file("C:\\AFTERDRK\\ONE.MID", one_second_smf());
+  uint16_t rec = g.data(512);
+  uint16_t hwnd = make_window(g, rec);
+  CHECK(g.mci("open sequencer!C:\\AFTERDRK\\ONE.MID alias fred wait") == 0, "open fred");
+  // TimeProc: mciSendString("play fred to 800 notify", NULL, 0, hwnd), FAR PASCAL.
+  uint32_t cmd = g.str("play fred to 800 notify");
+  uint32_t fn = g.rt.thunk_far(*g.rt.shims().find_name("MMSYSTEM", "mciSendString"));
+  uint16_t cs = g.code({0x55, 0x8B, 0xEC,                                                  // push bp; mov bp,sp
+                        0x68, uint8_t(cmd >> 16), uint8_t(cmd >> 24), 0x68, uint8_t(cmd), uint8_t(cmd >> 8),
+                        0x6A, 0x00, 0x6A, 0x00, 0x6A, 0x00,                                // no return string
+                        0x68, uint8_t(hwnd), uint8_t(hwnd >> 8),                           // hwndCallback
+                        0x9A, uint8_t(fn), uint8_t(fn >> 8), uint8_t(fn >> 16), uint8_t(fn >> 24),
+                        0x5D, 0xCA, 0x10, 0x00});                                          // pop bp; retf 10h
+  uint16_t work = g.code(busy_work(15));
+  g.to(16667);
+  audio16_pump(g.rt);
+  set_timer(g, 4, cs, 0, false);           // one-shot, due inside the work below
+  g.rt.call_far(uint32_t(work) << 16, {});
+  g.rt.settle_time();
+  engine->advance(g.rt.peek_us());         // the engine rendered past the procedure's due time
+  g.to(2 * 16667);
+  audio16_pump(g.rt);                      // the procedure runs here: the song starts now
+  const uint64_t start = g.now();
+  std::string mode, pos;
+  g.to(start + 790000);  // reckoned from the procedure's due time, the song would have stopped by now
+  g.tick();
+  audio16_pump(g.rt);
+  CHECK(g.mci("status fred mode", &mode) == 0 && mode == "playing" && window_records(g, rec).empty(),
+        "790 ms after the start: still playing, no notify (%s)", mode.c_str());
+  g.to(start + 801000);
+  g.tick();
+  audio16_pump(g.rt);
+  std::vector<Rec> r = window_records(g, rec);
+  CHECK(g.mci("status fred mode", &mode) == 0 && mode == "stopped" && g.mci("status fred position", &pos) == 0 &&
+            pos == "800",
+        "801 ms after: stopped at 800 ms (%s, %s)", mode.c_str(), pos.c_str());
+  CHECK(r.size() == 1 && r[0].msg == 0x3B9 && r[0].wp == 1, "MM_MCINOTIFY(SUCCESSFUL) at 800 ms of play: %s",
+        records_text(r).c_str());
+  g.mci("close all");
+  audio16_close(g.rt);
+  engine->shutdown(g.now());
+}
+
 }  // namespace
 
 int main() {
@@ -1153,9 +1951,19 @@ int main() {
     test_waveout();
     test_wom_window();
     test_wom_function();
+    test_midi_out();
+    test_midi_function();
+    test_resend_chain();
+    test_timers();
+    test_timer_chain();
+    test_timers_without_engine();
+    test_timer_determinism();
     test_mci();
     test_gates();
     test_real_engine();
+    test_real_engine_midi();
+    test_real_engine_midi_lane_order();
+    test_mci_from_procedure();
   } catch (const std::exception& e) {
     printf("FAIL: exception %s\n", e.what());
     return 1;

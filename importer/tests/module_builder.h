@@ -1,8 +1,9 @@
 // Synthetic After Dark-shaped module files for the catalog tests: a PE32 DLL
 // and an NE DLL carrying exactly the resources, imports and exports the
 // catalog reads (type 1000 control records, 2000 text, VERSIONINFO,
-// STRINGLIST), built byte by byte. They hold no After Dark bytes — the
-// records are laid out from ABI.md §2.10.2 with made-up contents.
+// STRINGLIST; an Intermission IMX module's SAVERINIT/SAVERDRAW exports),
+// built byte by byte. They hold no After Dark bytes — the records are laid
+// out from ABI.md §2.10.2 with made-up contents.
 #pragma once
 
 #include <algorithm>
@@ -358,10 +359,17 @@ struct NeSpec {
   std::string module_name = "SYNTH";
   std::vector<std::string> module_refs;
   std::vector<NeResource> resources;
+  // Exported names: resident names with ordinals 1..n, each an entry of one
+  // bundle of fixed entries for segment 1 (the loader does not check entry
+  // segments against the segment table; only relocations are validated).
+  std::vector<std::string> exports;
+  // Names listed after them (ordinals n+1..) with no entry-table entry: a
+  // lookup by name finds them, GetProcAddress would not.
+  std::vector<std::string> names_without_entries;
 };
 
 // A code-less NE library: header, resource table, name tables, module
-// references, and the resource data at 16-byte units.
+// references, the entry table, and the resource data at 16-byte units.
 inline std::string build_ne(const NeSpec& spec) {
   const size_t ne = 0x40;
   const uint16_t shift = 4;
@@ -413,7 +421,20 @@ inline std::string build_ne(const NeSpec& spec) {
   rn.u8(0, uint8_t(spec.module_name.size()));
   rn.put(1, spec.module_name);
   rn.u16(1 + spec.module_name.size(), 0);
-  rn.u8(3 + spec.module_name.size(), 0);
+  for (size_t i = 0; i < spec.exports.size(); i++) {
+    size_t o = rn.d.size();
+    rn.u8(o, uint8_t(spec.exports[i].size()));
+    rn.put(o + 1, spec.exports[i]);
+    rn.u16(o + 1 + spec.exports[i].size(), uint16_t(i + 1));
+  }
+  for (size_t i = 0; i < spec.names_without_entries.size(); i++) {
+    const std::string& n = spec.names_without_entries[i];
+    size_t o = rn.d.size();
+    rn.u8(o, uint8_t(n.size()));
+    rn.put(o + 1, n);
+    rn.u16(o + 1 + n.size(), uint16_t(spec.exports.size() + i + 1));
+  }
+  rn.u8(rn.d.size(), 0);
   size_t modref = resident + rn.d.size();
   Bytes imp;
   imp.u8(0, 0);  // offset 0 is the conventional empty name
@@ -426,11 +447,23 @@ inline std::string build_ne(const NeSpec& spec) {
   }
   size_t impnames = modref + mr.d.size();
   size_t entry = impnames + imp.d.size();
+  // The entry table: one bundle of fixed entries (exported, shared data) in
+  // segment 1, then the terminating 0.
+  Bytes et;
+  if (!spec.exports.empty()) {
+    et.u8(0, uint8_t(spec.exports.size()));
+    et.u8(1, 1);
+    for (size_t i = 0; i < spec.exports.size(); i++) {
+      et.u8(2 + 3 * i, 0x03);
+      et.u16(3 + 3 * i, uint16_t(16 * i));
+    }
+  }
+  et.u8(et.d.size(), 0);
 
   f.put(ne, "NE");
   f.u8(ne + 2, 5);
   f.u16(ne + 0x04, uint16_t(entry));
-  f.u16(ne + 0x06, 2);
+  f.u16(ne + 0x06, uint16_t(std::max<size_t>(et.d.size(), 2)));
   f.u16(ne + 0x0C, 0x8001);  // library, single data
   f.u16(ne + 0x1E, uint16_t(spec.module_refs.size()));
   f.u16(ne + 0x22, uint16_t(rsrc));
@@ -445,6 +478,7 @@ inline std::string build_ne(const NeSpec& spec) {
   f.put(ne + modref, mr.d);
   f.put(ne + impnames, imp.d);
   f.u16(ne + entry, 0);
+  f.put(ne + entry, et.d);
 
   // Data, each resource at a 16-byte unit, lengths rounded up in units as a
   // resource compiler stores them (so the readers see trailing padding).

@@ -4,6 +4,7 @@
 #include <cstring>
 #include <exception>
 #include <stdexcept>
+#include <string_view>
 #include <tuple>
 #include <utility>
 
@@ -36,6 +37,32 @@ ControlType control_type(const std::string& t) {
   if (t == "popup") return ControlType::popup;
   if (t == "button") return ControlType::button;
   return ControlType::unknown;
+}
+
+// A catalog "screen" ("640x480"): 1 to 5 decimal digits either side of an 'x'
+// (or 'X'). The host renders any size up to 16384 on an axis, but the stream
+// parser reads back no frame past 8192 on an axis or 4096x4096 pixels in all
+// (frame_parser.cc): anything else, or another shape, is no screen at all
+// ({0, 0}), and the module's ABI decides its screen as before. An axis of 6
+// digits or more is none whatever its value ("000640x480"), so none can
+// overflow an int on its way to the 8192 check ("4294967936" would wrap to
+// 640).
+SizeI screen_of(const std::string& s) {
+  const size_t x = s.find_first_of("xX");
+  if (x == std::string::npos) return {};
+  auto number = [](std::string_view d, int& out) {
+    if (d.empty() || d.size() > 5) return false;   // 5 digits hold every size allowed, and never overflow
+    out = 0;
+    for (char c : d) {
+      if (c < '0' || c > '9') return false;
+      out = out * 10 + (c - '0');
+    }
+    return true;
+  };
+  int w = 0, h = 0;
+  if (!number(std::string_view(s).substr(0, x), w) || !number(std::string_view(s).substr(x + 1), h)) return {};
+  if (w < 1 || h < 1 || w > 8192 || h > 8192 || (long long)w * h > 4096LL * 4096) return {};
+  return SizeI{w, h};
 }
 
 } // namespace
@@ -230,6 +257,14 @@ bool parse_catalog(const std::string& json_text, Catalog& out, std::string* erro
       mod.path = str_or(m, "path");
       if (mod.id.empty() || mod.path.empty()) continue;   // unusable entry; skip, don't fail the catalog
       mod.lane = str_or(m, "lane");
+      // Written only for a module whose ABI is not After Dark's (the importer
+      // puts it last); absent, empty or not a string, it is After Dark's.
+      mod.abi = str_or(m, "abi");
+      if (mod.abi.empty()) mod.abi = kAfterDarkAbi;
+      // A fixed screen of its own (PACKAGES.md §6), for a module that
+      // composes a scene of that size: absent, not a string or not a size
+      // it can use, it has none.
+      mod.screen = screen_of(str_or(m, "screen"));
       mod.module_name = str_or(m, "moduleName");
       mod.display_name = display_name_of(mod.lane, mod.module_name, str_or(m, "displayName", mod.id));
       if (mod.display_name.empty()) mod.display_name = mod.id;

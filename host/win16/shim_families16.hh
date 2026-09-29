@@ -51,6 +51,23 @@ void user16_post_host(Runtime16& rt, uint16_t hwnd, uint16_t msg, uint16_t wpara
 // returns how many left the queue.
 int user16_dispatch_host(Runtime16& rt, int max = 64);
 bool user16_window_exists(Runtime16& rt, uint16_t hwnd);
+// The message loop INTERMIS ran between two calls of an Intermission saver
+// (INTERMIS 1:09da..1:0a64: PeekMessage, GetMessage, DispatchMessage), for the
+// ne16 lane's Intermission protocol (the AD3 path never calls it): sends the
+// guest's own posted messages — not the host-posted ones (user16_dispatch_host),
+// not the tagged input messages, which stay for the lane — to the window
+// procedures of their (live) windows, in queue order, and then the WM_TIMERs
+// that are due to their TIMERPROC or window; messages posted to the task
+// itself (hwnd 0: SWSE FORCETOWAKE's PostAppMessage(GetCurrentTask(), …)) are
+// removed and counted (StepReport16::task_posts, last_task_msg), nobody
+// takes them. At most `max` messages are handled; returns how many were.
+int user16_dispatch_guest(Runtime16& rt, int max = 64);
+
+// The task this runtime is (GetCurrentTask; made on first use), and the task
+// the synthetic desktop's Program Manager belongs to (GetWindowTask, IsTask;
+// no task list shows it).
+uint16_t kernel16_current_task(Runtime16& rt);
+uint16_t kernel16_shell_task(Runtime16& rt);
 
 // ---- helpers shared by the families ----
 

@@ -2,8 +2,13 @@
 //
 //   test_import_catalog unit <scratch>
 //     the text and record readers against hand-made inputs, whole synthetic
-//     PE32 / NE modules (tests/module_builder.h), a scan of a synthetic FILES
-//     tree, the JSON layout, and regenerate_catalog (adimport --catalog-only)
+//     PE32 / NE modules (tests/module_builder.h), NE modules told apart by
+//     their exports as the ne16 lane does (MODULE first; what it refuses
+//     left out, with its reason), a scan of a synthetic FILES tree and of a
+//     package tree with *.AD and *.IMX, the JSON layout (abi last, IMX
+//     entries only), After Dark 2.0's About rules and "screen" (the startrek
+//     package's entries only), and regenerate_catalog (adimport
+//     --catalog-only)
 //   test_import_catalog real <scratch> <adimport.exe> <reference.json>
 //     semantic identity with the prototype's output (research/win/
 //     make_catalog.py -> research/win/catalog-win.json) over the real
@@ -14,6 +19,7 @@
 
 #include <functional>
 #include <set>
+#include <tuple>
 
 #include "catalog.h"
 #include "importer.h"
@@ -182,6 +188,7 @@ std::string synth_pe(bool msvc_entry = false) {
 std::string synth_ne() {
   test::NeSpec ne;
   ne.module_refs = {"KERNEL", "USER", "ADXPL300", "AD_RSRC", "GDI", "USER"};
+  ne.exports = {"WEP", "MODULE"};  // what the Classic lane calls
   ne.resources = {
       {2000, "", 20, std::string("Synth Three\0junk", 16)},
       {2000, "", 30, "About \x93this\x94\r\nline 2\r\n  "},
@@ -254,6 +261,7 @@ void test_modules(const fs::path& dir) {
   }
   // An empty name (just the NUL) falls back like a missing one.
   test::NeSpec ne;
+  ne.exports = {"MODULE"};
   ne.resources = {{2000, "", 20, std::string(1, '\0')}, {0, "STRINGLIST", 128, test::stringlist({"Listed"})}};
   CatalogModule listed = catalog_module(write("LISTED3.AD", test::build_ne(ne)), "x");
   CHECK_EQ(listed.display_name, std::string("Listed"));
@@ -276,6 +284,181 @@ void test_modules(const fs::path& dir) {
     threw = true;
   }
   CHECK(threw);
+}
+
+// ---- Intermission IMX modules ---------------------------------------------------------------
+
+const std::vector<std::string> kImxExports = {"WEP", "SAVERINIT", "SAVERDRAW", "SAVERDLGPROC", "LIBMAIN", "SAVERDLGPROC2"};
+
+// An NE with these exports (and, listed after them, names with no entry);
+// it also carries an After Dark name resource, which an IMX module's entry
+// must not read.
+std::string synth_imx(const std::vector<std::string>& exports,
+                      const std::vector<std::string>& refs = {"INTRMLIB", "READJPG", "SWSE", "KERNEL", "USER", "GDI",
+                                                              "WIN87EM", "STRESS"},
+                      const std::vector<std::string>& names_without_entries = {}) {
+  test::NeSpec ne;
+  ne.module_name = "SYNTHIMX";
+  ne.module_refs = refs;
+  ne.exports = exports;
+  ne.names_without_entries = names_without_entries;
+  ne.resources = {{5, "", 1, "a dialog"}, {2000, "", 20, std::string("After Dark Name\0", 16)},
+                  {2000, "", 30, "About text\r\n"}};
+  return test::build_ne(ne);
+}
+
+void test_imx(const fs::path& dir) {
+  fs::create_directories(dir);
+  auto write = [&](const std::string& name, const std::string& data) {
+    fs::path p = dir / to_wide(name);
+    test::write_bytes(p, std::vector<uint8_t>(data.begin(), data.end()));
+    return p;
+  };
+  const Package* swse = find_package("swse");
+  CHECK(swse && swse->recipe == Recipe::intermission);
+  CatalogModule m = catalog_module(write("VADER.IMX", synth_imx(kImxExports)), "packages/swse/SAVER/VADER.IMX", swse);
+  CHECK_EQ(m.id, std::string("swse.vader"));
+  CHECK_EQ(m.lane, std::string("ne16"));
+  CHECK_EQ(m.abi, std::string("intermission"));
+  CHECK_EQ(m.entry, std::string("SAVERDRAW"));
+  CHECK_EQ(m.display_name, std::string("vader"));  // no resource holds its name: the registry's overrides do
+  CHECK_EQ(m.module_name, std::string("vader"));
+  CHECK(m.about.empty() && !m.credits);
+  CHECK_EQ(m.controls.size(), size_t(1));
+  if (m.controls.size() == 1) {
+    const CatalogControl& b = m.controls[0];
+    CHECK(b.index == 0 && b.name == "Configure..." && b.kind == "button" && b.type == "button" && !b.def);
+  }
+  CHECK((m.needs == std::vector<std::string>{"INTRMLIB", "READJPG", "STRESS", "SWSE"}));
+  CHECK((m.system == std::vector<std::string>{"GDI", "KERNEL", "USER", "WIN87EM"}));
+  CHECK_EQ(m.package, std::string("swse"));
+  CHECK_EQ(m.package_title, std::string("Star Wars Screen Entertainment"));
+  // Export names match without case, as GetProcAddress (IMIMXPLY asks in
+  // lower case; the NE stores upper case).
+  CatalogModule lower = catalog_module(write("LOWER.IMX", synth_imx({"wep", "saverinit", "saverdraw", "saverdlgproc"})),
+                                       "x", swse);
+  CHECK(lower.abi == "intermission" && lower.controls.size() == 1);
+  // No SAVERDLGPROC: no dialog, no button.
+  CatalogModule nodlg = catalog_module(write("NODLG.IMX", synth_imx({"SAVERINIT", "SAVERDRAW"})), "x", swse);
+  CHECK(nodlg.abi == "intermission" && nodlg.controls.empty());
+  // The ne16 lane's rule, rule for rule (host/ne16/package.cc detect_kind):
+  // MODULE makes an After Dark module whatever else it exports — its name,
+  // text and controls, no Configure... button.
+  const std::vector<std::vector<std::string>> hybrids = {{"MODULE", "SAVERINIT", "SAVERDRAW", "SAVERDLGPROC"},
+                                                         {"SAVERINIT", "SAVERDRAW", "SAVERDLGPROC", "module"}};
+  for (const auto& exports : hybrids) {
+    CatalogModule both = catalog_module(write("BOTH.IMX", synth_imx(exports)), "x", swse);
+    CHECK(both.abi.empty());
+    CHECK_EQ(both.entry, std::string("MODULE"));
+    CHECK_EQ(both.display_name, std::string("After Dark Name"));
+    CHECK_EQ(both.about, std::string("About text"));
+    CHECK(both.controls.empty());
+  }
+  // What the lane would refuse is no module: catalog_module says why, in the
+  // lane's words (build_catalog logs it and leaves the file out) — a module
+  // exporting SETCURRSAVER is another product's, an IMXX_ file an extension,
+  // one of SAVERINIT/SAVERDRAW is not enough, SAVERMAIN is a reader, and an
+  // NE with none of these exports is nothing the lane runs.
+  for (const auto& [file, exports, why] : std::vector<std::tuple<std::string, std::vector<std::string>, std::string>>{
+           {"OTHER.IMX", {"SAVERINIT", "SAVERDRAW", "SETCURRSAVER"},
+            "an Intermission module that exports SETCURRSAVER, which the IMX reader refuses"},
+           {"IMXX_IWR.IMX", kImxExports, "an Intermission module named IMXX_*, which the IMX reader refuses"},
+           {"imxx_low.imx", kImxExports, "an Intermission module named IMXX_*, which the IMX reader refuses"},
+           {"HALF.IMX", {"SAVERINIT"}, "not an Intermission module: it exports SAVERINIT without SAVERDRAW"},
+           {"DRAW.IMX", {"SAVERDRAW", "SAVERDLGPROC"},
+            "not an Intermission module: it exports SAVERDRAW without SAVERINIT"},
+           {"READER.IMX", {"WEP", "SAVERMAIN"}, "an Intermission reader (it exports SAVERMAIN), not a module"},
+           {"NONE.AD", {"WEP"}, "not an After Dark or Intermission module (no MODULE, SAVERINIT or SAVERDRAW export)"},
+           {"EMPTY.IMX", {}, "not an After Dark or Intermission module (no MODULE, SAVERINIT or SAVERDRAW export)"}}) {
+    std::string got = "listed";
+    try {
+      catalog_module(write(file, synth_imx(exports)), "x", swse);
+    } catch (const ImportError& e) {
+      got = e.status() == Status::source_invalid ? e.what() : "another status";
+    }
+    if (got != why) fprintf(stderr, "  %s: \"%s\", expected \"%s\"\n", file.c_str(), got.c_str(), why.c_str());
+    CHECK_EQ(got, why);
+  }
+  // Exports are found by name, as the lane finds them: a name with no
+  // entry-table entry still counts (the Configure... button needs a
+  // callable SAVERDLGPROC, as IMIMXPLY's GetProcAddress does).
+  {
+    CatalogModule named = catalog_module(write("NAMED.IMX", synth_imx({"WEP"}, {"KERNEL"}, {"SAVERINIT", "SAVERDRAW",
+                                                                                              "SAVERDLGPROC"})),
+                                         "x", swse);
+    CHECK(named.abi == "intermission" && named.entry == "SAVERDRAW" && named.controls.empty());
+    CatalogModule ad = catalog_module(write("NAMED.AD", synth_imx(kImxExports, {"KERNEL"}, {"MODULE"})), "x", swse);
+    CHECK(ad.abi.empty() && ad.entry == "MODULE");
+  }
+  // The exports decide, never the extension.
+  CHECK_EQ(catalog_module(write("SHAPED.AD", synth_imx(kImxExports)), "x", swse).abi, std::string("intermission"));
+
+  // JSON: "abi" only on IMX entries, last in the object; an After Dark entry
+  // is laid out exactly as before.
+  CatalogModule ad = catalog_module(write("AD.AD", synth_ne()), "x", swse);
+  m.md5 = std::string(32, 'a');
+  ad.md5 = std::string(32, 'b');
+  std::string j = render_catalog_json({ad, m});
+  CHECK(j.find("\"md5\": \"" + std::string(32, 'a') + "\",\n   \"abi\": \"intermission\"\n  }") != std::string::npos);
+  CHECK(j.find("\"md5\": \"" + std::string(32, 'b') + "\"\n  }") != std::string::npos);
+  CHECK(j.find("\"entry\": \"SAVERDRAW\"") != std::string::npos);
+  CHECK(j.find("\"abi\"") == j.rfind("\"abi\""));  // once
+  phosg::JSON doc = phosg::JSON::parse(j);
+  CHECK(!doc.at("modules").as_list().at(0)->contains("abi"));
+  CHECK_EQ(doc.at("modules").as_list().at(1)->get_string("abi"), std::string("intermission"));
+  // A sameAs goes before it.
+  m.same_as = "swse.other";
+  j = render_catalog_json({m});
+  CHECK(j.find("\"sameAs\": \"swse.other\",\n   \"abi\": \"intermission\"\n  }") != std::string::npos);
+  CHECK(is_system_dll("KERNEL") && is_system_dll("WIN87EM") && !is_system_dll("TOOLHELP") && !is_system_dll("INTRMLIB"));
+
+  // Scanning: a package's folders list *.AD and *.IMX together, sorted;
+  // ENGINE is scanned too; WINDOWS never is; the registry's name overrides
+  // name the Intermission modules; a file the lane would refuse is left out
+  // and logged, and one exporting MODULE too is an After Dark entry.
+  fs::path root = dir / L"swse-tree";
+  auto put = [&](const std::wstring& rel, const std::string& data) {
+    test::write_bytes(root / rel, std::vector<uint8_t>(data.begin(), data.end()));
+  };
+  put(L"SAVER\\C.imx", synth_imx(kImxExports));
+  put(L"SAVER\\A.IMX", synth_imx(kImxExports, {"KERNEL"}));
+  put(L"SAVER\\B.AD", synth_ne());
+  put(L"SAVER\\VADER.IMX", synth_imx(kImxExports, {"USER"}));
+  put(L"SAVER\\READJPG.DLL", synth_imx(kImxExports, {"GDI"}));  // not a module file name
+  put(L"SAVER\\IMIMXPLY.IMQ", synth_imx(kImxExports, {"GDI", "USER"}));
+  put(L"SAVER\\IMXX_EXT.IMX", synth_imx(kImxExports));
+  put(L"SAVER\\SETCUR.IMX", synth_imx({"SAVERINIT", "SAVERDRAW", "SETCURRSAVER"}));
+  put(L"SAVER\\BOTH.IMX", synth_imx({"MODULE", "SAVERINIT", "SAVERDRAW", "SAVERDLGPROC"}));
+  put(L"ENGINE\\E.IMX", synth_imx(kImxExports, {"COMMDLG"}));
+  put(L"WINDOWS\\W.IMX", synth_imx(kImxExports, {"SHELL"}));
+  CatalogTree t;
+  t.package = swse;
+  t.dir = root;
+  std::vector<std::string> logged;
+  CatalogDoc cat = build_catalog({t}, [&](const std::string& s) { logged.push_back(s); });
+  std::vector<std::string> ids, names;
+  for (auto& mod : cat.modules) ids.push_back(mod.id), names.push_back(mod.module_name);
+  CHECK((ids == std::vector<std::string>{"swse.a", "swse.b", "swse.both", "swse.c", "swse.vader", "swse.e"}));
+  CHECK_EQ(cat.modules.size() > 4 ? cat.modules[4].module_name : std::string(), std::string("Darth Vader"));
+  CHECK_EQ(cat.modules.size() > 4 ? cat.modules[4].display_name : std::string(), std::string("Darth Vader"));
+  CHECK_EQ(cat.modules.size() > 4 ? cat.modules[4].path : std::string(), std::string("packages/swse/SAVER/VADER.IMX"));
+  CHECK(cat.modules.size() > 2 && cat.modules[2].abi.empty() && cat.modules[2].entry == "MODULE");
+  CHECK_EQ(cat.packages.size() == 1 ? cat.packages[0].modules : 0, size_t(6));
+  CHECK((logged == std::vector<std::string>{
+                       "catalog: skipped packages/swse/SAVER/IMXX_EXT.IMX: an Intermission module named IMXX_*, which "
+                       "the IMX reader refuses",
+                       "catalog: skipped packages/swse/SAVER/SETCUR.IMX: an Intermission module that exports "
+                       "SETCURRSAVER, which the IMX reader refuses"}));
+  for (const auto& l : logged) fprintf(stderr, "  %s\n", l.c_str());
+  // Deluxe's fixed places hold *.AD only: an IMX file there is not listed.
+  fs::path files = dir / L"FILES.deluxe";
+  const std::string imx = synth_imx(kImxExports), ne = synth_ne();
+  test::write_bytes(files / L"CLASSIC" / L"X.IMX", std::vector<uint8_t>(imx.begin(), imx.end()));
+  test::write_bytes(files / L"CLASSIC" / L"Y.AD", std::vector<uint8_t>(ne.begin(), ne.end()));
+  test::write_bytes(files / L"AD40" / L"Z.IMX", std::vector<uint8_t>(imx.begin(), imx.end()));
+  auto deluxe = scan_catalog(files);
+  CHECK_EQ(deluxe.size(), size_t(1));
+  CHECK(!deluxe.empty() && deluxe[0].id == "classic.y");
 }
 
 // ---- a FILES tree ------------------------------------------------------------------------
@@ -322,12 +505,62 @@ void test_scan(const fs::path& dir) {
   CHECK(threw);
 }
 
+// ---- After Dark 2.0: the About rules and the fixed screen (startrek) ----------------------------
+
+void test_ad20(const fs::path& dir) {
+  // The text rules alone.
+  CHECK_EQ(ad20_about("TITLE\n\nWrapped by \nhand.\nTM 1992\nBerkeley Systems Authorized User."),
+           std::string("TITLE\n\nWrapped by hand.\nTM 1992"));
+  CHECK_EQ(ad20_about("x   \n  Berkeley Systems Authorized User.  "), std::string("x"));
+  CHECK_EQ(ad20_about("Berkeley Systems Authorized User."), std::string());
+  // Only the last line, only that text; a break joins only after a space and
+  // before a lower-case letter.
+  CHECK_EQ(ad20_about("Berkeley Systems Authorized User.\nmore"), std::string("Berkeley Systems Authorized User.\nmore"));
+  CHECK_EQ(ad20_about("x\nBerkeley Systems, Inc."), std::string("x\nBerkeley Systems, Inc."));
+  CHECK_EQ(ad20_about("a \nB, a\nb, a \n\nb, a \n1, burn-in. \n"), std::string("a \nB, a\nb, a \n\nb, a \n1, burn-in. \n"));
+  CHECK_EQ(ad20_about(" \nx"), std::string(" x"));
+  CHECK_EQ(ad20_about(""), std::string());
+
+  // In the catalog: a Classic module of the After Dark 2.0 package has them
+  // and the package's screen; the same file anywhere else is as written
+  // (four texts of the other releases have such a break).
+  fs::create_directories(dir);
+  test::NeSpec ne;
+  ne.module_refs = {"KERNEL", "AD_MOD"};
+  ne.exports = {"MODULE"};
+  ne.resources = {{2000, "", 20, std::string(" Two Oh") + '\0'},
+                  {2000, "", 30, "TWO OH\r\n\r\nA sentence wrapped by \r\nhand.\r\nBerkeley Systems Authorized User."}};
+  const std::string bytes = test::build_ne(ne);
+  const fs::path file = dir / L"TWOOH.AD";
+  test::write_bytes(file, std::vector<uint8_t>(bytes.begin(), bytes.end()));
+  const Package* st = find_package("startrek");
+  CatalogModule a = catalog_module(file, "packages/startrek/AFTERDRK/TWOOH.AD", st);
+  CHECK_EQ(a.id, std::string("startrek.twooh"));
+  CHECK_EQ(a.about, std::string("TWO OH\n\nA sentence wrapped by hand."));
+  CHECK_EQ(a.module_name, std::string("Two Oh"));
+  CHECK_EQ(a.screen, std::string("640x480"));
+  for (const char* id : {"ad32", "simpsons", "deluxe"}) {
+    CatalogModule o = catalog_module(file, "x/TWOOH.AD", find_package(id));
+    CHECK_EQ(o.about, std::string("TWO OH\n\nA sentence wrapped by \nhand.\nBerkeley Systems Authorized User."));
+    CHECK(o.screen.empty());
+  }
+  CHECK(catalog_module(file, "FILES/CLASSIC/TWOOH.AD").screen.empty());
+  // "screen" is written last, and only when there is one.
+  CatalogModule plain = a;
+  plain.screen.clear();
+  const std::string with = render_catalog_json({a}), without = render_catalog_json({plain});
+  CHECK(with.find("   \"md5\": \"" + a.md5 + "\",\n   \"screen\": \"640x480\"\n  }\n") != std::string::npos);
+  CHECK(without.find("screen") == std::string::npos);
+}
+
 // ---- JSON ----------------------------------------------------------------------------------
 
 void test_json() {
-  // PACKAGES.md §6, COVERS.md §2.7: generator adimport 1.2 and the top-level packages list.
+  // PACKAGES.md §6, COVERS.md §2.7: the top-level packages list; generator
+  // adimport 1.3 since Intermission modules (the "abi" field, the
+  // intermission recipe).
   CHECK_EQ(render_catalog_json({}),
-           std::string("{\n \"version\": 1,\n \"generator\": \"adimport 1.2\",\n \"packages\": [],\n \"modules\": []\n}\n"));
+           std::string("{\n \"version\": 1,\n \"generator\": \"adimport 1.3\",\n \"packages\": [],\n \"modules\": []\n}\n"));
   CatalogModule m;
   m.id = "ad40.x";
   m.display_name = "X \"quoted\" \\ \x01";
@@ -623,7 +856,9 @@ int main(int argc, char** argv) {
   test_text();
   test_records();
   test_modules(dir / L"modules");
+  test_imx(dir / L"imx");
   test_scan(dir / L"scan");
+  test_ad20(dir / L"ad20");
   test_json();
   test_regenerate(dir / L"regen");
   return test::finish("import.catalog");

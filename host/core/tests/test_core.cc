@@ -438,6 +438,13 @@ TEST(parse_commands) {
   CHECK(parse_command("KEY 65 1", c) && c.kind == Command::Kind::key && c.a == 65 && c.b == 1);
   CHECK(parse_command("KEY 65 7", c) && c.b == 1);  // any nonzero = down
   CHECK(parse_command("CAPS 1", c) && c.kind == Command::Kind::caps && c.a == 1);
+  CHECK(parse_command("NUMLOCK 1", c) && c.kind == Command::Kind::numlock && c.a == 1);
+  CHECK(parse_command("numlock 7", c) && c.kind == Command::Kind::numlock && c.a == 1);  // any nonzero = on
+  CHECK(parse_command("NUMLOCK 0", c) && c.kind == Command::Kind::numlock && c.a == 0);
+  CHECK(std::string(command_name(Command::Kind::numlock)) == "NUMLOCK");
+  CHECK(!parse_command("NUMLOCK", c) && c.kind == Command::Kind::unknown);
+  CHECK(!parse_command("NUMLOCK 1 1", c));
+  CHECK(!parse_command("NUMLOCK on", c));
   CHECK(parse_command("MOUSE 10 -20 1", c) && c.kind == Command::Kind::mouse && c.a == 10 &&
         c.b == -20 && c.c == 1);
   CHECK(parse_command("QUIT", c) && c.kind == Command::Kind::quit);
@@ -462,6 +469,9 @@ TEST(input_state) {
   in.apply(c);
   parse_command("CAPS 1", c);
   in.apply(c);
+  CHECK(!in.numlock);
+  parse_command("NUMLOCK 1", c);
+  in.apply(c);
   parse_command("MOUSE 5 6 1", c);
   in.apply(c);
   CHECK_EQ(in.control(2, 0), 40);
@@ -470,6 +480,11 @@ TEST(input_state) {
   CHECK_EQ(in.last_key, 37);
   CHECK(in.last_key_down);
   CHECK(in.caps);
+  CHECK(in.numlock);
+  CHECK(!in.keys.test(144));  // the toggle, not the key
+  parse_command("NUMLOCK 0", c);
+  in.apply(c);
+  CHECK(!in.numlock && in.caps);
   CHECK(in.mouse_seen && in.mouse_x == 5 && in.mouse_y == 6 && in.mouse_button);
   parse_command("KEY 37 0", c);
   in.apply(c);
@@ -1179,16 +1194,18 @@ namespace {
 // Records what each step saw, and every command with its seq.
 struct InputProbe : Lane {
   LaneContext* ctx = nullptr;
-  bool caps_at_init = false;
+  bool caps_at_init = false, numlock_at_init = false;
   std::vector<Command> commands;
   std::vector<std::bitset<256>> keys_at_step;
   std::vector<uint32_t> buttons_at_step;
   std::vector<uint64_t> seq_at_step;
+  std::vector<bool> numlock_at_step;
   LaneStatus st;
   const char* name() const override { return "probe"; }
   bool init(const std::string&, LaneContext& c) override {
     ctx = &c;
     caps_at_init = c.input.caps;
+    numlock_at_init = c.input.numlock;
     return true;
   }
   void on_command(const Command& c) override {
@@ -1201,6 +1218,7 @@ struct InputProbe : Lane {
     keys_at_step.push_back(ctx->input.keys);
     buttons_at_step.push_back(ctx->input.mouse_buttons);
     seq_at_step.push_back(ctx->input.input_seq);
+    numlock_at_step.push_back(ctx->input.numlock);
     return StepResult::ok;
   }
   LaneStatus status() const override { return st; }
@@ -1225,15 +1243,24 @@ Run run_with_status(Lane& lane, const std::map<std::string, std::string>& vars, 
 TEST(input_lines_numbered) {
   InputProbe lane;
   FakeSource src;
-  for (const char* l : {"SET 0 1", "KEY 65 1", "CAPS 1", "MOUSE 1 1 0", "SET 1 2", "KEY 66 1", "GO", "QUIT"})
+  for (const char* l : {"SET 0 1", "KEY 65 1", "CAPS 1", "MOUSE 1 1 0", "SET 1 2", "KEY 66 1", "NUMLOCK 1", "GO", "QUIT"})
     src.add(l);
   std::vector<AdwHostStatusV1> pub;
   run_with_status(lane, {{"ADSTREAM", "1"}}, &src, &pub);
   std::vector<uint64_t> seqs;
   for (const Command& c : lane.commands) seqs.push_back(c.seq);
-  CHECK((seqs == std::vector<uint64_t>{0, 1, 2, 3, 0, 4}));
+  CHECK((seqs == std::vector<uint64_t>{0, 1, 2, 3, 0, 4, 5}));  // NUMLOCK is an input line, as CAPS is
   CHECK_EQ(lane.seq_at_step.size(), size_t(1));
-  CHECK_EQ(lane.seq_at_step[0], uint64_t(4));
+  CHECK_EQ(lane.seq_at_step[0], uint64_t(5));
+  CHECK(lane.numlock_at_step.size() == 1 && lane.numlock_at_step[0]);
+  // A NUMLOCK after a held release waits with it (order is kept).
+  InputProbe held;
+  FakeSource s2;
+  for (const char* l : {"KEY 144 1", "KEY 144 0", "NUMLOCK 1", "GO", "GO", "QUIT"}) s2.add(l);
+  pub.clear();
+  run_with_status(held, {{"ADSTREAM", "1"}}, &s2, &pub);
+  CHECK(held.numlock_at_step.size() == 2 && !held.numlock_at_step[0] && held.numlock_at_step[1]);
+  CHECK(held.keys_at_step.size() == 2 && held.keys_at_step[0].test(144) && !held.keys_at_step[1].test(144));
 }
 
 TEST(held_release_seen_by_one_step) {
@@ -1296,6 +1323,20 @@ TEST(adcaps_visible_at_init) {
   CHECK(!off.caps_at_init);
   CHECK(Env::parse({{"ADCAPS", "1"}}).caps_at_start);
   CHECK(!Env::parse({{"ADCAPS", "0"}}).caps_at_start);
+  CHECK(!on.numlock_at_init);  // ADCAPS is Caps Lock's alone
+}
+
+TEST(adnumlock_visible_at_init) {
+  // Final Exam latches Num Lock's toggle as it starts, and a change starts its exam.
+  InputProbe on, off;
+  std::vector<AdwHostStatusV1> pub;
+  run_with_status(on, {{"ADNUMLOCK", "1"}, {"ADFRAMES", "1"}}, nullptr, &pub);
+  run_with_status(off, {{"ADFRAMES", "1"}}, nullptr, &pub);
+  CHECK(on.numlock_at_init && !on.caps_at_init);
+  CHECK(!off.numlock_at_init);
+  CHECK(Env::parse({{"ADNUMLOCK", "1"}}).numlock_at_start);
+  CHECK(!Env::parse({{"ADNUMLOCK", "0"}}).numlock_at_start);
+  CHECK(!Env::parse({}).numlock_at_start);
 }
 
 TEST(status_published_after_init_and_each_step) {
@@ -1487,7 +1528,7 @@ TEST(configure_driver_exit_codes) {
     std::string json;
     ConfigureRequest seen_req;
     int32_t seen_cv = -1;
-    bool seen_caps = false;
+    bool seen_caps = false, seen_numlock = false;
     std::string seen_state;
     const char* name() const override { return "cfg"; }
     bool init(const std::string&, LaneContext&) override { return true; }
@@ -1498,13 +1539,14 @@ TEST(configure_driver_exit_codes) {
       seen_req = req;
       seen_cv = ctx.input.control(2, -1);
       seen_caps = ctx.input.caps;
+      seen_numlock = ctx.input.numlock;
       seen_state = ctx.env.state_root;
       if (throws) throw std::runtime_error("boom");
       if (!json.empty()) *out = json;
       return result;
     }
   };
-  Env env = Env::parse({{"ADCVSET", "2=40"}, {"ADCAPS", "1"}, {"ADSTATE", "C:\\st"}});
+  Env env = Env::parse({{"ADCVSET", "2=40"}, {"ADCAPS", "1"}, {"ADNUMLOCK", "1"}, {"ADSTATE", "C:\\st"}});
   ConfigureRequest req;
   req.slot = 3;
   req.owner = 0x1234;
@@ -1515,6 +1557,7 @@ TEST(configure_driver_exit_codes) {
   CHECK_EQ(shown.seen_req.owner, uint64_t(0x1234));
   CHECK_EQ(shown.seen_cv, 40);
   CHECK(shown.seen_caps);
+  CHECK(shown.seen_numlock);
   CHECK_EQ(shown.seen_state, std::string("C:\\st"));
   CHECK(line.find("\"result\":\"ok\"") != std::string::npos);
   Cfg nothing;

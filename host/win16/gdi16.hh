@@ -15,6 +15,27 @@
 // table; the real object behind one never reaches the guest. Screen DCs each
 // own a DIB section aliasing the display's bits in emulated memory (so any
 // number of GetDC DCs can draw at once), memory DCs are real memory DCs.
+//
+// The DIB driver. CreateDC("DIB", NULL, NULL, lpPackedDIB) was Windows 3.1's
+// DIB.DRV: a device DC drawing straight into the packed DIB's own bits, which
+// the program also reads and writes itself (Star Wars Screen Entertainment's
+// SWSE.DLL makes all its "addressable canvases" this way, _GETCANVASDC). Here
+// it is native (DIB.DRV is never loaded): a DC whose surface is a DIB section
+// aliasing those bits in guest memory (8 bits per pixel, bottom-up or
+// top-down), drawn on by every GDI shim and blitted like any 8-bit surface;
+// DeleteDC leaves the memory as it was. Its pixel values are the DIB's own
+// indices, and colours reach them as DIB.DRV's ColorInfo made them (VERIFIED
+// in its code, 1:0602/1:06FC/1:075C; see Gdi16::dib_index): DIBINDEX(n),
+// PALETTEINDEX(n) and physical colours are pixel value n, whatever palette is
+// selected; any other colour is the nearest entry of the DIB's colour table
+// read as RGBQUADs — or, when that table holds the WORD indices 0, 1, 2, …
+// (the DIB_PAL_COLORS identity table SWSE writes, SETDIBUSAGEBI), of the 16
+// VGA colours (pixel values 0..15). The table is read from guest memory at
+// every match, as the driver did. A DIB DC is no palette device: its
+// RealizePalette maps nothing, GetDeviceCaps answers the driver's GDIINFO.
+// Real GDI batches drawing, and the program reads the bits between calls:
+// after any call that touched a DIB DC the batch is flushed
+// (Runtime16::flush_gdi_after_call).
 #pragma once
 
 #include <windows.h>
@@ -40,23 +61,29 @@ struct Dc16State {
   bool force_background = false;
 };
 
-struct Dc16 {
-  HDC host = nullptr;
-  bool screen = false;          // draws on the display surface
-  bool info = false;            // an information context (CreateIC): never drawn on
-  HBITMAP surface = nullptr;    // screen DCs: their DIB section over the display's bits
-  HGDIOBJ old_bitmap = nullptr;
-  uint16_t hwnd = 0;            // GetDC's window (ReleaseDC checks nothing)
-  int16_t org_x = 0, org_y = 0; // GetDCOrg: the window corner on the screen (GetDC sets it)
-  Dc16State s;
-  std::vector<Dc16State> saved;
-};
-
 struct Bitmap16 {
   int w = 0, h = 0, bpp = 8;
   uint8_t* bits = nullptr;  // host view of the pixels (8bpp key surfaces); null for mono bitmaps
   uint32_t stride = 0;
   uint16_t selected_in = 0;  // the DC it is selected into (a bitmap is in at most one)
+};
+
+struct Dc16 {
+  HDC host = nullptr;
+  bool screen = false;          // draws on the display surface
+  bool info = false;            // an information context (CreateIC): never drawn on
+  bool dib_device = false;      // a DIB driver DC (CreateDC("DIB")): draws on the packed DIB's bits
+  HBITMAP surface = nullptr;    // screen and DIB DCs: their DIB section over guest memory
+  HGDIOBJ old_bitmap = nullptr;
+  uint16_t hwnd = 0;            // GetDC's window (ReleaseDC checks nothing)
+  int16_t org_x = 0, org_y = 0; // GetDCOrg: the window corner on the screen (GetDC sets it)
+  // The packed DIB (far pointer to its BITMAPINFOHEADER) whose colour table
+  // gives this DC's pixel values their meaning — a DIB DC's own, and a memory
+  // DC made compatible with one; 0 = hardware palette indices.
+  uint32_t dib_header = 0;
+  Bitmap16 dib_bmp;             // a DIB DC's surface (dc_surface)
+  Dc16State s;
+  std::vector<Dc16State> saved;
 };
 
 struct Obj16 {
@@ -71,8 +98,17 @@ struct Obj16 {
   COLORREF color = 0;
   COLORREF made_for = 0xFFFFFFFF;
   int style = 0, width = 0, hatch = 0;
-  uint16_t pattern = 0;  // pattern brushes: the bitmap
-  LOGFONTA font{};       // fonts: as created (GetObject)
+  uint16_t pattern = 0;     // pattern brushes: the bitmap
+  uint16_t pattern_of = 0;  // bitmaps: the DIB pattern brush this one was made for (the guest never
+                            // sees it; deleted with the brush)
+  LOGFONTA font{};          // fonts: as created (GetObject)
+  // DIB pattern brushes (CreateDIBPatternBrush): the packed DIB as it was
+  // (Windows kept a copy), and the real brush of its own indices a DIB DC
+  // paints with (made on first use there; Gdi16::realize_brush).
+  std::vector<uint8_t> dib_pattern;
+  uint16_t dib_usage = 0;  // DIB_RGB_COLORS (RGBQUAD table) or DIB_PAL_COLORS (WORDs)
+  HGDIOBJ dib_brush = nullptr;
+  HBITMAP dib_brush_bitmap = nullptr;
 };
 
 class Gdi16 : public RuntimeState16 {
@@ -97,6 +133,10 @@ class Gdi16 : public RuntimeState16 {
   void release_dc(uint16_t h);               // ReleaseDC (pooled for the next GetDC)
   uint16_t create_memory_dc();
   uint16_t create_ic();
+  // The DIB driver (see the header comment): a DC drawing into the packed DIB
+  // at `packed` (BITMAPINFOHEADER, colour table, bits) in guest memory. 0
+  // (logged) for anything DIB.DRV refused, or not 8 bits per pixel.
+  uint16_t create_dib_dc(uint32_t packed);
   // The palette a DC draws with: its selected palette, or DEFAULT_PALETTE.
   win32::LogicalPalette* dc_palette(uint16_t hdc);
   // The surface a DC draws on (the screen's pseudo bitmap for screen DCs); null for mono/IC.
@@ -105,6 +145,20 @@ class Gdi16 : public RuntimeState16 {
   COLORREF key(uint16_t hdc, COLORREF c);
   // What the guest sees for a pixel index read back from a DC's surface.
   COLORREF index_rgb(int index);
+  // … from this DC's surface (a DIB DC's pixel values mean its colour table).
+  COLORREF surface_rgb(uint16_t hdc, int index);
+  // The DIB driver's colour matching: the pixel value a colour becomes in a
+  // DC with DIB colour semantics (Dc16::dib_header; DIB.DRV 1:0602).
+  int dib_index(const Dc16& d, COLORREF c);
+  // DIB.DRV's GetDeviceCaps for a DIB DC (its GDIINFO, sized by the DIB).
+  int dib_device_caps(const Dc16& d, int index);
+  // The DIB's colour table as the driver matched against it: an identity
+  // WORD table (or none) is the 16 VGA colours (vga true).
+  struct DibTable {
+    bool vga = true;
+    std::vector<RGBQUAD> colors;
+  };
+  DibTable dib_table(uint32_t header);
   // Before drawing: the DC's brush/pen re-made for its palette, text colours keyed.
   void sync(uint16_t hdc);
   void sync_brush(uint16_t hdc, uint16_t brush);  // select a specific brush (FillRect)
@@ -128,6 +182,11 @@ class Gdi16 : public RuntimeState16 {
  private:
   void init_stock();
   HGDIOBJ realize_brush(Obj16& o, uint16_t hdc);
+  // A DIB pattern brush's real brush for DIB DCs: the pattern's top-left
+  // 8×8 pixels, their indices as they are (DIB.DRV's colour translation
+  // between two DIBs, 1:0653, is the identity when either table is an
+  // identity table — SWSE's canvases' is).
+  HGDIOBJ dib_pattern_brush(Obj16& o, const Dc16& d);
   HGDIOBJ realize_pen(Obj16& o, uint16_t hdc);
   // The realization cache (see extra_): true when o now holds an earlier
   // real object made for key colour k (the one it held is kept in its place).
@@ -228,9 +287,12 @@ inline RECT16 to_rect16(const RECT& r) {
 
 // The screen DC OLDMOD16 is handed (the saver window's), for the lane.
 uint16_t gdi16_screen_dc(Runtime16& rt, uint16_t hwnd);
+// GDI.MulDiv's arithmetic (gdi16.cc): Win16's rounding, -32768 for a zero
+// divisor or a result outside -32767..32767.
+int16_t gdi16_muldiv(int16_t a, int16_t b, int16_t c);
 // A device bitmap from a packed DIB (BITMAPINFO + bits) in guest memory,
 // colours matched through `hdc`'s palette (0 = DEFAULT_PALETTE, what
-// LoadBitmap used). 0 on failure.
-uint16_t gdi16_bitmap_from_dib(Runtime16& rt, uint16_t hdc, uint32_t packed_dib);
+// LoadBitmap used); `usage` says what the colour table holds. 0 on failure.
+uint16_t gdi16_bitmap_from_dib(Runtime16& rt, uint16_t hdc, uint32_t packed_dib, uint16_t usage = DIB_RGB_COLORS);
 
 }  // namespace adw::win16

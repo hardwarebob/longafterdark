@@ -17,8 +17,10 @@
 #include <deque>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "catalog.h"
 #include "host_process.h"
 
 namespace adw::scr {
@@ -53,11 +55,15 @@ struct ThumbJob {
   std::string id;
   std::wstring host_exe, module_path, win_dir, thumb_path;
   std::string cvset;             // the module's settings, as the saver would send them
+  // Its catalog ABI and "screen", which size its screen (geometry.h:
+  // own_screen, module_screen).
+  std::string abi = kAfterDarkAbi;
+  SizeI screen;
 };
 
 // Posted to the queue's owner: wParam says what happened.
 inline constexpr WPARAM kThumbSaved = 1;          // a thumbnail was written (lParam: 0)
-inline constexpr WPARAM kThumbLaneMissing = 2;    // the host can't run the module's lane (exit 3)
+inline constexpr WPARAM kThumbLaneMissing = 2;    // the host has no lane for a module (exit 3): take_cant_run() names it
 inline constexpr WPARAM kThumbIdle = 3;           // nothing more queued
 
 class ThumbnailQueue {
@@ -73,6 +79,9 @@ class ThumbnailQueue {
   // While paused (the full-screen Preview runs) no frames are asked for.
   void pause(bool paused);
   bool idle() const { return !host_ && jobs_.empty(); }
+  // The ids of the modules whose host exited 3 before a frame since the last
+  // call (each kThumbLaneMissing names one), oldest first; the list is emptied.
+  std::vector<std::string> take_cant_run() { return std::exchange(cant_run_, {}); }
 
   LRESULT handle(HWND h, UINT msg, WPARAM wp, LPARAM lp);
 
@@ -86,6 +95,7 @@ class ThumbnailQueue {
   HANDLE job_ = nullptr;
   Pacer pacer_;
   std::deque<ThumbJob> jobs_;
+  std::vector<std::string> cant_run_;   // ids that exited 3 before a frame, not yet taken
   std::unique_ptr<HostProcess> host_;
   ThumbJob current_;
   ThumbTaker taker_;

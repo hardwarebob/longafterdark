@@ -19,6 +19,7 @@
 #include <wincodec.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -42,6 +43,7 @@
 #include "resource.h"
 #include "settings.h"
 #include "sound.h"
+#include "ui_model.h"
 
 namespace fs = std::filesystem;
 using namespace adw::scr;
@@ -134,6 +136,8 @@ EnvList base_env(const Opts& o, const Work& w) {
       {L"AD_SCR_TEST_MONITORS", L""}, {kPreviewSettingsEnv, L""}, {L"AD_IMPORT_EXE", o.fakeimport},
       {L"FAKEIMPORT_LOG", (w.dir / "fakeimport.log").wstring()}, {L"FAKEIMPORT_EXIT", L""},
       {L"FAKEIMPORT_CATALOG", L""}, {L"FAKEIMPORT_WAIT_MS", L""}, {L"FAKEHOST_LANES", L""},
+      {L"FAKEHOST_ABIS", L""}, {L"FAKEHOST_EXIT3_MODULE", L""}, {L"FAKEHOST_CAPS_DELAY_MS", L""},
+      {L"FAKEHOST_NUMLOCK", L""}, {L"ADNUMLOCK", L""},
       // Interaction (INTERACTION.md): fakehost's levers, and the saver's.
       {L"FAKEHOST_CONFIGURE", L""}, {L"FAKEHOST_CONFIGURE_MS", L""}, {L"FAKEHOST_CONFIGURE_EXIT", L""},
       {L"FAKEHOST_CONFIGURE_EXIT_FILE", L""}, {L"FAKEHOST_INTERACTIVE", L""}, {L"FAKEHOST_CURSOR", L""},
@@ -148,6 +152,8 @@ EnvList base_env(const Opts& o, const Work& w) {
       // inherited.
       {L"ADSOUND", L""}, {L"ADVOLUME", L""}, {L"ADAUDIOOUT", L""}, {L"ADAUDIOLIVE", L""},
       {L"FAKEHOST_QUIT_DELAY_MS", L""},
+      // The dialog's credit link: the test build never opens it, only logs it.
+      {L"AD_SCR_TEST_OPEN_LOG", L""},
   };
 }
 
@@ -1176,7 +1182,8 @@ int test_config_lead(const Opts& o) {
 // The Import… button: adimport (fakeimport.exe here, a console program like
 // it) starts without a console window, and its exit code is read as
 // adw::import::Status — 5 cancelled and 1-4 failed change nothing, 0 brings
-// in the new catalog.
+// in the new catalog. The first import, from the welcome, then asks the host
+// what it runs.
 int test_import(const Opts& o) {
   Work w = prepare(o, "import");
   fs::path catalog = w.assets / "win" / "catalog-win.json";
@@ -1243,6 +1250,68 @@ int test_import(const Opts& o) {
   for (const auto& l : runs) {
     if (l != "run\tconsole=0\targs=--gui") failf("importer run: %s", l.c_str());
   }
+
+  // The first import, from the welcome (which asks the host nothing: it has
+  // no module to ask about). A later catalog keeps the host's answer, but
+  // this one has none yet: the host is asked after the import, before the
+  // module shown starts, and the module's button comes alive.
+  Work fw = prepare(o, "import-first");
+  const fs::path imported = fw.dir / "catalog-imported.json";
+  fs::copy_file(fw.assets / "win" / "catalog-win.json", imported);
+  fs::remove(fw.assets / "win" / "catalog-win.json");   // the module files stay; the dialog opens on the welcome
+  edit_settings(fw, [](Settings& s) {
+    s.module = "test.stops";
+    s.randomize.clear();
+  });
+  EnvList env = base_env(o, fw);
+  env.push_back({L"FAKEIMPORT_EXIT", L"0"});
+  env.push_back({L"FAKEIMPORT_CATALOG", imported.wstring()});
+  HWND dlg = nullptr;
+  int step = 0;
+  bool welcome = false, live_button = false;
+  ULONGLONG t0 = 0;
+  RunResult r = run_scr(o, L"/c", env, 60000, [&](DWORD pid) {
+    if (!dlg) {
+      HWND d = find_dialog(pid);
+      if (!d || !IsWindowVisible(GetDlgItem(d, IDC_WELCOME_IMPORT))) return;
+      dlg = d;
+      welcome = SendMessageW(GetDlgItem(d, IDC_MODULE_LIST), LVM_GETITEMCOUNT, 0, 0) == 0;
+    }
+    if (step == 0) {
+      click(dlg, IDC_WELCOME_IMPORT);
+      t0 = GetTickCount64();
+      step = 1;
+    } else if (step == 1) {
+      // Until the button (test.stops' control 0) is a live one and the
+      // module's live preview runs.
+      HWND button = GetDlgItem(GetDlgItem(dlg, IDC_PANEL), IDC_PANEL_BASE + IDC_PART_INPUT);
+      wchar_t cls[32] = {};
+      if (button) GetClassNameW(button, cls, 32);
+      live_button = button && _wcsicmp(cls, L"Button") == 0 && IsWindowEnabled(button);
+      bool previewing = false;
+      for (auto& e : hosts_of(fw, pid)) previewing |= ends_with(e["module"], "TESTSTOP.AD");
+      if ((!live_button || !previewing) && GetTickCount64() - t0 < 10000) return;
+      PostMessageW(dlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+      step = 2;
+    }
+  });
+  CHECK(step == 2);
+  if (!expect_exit(fw, r, 0)) return 1;
+  CHECK(welcome && live_button);
+  CHECK(count_in_log(fw.scr_log, "dialog: catalog reloaded") == 1);
+  CHECK(count_in_log(fw.scr_log, "dialog: host capabilities") == 1);
+  const auto lines = lines_of(fw.scr_log);
+  auto line_of = [&](const char* needle) {
+    for (size_t i = 0; i < lines.size(); ++i) {
+      if (lines[i].find(needle) != std::string::npos) return (int)i;
+    }
+    return -1;
+  };
+  const int reloaded = line_of("dialog: catalog reloaded"), asked = line_of("dialog: host capabilities"),
+            spawned = line_of("live preview: spawn");
+  CHECK(reloaded >= 0 && asked > reloaded && spawned > asked);
+  check_hosts_gone(fw);
+  if (g_failures) dump_logs(fw);
   return 0;
 }
 
@@ -1736,6 +1805,7 @@ struct A11y {
   bool ok = false;
   int control_type = 0;        // UIA_*ControlTypeId
   std::string name;
+  std::string help;            // HelpText (MSAA's description)
   int toggle = -1;             // ToggleState, -1 without the Toggle pattern
   int live = -1;               // LiveSetting (0 off, 1 polite, 2 assertive)
 };
@@ -1762,6 +1832,12 @@ A11y a11y_of(HWND h) {
       VariantInit(&live);
       if (SUCCEEDED(e->GetCurrentPropertyValue(UIA_LiveSettingPropertyId, &live)) && live.vt == VT_I4) a.live = live.lVal;
       VariantClear(&live);
+      VARIANT help;
+      VariantInit(&help);
+      if (SUCCEEDED(e->GetCurrentPropertyValue(UIA_HelpTextPropertyId, &help)) && help.vt == VT_BSTR && help.bstrVal) {
+        a.help = narrow(std::wstring(help.bstrVal, SysStringLen(help.bstrVal)));
+      }
+      VariantClear(&help);
       IUIAutomationTogglePattern* tp = nullptr;
       if (SUCCEEDED(e->GetCurrentPatternAs(UIA_TogglePatternId, kToggleIid, reinterpret_cast<void**>(&tp))) && tp) {
         ToggleState ts = ToggleState_Off;
@@ -2045,7 +2121,8 @@ HWND open_menu(DWORD pid) {
 // "Change cover…" from a tile's context menu (COVERS.md §1.11), against
 // fakeimport.exe: it starts `--gui --change-cover <id>` with no console
 // window; meanwhile Import… and the menu item are greyed; exit 0 reloads the
-// catalog (keeping the filter), exit 5 changes nothing.
+// catalog (keeping the filter), exit 5 changes nothing. A reload asks the
+// host nothing again and leaves the live preview running.
 int test_config_cover(const Opts& o) {
   Work w = prepare_releases(o, "config-cover");
   fs::path catalog = w.assets / "win" / "catalog-win.json";
@@ -2151,6 +2228,78 @@ int test_config_cover(const Opts& o) {
   for (const auto& l : runs) {
     if (l != "run\tconsole=0\targs=--gui --change-cover simpsons") failf("importer run: %s", l.c_str());
   }
+
+  // Across the reload the host is the same program: its answer stands (it
+  // is asked once), and the module the details show (a pe32 one here) keeps
+  // its live preview, one host from start to end, never stopped for a
+  // question already answered.
+  CHECK(write_file_atomic(catalog.wstring(), original));
+  edit_settings(w, [](Settings& s) {
+    s.module = "ad40.alpha";
+    s.randomize.clear();
+  });
+  std::error_code ec;
+  fs::remove(w.scr_log, ec);
+  fs::remove(w.host_log, ec);
+  EnvList env = base_env(o, w);
+  env.push_back({L"FAKEIMPORT_EXIT", L"0"});
+  env.push_back({L"FAKEIMPORT_CATALOG", changed_path.wstring()});
+  env.push_back({L"FAKEIMPORT_WAIT_MS", L"300"});
+  HWND dlg = nullptr;
+  int step = 0;
+  ULONGLONG t0 = 0;
+  DWORD dialog_pid = 0;
+  RunResult r = run_scr(o, L"/c", env, 60000, [&](DWORD pid) {
+    dialog_pid = pid;
+    if (!dlg) {
+      HWND d = find_dialog(pid);
+      HWND list = d ? GetDlgItem(d, IDC_MODULE_LIST) : nullptr;
+      if (!list || item_count(list) == 0 || !tile_of(d, 4)) return;
+      dlg = d;
+    }
+    auto give_up = [&](const char* why) {
+      if (GetTickCount64() - t0 < 5000) return;
+      failf("%s", why);
+      step = 9;
+      PostMessageW(dlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+    };
+    if (step == 0) {
+      // The preview has run a while: then "Change cover…" on the Simpsons' tile.
+      if (hosts_of(w, pid).empty()) return;
+      if (!t0) t0 = GetTickCount64();
+      if (GetTickCount64() - t0 < 1000) return;
+      PostMessageW(strip_of(dlg), WM_CONTEXTMENU, (WPARAM)tile_of(dlg, 4), (LPARAM)-1);
+      t0 = GetTickCount64();
+      step = 1;
+    } else if (step == 1) {
+      HWND menu = open_menu(pid);
+      if (!menu) return give_up("no context menu");
+      PostMessageW(menu, WM_KEYDOWN, VK_UP, 0);
+      PostMessageW(menu, WM_KEYDOWN, VK_RETURN, 0);
+      t0 = GetTickCount64();
+      step = 2;
+    } else if (step == 2) {
+      if (IsWindowEnabled(GetDlgItem(dlg, IDC_IMPORT))) return give_up("Change cover did not start");
+      step = 3;
+    } else if (step == 3) {
+      if (!IsWindowEnabled(GetDlgItem(dlg, IDC_IMPORT))) return;   // until adimport has exited
+      t0 = GetTickCount64();
+      step = 4;
+    } else if (step == 4) {
+      if (GetTickCount64() - t0 < 1500) return;   // time for a preview restarted after it to show
+      PostMessageW(dlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+      step = 5;
+    }
+  });
+  CHECK(step == 5);
+  if (!expect_exit(w, r, 0)) return 1;
+  CHECK(count_in_log(w.scr_log, "dialog: catalog reloaded") == 1);
+  CHECK(count_in_log(w.scr_log, "dialog: host capabilities") == 1);
+  CHECK(count_in_log(w.scr_log, "live preview: spawn") == 1);
+  int alpha = 0;
+  for (auto& e : hosts_of(w, dialog_pid)) alpha += ends_with(e["module"], "ALPHA.AD");
+  CHECK(alpha == 1);
+  if (g_failures) dump_logs(w);
   return 0;
 }
 
@@ -2188,6 +2337,1298 @@ int test_rotate_collections(const Opts& o) {
   CHECK(count_in_log(w.scr_log, "rotation: 8 module(s), collections=deluxe,ad32") == 1);
   check_hosts_gone(w);
   if (g_failures) dump_logs(w);
+  return 0;
+}
+
+// ---- six releases: another module ABI (Star Wars Screen Entertainment) --------------------
+
+// The six-release tree (catalog-six.json): the five After Dark releases'
+// entries and Star Wars Screen Entertainment's 14 Intermission modules (lane
+// ne16, abi intermission, one Configure... button each), with placeholder
+// module files (*.IMX for theirs) and synthesized cover tiles. With
+// catalog-seven.json, Star Trek: The Screen Saver's four too (lane ne16,
+// "screen": "640x480" each).
+Work prepare_six(const Opts& o, const std::string& name, const char* fixture = "catalog-six.json") {
+  Work w = prepare(o, name, false);
+  fs::path win = w.assets / "win";
+  fs::create_directories(win);
+  fs::copy_file(fs::path(o.fixtures) / fixture, win / "catalog-win.json");
+  Catalog c;
+  load_catalog((win / "catalog-win.json").wstring(), c, nullptr);
+  for (const auto& m : c.modules) {
+    fs::path p = resolve_module_path(win.wstring(), m.path);
+    fs::create_directories(p.parent_path());
+    write_file_atomic(p.wstring(), "placeholder module file for the LongAfterDark.scr smoke tests\n");
+  }
+  static const COLORREF kTop[] = {RGB(230, 190, 40), RGB(90, 90, 110), RGB(60, 160, 80), RGB(180, 60, 180),
+                                  RGB(200, 60, 40), RGB(40, 120, 200)};
+  for (size_t i = 0; i < c.releases.size(); ++i) {
+    const Cover& cv = c.releases[i].cover;
+    if (cv.generated()) continue;
+    synth_tile(resolve_module_path(win.wstring(), cv.tile), kTop[i % 6], RGB(20, 20, 40), (wchar_t)(L'A' + i));
+  }
+  edit_settings(w, [](Settings& s) {
+    s.module = "random";
+    s.randomize.clear();
+    s.controls.clear();
+  });
+  return w;
+}
+
+// A picture already taken for every module of the tree but `except` (the
+// dialog's thumbnails folder, `thumbs` next to settings.ini), so that its
+// background queue has only those to take. Synthesized, never real art.
+void seed_thumbs(const Work& w, const std::set<std::string>& except) {
+  Catalog c;
+  load_catalog((w.assets / "win" / "catalog-win.json").wstring(), c, nullptr);
+  const int n = 96;
+  std::vector<uint8_t> bgr((size_t)n * n * 3);
+  for (int y = 0; y < n; ++y) {
+    for (int x = 0; x < n; ++x) {
+      uint8_t* p = &bgr[((size_t)y * n + x) * 3];
+      p[0] = (uint8_t)(x * 2), p[1] = (uint8_t)(y * 2), p[2] = (uint8_t)((x + y) & 0xFF);
+    }
+  }
+  fs::create_directories(w.dir / "thumbs");
+  for (const auto& m : c.modules) {
+    if (except.count(m.id)) continue;
+    std::string err;
+    if (!adw::ui::save_png_bgr((w.dir / "thumbs" / (m.id + ".v2.png")).wstring(), n, n, bgr, &err)) {
+      failf("cannot write a thumbnail for %s: %s", m.id.c_str(), err.c_str());
+    }
+  }
+}
+
+// One off-screen render of the settings dialog (the screenshot hook: never
+// on screen, never focused) with `state`, and its report.
+std::map<std::string, std::string> dialog_report(const Opts& o, const Work& w, const std::string& state,
+                                                 const EnvList& extra = {}) {
+  const fs::path png = w.dir / "dialog.png", report = w.dir / "report.txt";
+  EnvList env = base_env(o, w);
+  env.insert(env.end(), extra.begin(), extra.end());
+  env.push_back({L"AD_SCR_TEST_SCREENSHOT", png.wstring()});
+  env.push_back({L"AD_SCR_TEST_SCREENSHOT_STATE", widen(state + ";report=") + report.wstring()});
+  RunResult r = run_scr(o, L"/c", env, 90000);
+  std::map<std::string, std::string> kv;
+  if (!expect_exit(w, r, 0)) return kv;
+  for (const auto& l : lines_of(report)) {
+    size_t eq = l.find('=');
+    if (eq != std::string::npos) kv[l.substr(0, eq)] = l.substr(eq + 1);
+  }
+  if (kv.empty()) failf("%s: no report", w.dir.string().c_str());
+  return kv;
+}
+
+bool started_imx(const Work& w) {
+  for (auto& e : host_events(w, "start")) {
+    if (ends_with(e["module"], ".IMX")) return true;
+  }
+  return false;
+}
+
+// The settings dialog with a module ABI a host may lack (PLAN: catalog "abi",
+// --capabilities "abis="), rendered off screen against fakehost:
+//  * today's host (abis=afterdark,intermission): Star Wars Screen
+//    Entertainment's modules run: previewed, a live Configure...;
+//  * a host from before module ABIs (no abis=): they are "Coming soon",
+//    dimmed, never started, not even for a thumbnail, their button read-only,
+//    Preview greyed, the group's pill up; the rest run;
+//  * one module's exit 3 (its preview, or its thumbnail) makes that module
+//    alone "Coming soon", never every module of its lane or ABI;
+//  * at the minimum window in Random, the long release title is ellipsized
+//    so that its count shows.
+int test_config_abi(const Opts& o) {
+  const std::string swse_ids = "swse.battles,swse.bios,swse.bluprint,swse.cantina,swse.hyperspc,swse.iclock,swse.jawas,"
+                               "swse.posters,swse.rclock,swse.sabrduel,swse.storybrd,swse.swtext,swse.trench,swse.vader";
+  // Today's host.
+  {
+    Work w = prepare_six(o, "config-abi-host");
+    auto kv = dialog_report(o, w, "theme=light;mode=single;module=swse.vader;size=1040x800;wait=6000;frames=3");
+    CHECK(kv["caps"].find(" abis=afterdark,intermission ") != std::string::npos);
+    CHECK(kv["details"] == "swse.vader" && kv["badge"] == "Star Wars" && kv["soon"].empty());
+    CHECK(kv["button_live"] == "1" && kv["preview_enabled"] == "1");
+    bool vader = false;
+    for (auto& e : host_events(w, "start")) vader |= ends_with(e["module"], "VADER.IMX");
+    CHECK(vader);   // the live preview ran it
+    CHECK(host_events(w, "capabilities").size() == 1);
+    check_hosts_gone(w);
+    if (g_failures) dump_logs(w);
+  }
+  // A host from before module ABIs; the background thumbnails on (every
+  // module but theirs already has a picture: the queue could take only
+  // theirs, and must not).
+  {
+    Work w = prepare_six(o, "config-abi-old");
+    std::set<std::string> theirs;
+    for (size_t p = 0; p < swse_ids.size();) {
+      size_t comma = swse_ids.find(',', p);
+      theirs.insert(swse_ids.substr(p, comma == std::string::npos ? std::string::npos : comma - p));
+      if (comma == std::string::npos) break;
+      p = comma + 1;
+    }
+    seed_thumbs(w, theirs);
+    auto kv = dialog_report(o, w, "theme=light;mode=random;module=swse.vader;size=1040x800;thumbgen=wait;wait=4000",
+                            {{L"FAKEHOST_ABIS", L"none"}});
+    CHECK(!kv["caps"].empty() && kv["caps"].find("abis=") == std::string::npos);
+    CHECK(kv["soon"] == swse_ids);
+    CHECK(kv["badge"] == "Star Wars \xC2\xB7 Coming soon" && kv["button_live"] == "0" && kv["preview_enabled"] == "0");
+    CHECK(!started_imx(w));   // no preview, no thumbnail of theirs
+    for (const auto& id : theirs) CHECK(!fs::exists(w.dir / "thumbs" / (id + ".v2.png")));
+    check_hosts_gone(w);
+    if (g_failures) dump_logs(w);
+  }
+  // One module's preview exits 3 (a host that lists everything): it alone
+  // is "Coming soon"; the other 13, and every Classic module, still run.
+  {
+    Work w = prepare_six(o, "config-abi-exit3");
+    auto kv = dialog_report(o, w, "theme=light;mode=single;module=swse.battles;size=1040x800;wait=5000;frames=1000",
+                            {{L"FAKEHOST_EXIT3_MODULE", L"BATTLES.IMX"}});
+    CHECK(kv["soon"] == "swse.battles");
+    CHECK(kv["details"] == "swse.battles" && kv["badge"] == "Star Wars \xC2\xB7 Coming soon" && kv["button_live"] == "0");
+    CHECK(count_in_log(w.scr_log, "swse.battles exited 3") == 1);
+    check_hosts_gone(w);
+    if (g_failures) dump_logs(w);
+  }
+  // ...and so does a module whose thumbnail's host exits 3 (the queue runs
+  // the two without a picture: that one, and one that works).
+  {
+    Work w = prepare_six(o, "config-abi-thumb3");
+    seed_thumbs(w, {"swse.jawas", "swse.cantina"});
+    auto kv = dialog_report(o, w, "theme=light;mode=single;module=swse.vader;size=1040x800;thumbgen=wait;wait=30000",
+                            {{L"FAKEHOST_EXIT3_MODULE", L"JAWAS.IMX"}});
+    CHECK(kv["soon"] == "swse.jawas");
+    CHECK(kv["details"] == "swse.vader" && kv["badge"] == "Star Wars" && kv["button_live"] == "1");
+    CHECK(fs::exists(w.dir / "thumbs" / "swse.cantina.v2.png") && !fs::exists(w.dir / "thumbs" / "swse.jawas.v2.png"));
+    check_hosts_gone(w);
+    if (g_failures) dump_logs(w);
+  }
+  // The narrowest window in Random: "Star Wars Screen Entertainment" gives
+  // way (its count shows), with or without its "Coming soon" pill; the After
+  // Dark titles are drawn whole without one.
+  for (bool old_host : {false, true}) {
+    Work w = prepare_six(o, old_host ? "config-abi-min-old" : "config-abi-min");
+    EnvList extra;
+    if (old_host) extra.push_back({L"FAKEHOST_ABIS", L"none"});
+    // The first row: the list opens at its top, the first two headers in view.
+    auto kv = dialog_report(o, w, "theme=light;mode=random;module=simpsons.hotel;size=900x680;dpi=96;wait=2500;frames=2",
+                            extra);
+    const std::string title = "Star Wars Screen Entertainment", drawn = kv["drawn1"];
+    CHECK(kv["group1"].rfind(title + ", ", 0) == 0);   // screen readers hear it whole
+    CHECK(ends_with(drawn, "\xE2\x80\xA6") && drawn.size() > 3 && title.rfind(drawn.substr(0, drawn.size() - 3), 0) == 0);
+    // Without the pill, the After Dark titles in view are drawn whole.
+    CHECK(kv.count("drawn0") == 1);
+    for (int g = 0; !old_host && g < 6; ++g) {
+      const std::string k = std::to_string(g);
+      if (g == 1 || !kv.count("drawn" + k)) continue;
+      CHECK(kv["group" + k].rfind(kv["drawn" + k] + ", ", 0) == 0);
+    }
+    check_hosts_gone(w);
+    if (g_failures) dump_logs(w);
+  }
+  return 0;
+}
+
+// The tree with Star Wars Screen Entertainment alone imported: the six
+// releases' catalog cut down to its package and its 14 modules.
+Work prepare_swse_only(const Opts& o, const std::string& name) {
+  Work w = prepare_six(o, name);
+  const fs::path catalog = w.assets / "win" / "catalog-win.json";
+  std::string text;
+  read_file(catalog.wstring(), text);
+  phosg::JSON root = phosg::JSON::parse(text);
+  phosg::JSON one = phosg::JSON::dict();
+  one.emplace("version", 1);
+  phosg::JSON packages = phosg::JSON::list(), modules = phosg::JSON::list();
+  for (const auto& p : root.at("packages").as_list()) {
+    if (p->at("id").as_string() == "swse") packages.emplace_back(phosg::JSON(*p));
+  }
+  for (const auto& m : root.at("modules").as_list()) {
+    if (m->at("package").as_string() == "swse") modules.emplace_back(phosg::JSON(*m));
+  }
+  one.emplace("packages", std::move(packages));
+  one.emplace("modules", std::move(modules));
+  CHECK(write_file_atomic(catalog.wstring(), one.serialize()));
+  return w;
+}
+
+// /s and /p with Star Wars Screen Entertainment imported: on a host from
+// before module ABIs, Random leaves their 14 modules out (asking the host
+// first: "rotation: left out 14 module(s)", counting only what the rotation
+// would have held), and a list of only theirs falls back to what it can run;
+// with nothing else imported, nothing plays and the window says why (never
+// their modules into errors, one after another); on today's host they rotate
+// like the rest. /s runs on one monitor staged off every real one (it never
+// covers them).
+int test_rotate_abi(const Opts& o) {
+  Work w = prepare_six(o, "rotate-abi");
+  edit_settings(w, [](Settings& s) { s.all_monitors = false; });
+  auto run_s = [&](const Work& tree, const EnvList& extra, const char* frames, DWORD code = 0) {
+    fs::remove(tree.scr_log);
+    fs::remove(tree.host_log);
+    EnvList env = base_env(o, tree);
+    env.insert(env.end(), extra.begin(), extra.end());
+    env.push_back({L"AD_SCR_TEST_MONITORS", L"-16000,0,856,480,p"});
+    env.push_back({L"AD_SCR_TEST_ROTATE_MS", L"300"});
+    env.push_back({L"AD_SCR_TESTEXIT_AFTER_FRAMES", widen(frames)});
+    RunResult r = run_scr(o, L"/s", env, 60000);
+    return expect_exit(tree, r, code);
+  };
+  auto run_p = [&](const Work& tree, const EnvList& extra, DWORD code = 0) {
+    fs::remove(tree.scr_log);
+    fs::remove(tree.host_log);
+    HWND parent = make_parent(152, 112);
+    EnvList env = base_env(o, tree);
+    env.insert(env.end(), extra.begin(), extra.end());
+    env.push_back({L"AD_SCR_TESTEXIT_AFTER_FRAMES", L"10"});
+    RunResult r = run_scr(o, L"/p " + hwnd_arg(parent), env, 60000);
+    DestroyWindow(parent);
+    return expect_exit(tree, r, code);
+  };
+  const EnvList old_host = {{L"FAKEHOST_ABIS", L"none"}};
+  // A host from before module ABIs: none of theirs is started.
+  if (!run_s(w, old_host, "60")) return 1;
+  CHECK(count_in_log(w.scr_log, "rotation: 13 module(s), collections=all") == 1);
+  CHECK(count_in_log(w.scr_log, "rotation: left out 14 module(s) this host can't run") == 1);
+  CHECK(!started_imx(w) && host_events(w, "start").size() >= 2);
+  check_hosts_gone(w);
+  // ...not even when the list names only theirs: every module it can run
+  // (and "left out" counts the two the list held).
+  edit_settings(w, [](Settings& s) { s.randomize = {"swse.vader", "swse.jawas"}; });
+  if (!run_s(w, old_host, "30")) return 1;
+  CHECK(count_in_log(w.scr_log, "rotation: 13 module(s), collections=all") == 1);
+  CHECK(count_in_log(w.scr_log, "rotation: left out 2 module(s) this host can't run") == 1);
+  CHECK(!started_imx(w));
+  check_hosts_gone(w);
+  // A list of one of theirs and one After Dark module: that one plays alone.
+  edit_settings(w, [](Settings& s) { s.randomize = {"swse.vader", "ad40.alpha"}; });
+  if (!run_s(w, old_host, "20")) return 1;
+  CHECK(count_in_log(w.scr_log, "rotation: 1 module(s), collections=all") == 1);
+  CHECK(count_in_log(w.scr_log, "rotation: left out 1 module(s) this host can't run") == 1);
+  CHECK(!started_imx(w) && !host_events(w, "start").empty());
+  for (auto& e : host_events(w, "start")) CHECK(ends_with(e["module"], "ALPHA.AD"));
+  check_hosts_gone(w);
+  edit_settings(w, [](Settings& s) { s.randomize = {"swse.vader", "swse.jawas"}; });
+  // Today's host: they rotate, and nothing is left out.
+  if (!run_s(w, {}, "90")) return 1;
+  CHECK(count_in_log(w.scr_log, "rotation: 2 module(s), collections=all") == 1);
+  CHECK(count_in_log(w.scr_log, "left out") == 0);
+  std::set<std::string> played;
+  for (auto& e : host_events(w, "start")) played.insert(e["module"]);
+  CHECK(played.size() == 2);
+  for (const auto& m : played) CHECK(ends_with(m, "VADER.IMX") || ends_with(m, "JAWAS.IMX"));
+  check_hosts_gone(w);
+  // The Control Panel's /p asks the host too, and leaves theirs out.
+  edit_settings(w, [](Settings& s) { s.randomize.clear(); });
+  if (!run_p(w, old_host)) return 1;
+  CHECK(host_events(w, "capabilities").size() == 1 && !started_imx(w) && host_events(w, "start").size() == 1);
+  CHECK(count_in_log(w.scr_log, "rotation: left out 14 module(s) this host can't run") == 1);
+  check_hosts_gone(w);
+  if (g_failures) dump_logs(w);
+
+  // Theirs alone: a host from before module ABIs can run none of them. No
+  // host starts, and the window says so (the test hook's exit 13).
+  Work sw = prepare_swse_only(o, "rotate-abi-swse");
+  edit_settings(sw, [](Settings& s) { s.all_monitors = false; });
+  if (!run_s(sw, old_host, "30", 13)) return 1;
+  CHECK(host_events(sw, "capabilities").size() == 1 && host_events(sw, "start").empty());
+  CHECK(count_in_log(sw.scr_log, "rotation: 0 module(s), collections=all") == 1);
+  CHECK(count_in_log(sw.scr_log, "rotation: left out 14 module(s) this host can't run") == 1);
+  CHECK(count_in_log(sw.scr_log, "status window=0: None of the modules imported can run on this Long After Dark host "
+                                 "(adhostwin.exe).") == 1);
+  if (!run_p(sw, old_host, 13)) return 1;
+  CHECK(host_events(sw, "capabilities").size() == 1 && host_events(sw, "start").empty());
+  CHECK(count_in_log(sw.scr_log, "status window=0: No module can run on this host") == 1);
+  // ...which today's host runs.
+  if (!run_s(sw, {}, "30")) return 1;
+  CHECK(started_imx(sw) && count_in_log(sw.scr_log, "left out") == 0 && count_in_log(sw.scr_log, "status window") == 0);
+  check_hosts_gone(sw);
+  if (g_failures) dump_logs(sw);
+  return 0;
+}
+
+void post_display_change(DWORD pid, int times);   // below
+
+// Posts WM_CLOSE to every saver window of `pid` (the saver exits 0).
+void close_saver(DWORD pid) {
+  EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+    DWORD p = 0;
+    GetWindowThreadProcessId(h, &p);
+    wchar_t cls[64] = {};
+    GetClassNameW(h, cls, 64);
+    if (p == (DWORD)lp && wcscmp(cls, L"LongAfterDarkSaver") == 0) PostMessageW(h, WM_CLOSE, 0, 0);
+    return TRUE;
+  }, (LPARAM)pid);
+}
+
+// When the saver logged the first line holding `needle` (its GetTickCount64
+// stamp: "[scr <pid> <tick>] …"), or 0 when it didn't; `at` gets the line's index.
+unsigned long long log_tick(const fs::path& log, const std::string& needle, int* at = nullptr) {
+  const auto lines = lines_of(log);
+  for (size_t i = 0; i < lines.size(); ++i) {
+    if (lines[i].find(needle) == std::string::npos) continue;
+    unsigned long pid = 0;
+    unsigned long long tick = 0;
+    if (sscanf(lines[i].c_str(), "[scr %lu %llu]", &pid, &tick) != 2) continue;
+    if (at) *at = (int)i;
+    return tick;
+  }
+  if (at) *at = -1;
+  return 0;
+}
+
+// The saver's wait for the host's answer, when Random needs it (a rotation
+// holding a module of another ABI): a host slow to answer (FAKEHOST_CAPS_DELAY_MS)
+//  * past the wait (2 s): the first host starts once it runs out, the rotation
+//    keeps every module, and the late answer is only logged;
+//  * within it, while monitors change: a relayout retires the window that
+//    was up when the saver asked, and the answer still reaches the window
+//    that replaced it (Random leaves theirs out).
+// On one monitor staged off every real one.
+int test_rotate_abi_wait(const Opts& o) {
+  Work w = prepare_six(o, "rotate-abi-wait");
+  edit_settings(w, [](Settings& s) {
+    s.all_monitors = false;
+    s.randomize = {"swse.vader", "ad40.alpha"};
+  });
+  // Past the wait. Nothing ends the run on its own: the Intermission module
+  // fails on this host (exit 1) and is skipped; it ends once the late answer
+  // has come and theirs has been tried, or at the deadline.
+  {
+    EnvList env = base_env(o, w);
+    env.push_back({L"FAKEHOST_ABIS", L"none"});
+    env.push_back({L"FAKEHOST_CAPS_DELAY_MS", L"3000"});
+    env.push_back({L"AD_SCR_TEST_MONITORS", L"-16000,0,856,480,p"});
+    env.push_back({L"AD_SCR_TEST_ROTATE_MS", L"300"});
+    const ULONGLONG t0 = GetTickCount64();
+    bool closed = false;
+    RunResult r = run_scr(o, L"/s", env, 60000, [&](DWORD pid) {
+      const bool done = count_in_log(w.scr_log, "host capabilities: lanes=") > 0 && started_imx(w);
+      if (!closed && (done || GetTickCount64() - t0 > 20000)) {
+        close_saver(pid);
+        closed = true;
+      }
+    });
+    if (!expect_exit(w, r, 0)) return 1;
+    CHECK(count_in_log(w.scr_log, "host capabilities: no answer within 2000 ms; Random keeps every module") == 1);
+    CHECK(count_in_log(w.scr_log, "rotation: 2 module(s), collections=all") == 1);
+    CHECK(count_in_log(w.scr_log, "left out") == 0);
+    CHECK(started_imx(w));   // kept: this host never said it can't run it in time
+    // The first host started when the wait ran out, not before, and the
+    // answer came after it.
+    int waited = -1, spawned = -1, answered = -1;
+    const unsigned long long t_wait = log_tick(w.scr_log, "rotation: waiting for the host's capabilities", &waited);
+    const unsigned long long t_spawn = log_tick(w.scr_log, "spawn window=0 ", &spawned);
+    log_tick(w.scr_log, "host capabilities: lanes=", &answered);
+    CHECK(waited >= 0 && spawned > waited && answered > spawned);
+    if (t_wait && t_spawn && t_spawn - t_wait < 1900) failf("the first host started %llu ms into the wait", t_spawn - t_wait);
+    check_hosts_gone(w);
+    if (g_failures) dump_logs(w);
+  }
+  // Within the wait, while the monitor changes mode (16:9 to 4:3: a new
+  // window, the first one retired) before the answer comes.
+  {
+    fs::remove(w.scr_log);
+    fs::remove(w.host_log);
+    edit_settings(w, [](Settings& s) { s.randomize.clear(); });
+    EnvList env = base_env(o, w);
+    env.push_back({L"FAKEHOST_ABIS", L"none"});
+    env.push_back({L"FAKEHOST_CAPS_DELAY_MS", L"1200"});
+    env.push_back({L"AD_SCR_TEST_MONITORS", L"-16000,0,856,480,p|-16000,0,640,480,p"});
+    env.push_back({L"AD_SCR_TEST_ROTATE_MS", L"300"});
+    env.push_back({L"AD_SCR_TESTEXIT_AFTER_FRAMES", L"30"});
+    bool posted = false;
+    RunResult r = run_scr(o, L"/s", env, 60000, [&](DWORD pid) {
+      if (!posted && count_in_log(w.scr_log, "rotation: waiting for the host's capabilities") > 0) {
+        post_display_change(pid, 1);
+        posted = true;
+      }
+    });
+    if (!expect_exit(w, r, 0)) return 1;
+    CHECK(posted);
+    CHECK(count_in_log(w.scr_log, "relayout monitors=1->1 kept=0 moved=0 created=1 retired=1") == 1);
+    int relayout = -1, answered = -1;
+    log_tick(w.scr_log, "relayout monitors=", &relayout);
+    log_tick(w.scr_log, "host capabilities: lanes=", &answered);
+    CHECK(relayout >= 0 && answered > relayout);   // the first window was gone when the answer came
+    CHECK(count_in_log(w.scr_log, "no answer within") == 0);
+    CHECK(count_in_log(w.scr_log, "rotation: 13 module(s), collections=all") == 1);
+    CHECK(count_in_log(w.scr_log, "rotation: left out 14 module(s) this host can't run") == 1);
+    CHECK(!started_imx(w) && !host_events(w, "start").empty());
+    for (auto& e : host_events(w, "start")) CHECK(e["ADSCREENW"] == "640");   // the new window's hosts only
+    check_hosts_gone(w);
+    if (g_failures) dump_logs(w);
+  }
+  return 0;
+}
+
+// The hosts' start lines for modules whose path ends in `suffix`, in order.
+std::vector<std::map<std::string, std::string>> starts_of(const Work& w, const char* suffix) {
+  std::vector<std::map<std::string, std::string>> v;
+  for (auto& e : host_events(w, "start")) {
+    if (ends_with(e["module"], suffix)) v.push_back(e);
+  }
+  return v;
+}
+
+bool screen_is(std::map<std::string, std::string>& e, const char* width, const char* height) {
+  return e["ADSCREENW"] == width && e["ADSCREENH"] == height;
+}
+
+// Star Wars Screen Entertainment's modules fill the screen (PLAN §6a.1):
+// whatever the Resolution setting (720 lines here), every host started for
+// an Intermission module asks for its own 640x480 (geometry.h:
+// module_screen), and its 4:3 frame is scaled to fit the monitor: on this
+// 16:9 one its full height, side bars only. After Dark modules keep the
+// setting.
+//  * /s on a 16:9 monitor staged off every real one, rotating between an
+//    Intermission and an After Dark module: each host its module's size,
+//    640x480 and 1280x720, switch after switch; the first host starts on the
+//    desktop captured at its own screen (where this desktop can be captured);
+//  * that window shows the 640x480 frame full height, pillarboxed;
+//  * a monitor change of aspect keeps an Intermission module's host (its
+//    window moves) and replaces an After Dark module's;
+//  * /p: 320x240, as for every module;
+//  * the settings dialog: its live preview and thumbnails 640x480, and
+//    Preview's /s too.
+int test_screen_abi(const Opts& o) {
+  Work w = prepare_six(o, "screen-abi");
+  edit_settings(w, [](Settings& s) {
+    s.scale = 1.5;
+    s.all_monitors = false;
+    s.module = "random";
+    s.randomize = {"swse.vader", "ad40.alpha"};
+  });
+  const std::wstring wide = L"-16000,0,1280,720,p";
+  // A rotation of both ABIs.
+  {
+    EnvList env = base_env(o, w);
+    env.push_back({L"AD_SCR_TEST_MONITORS", wide});
+    env.push_back({L"AD_SCR_TEST_ROTATE_MS", L"300"});
+    bool closed = false;
+    const ULONGLONG t0 = GetTickCount64();
+    RunResult r = run_scr(o, L"/s", env, 60000, [&](DWORD pid) {
+      if (!closed && (host_events(w, "start").size() >= 5 || GetTickCount64() - t0 > 20000)) {
+        close_saver(pid);
+        closed = true;
+      }
+    });
+    if (!expect_exit(w, r, 0)) return 1;
+    auto starts = host_events(w, "start");
+    CHECK(starts.size() >= 4);
+    int imx = 0, ad = 0;
+    std::string last;
+    for (auto& e : starts) {
+      const bool is_imx = ends_with(e["module"], "VADER.IMX");
+      CHECK(is_imx || ends_with(e["module"], "ALPHA.AD"));
+      if (is_imx) {
+        ++imx;
+        CHECK(screen_is(e, "640", "480"));
+      } else {
+        ++ad;
+        CHECK(screen_is(e, "1280", "720"));
+      }
+      CHECK(e["module"] != last);   // two modules: every switch a new host, of the other size
+      last = e["module"];
+    }
+    CHECK(imx >= 2 && ad >= 2);
+    CHECK(count_in_log(w.scr_log, "size=640x480 ") == imx && count_in_log(w.scr_log, "size=1280x720 ") == ad);
+    // Both screens captured before the window appeared (either module may
+    // come first), the first host started on its own one; the rest black.
+    if (!starts.empty() && count_in_log(w.scr_log, "seed window=0 ") > 0) {
+      CHECK(count_in_log(w.scr_log, "seed window=0 1280x720 from 1280x720 in ") == 1);
+      CHECK(count_in_log(w.scr_log, "seed window=0 640x480 from 960x720 (the frame's part of the monitor) in ") == 1);
+      CHECK(starts[0]["seed_check"] == "ok " + starts[0]["ADSCREENW"] + "x" + starts[0]["ADSCREENH"]);
+      CHECK(ends_with(starts[0]["ADSEEDIMG"], starts[0]["ADSCREENW"] == "640" ? "-0-640x480.ppm" : "-0.ppm"));
+    } else {
+      fprintf(stderr, "screen-abi: no desktop capture here (a desktop that can't be read back); seeds not checked\n");
+    }
+    for (size_t i = 1; i < starts.size(); ++i) CHECK(starts[i]["ADSEEDIMG"].empty());
+    check_hosts_gone(w);
+    if (g_failures) dump_logs(w);
+  }
+  // What the window shows: the 640x480 frame at the monitor's full height,
+  // black bars at the sides only (fit_rect: 960x720 at x=160).
+  {
+    fs::remove(w.scr_log);
+    fs::remove(w.host_log);
+    edit_settings(w, [](Settings& s) {
+      s.module = "swse.vader";
+      s.randomize.clear();
+    });
+    const fs::path caps = w.dir / "captures";
+    fs::create_directories(caps);
+    EnvList env = base_env(o, w);
+    env.push_back({L"AD_SCR_TEST_MONITORS", wide});
+    env.push_back({L"AD_SCR_TEST_CAPTURE", caps.wstring()});
+    env.push_back({L"AD_SCR_TEST_CAPTURE_FRAMES", L"20"});
+    env.push_back({L"AD_SCR_TESTEXIT_AFTER_FRAMES", L"30"});
+    RunResult r = run_scr(o, L"/s", env, 60000);
+    if (!expect_exit(w, r, 0)) return 1;
+    auto starts = host_events(w, "start");
+    CHECK(starts.size() == 1);
+    for (auto& e : starts) CHECK(screen_is(e, "640", "480"));
+    CHECK(count_in_log(w.scr_log, "capture window=0 frame=20 ok 1280x720 host=640x480 ") == 1);
+    int sw = 0, sh = 0;
+    std::vector<uint8_t> px;
+    if (load_png(caps / "window0-frame20.png", &sw, &sh, &px) && sw == 1280 && sh == 720) {
+      auto lit = [&](int x, int y) {
+        const uint8_t* q = &px[((size_t)y * sw + x) * 4];
+        return q[0] + q[1] + q[2] > 48;
+      };
+      const RectI fit = fit_rect(640, 480, 1280, 720);
+      CHECK((fit == RectI{160, 0, 960, 720}));
+      for (int y : {2, 180, 360, 540, 717}) {
+        CHECK(!lit(80, y) && !lit(fit.x - 2, y) && !lit(fit.x + fit.w + 1, y) && !lit(1200, y));   // the side bars
+      }
+      // The frame reaches the top and the bottom rows: no bars there.
+      int top = 0, bottom = 0, n = 0;
+      for (int x = fit.x + 40; x < fit.x + fit.w - 40; x += 40, ++n) {
+        top += lit(x, 1);
+        bottom += lit(x, 718);
+      }
+      CHECK(top * 10 >= n * 9 && bottom * 10 >= n * 9);
+    } else {
+      failf("no 1280x720 capture of window 0 at frame 20");
+    }
+    check_hosts_gone(w);
+    if (g_failures) dump_logs(w);
+  }
+  // A monitor change of aspect (16:9 to 4:3): an Intermission module's host
+  // carries on in the moved window; an After Dark module's is replaced.
+  for (bool imx : {true, false}) {
+    fs::remove(w.scr_log);
+    fs::remove(w.host_log);
+    edit_settings(w, [&](Settings& s) {
+      s.module = imx ? "swse.vader" : "ad40.alpha";
+      s.randomize.clear();
+    });
+    EnvList env = base_env(o, w);
+    env.push_back({L"AD_SCR_TEST_MONITORS", wide + L"|-16000,0,1024,768,p"});
+    env.push_back({L"AD_SCR_TESTEXIT_AFTER_FRAMES", L"200"});
+    bool posted = false;
+    RunResult r = run_scr(o, L"/s", env, 60000, [&](DWORD pid) {
+      if (!posted && count_in_log(w.scr_log, "spawn window=0 ") > 0) {
+        post_display_change(pid, 1);
+        posted = true;
+      }
+    });
+    if (!expect_exit(w, r, 0)) return 1;
+    CHECK(posted);
+    auto starts = host_events(w, "start");
+    if (imx) {
+      CHECK(count_in_log(w.scr_log, "relayout monitors=1->1 kept=0 moved=1 created=0 retired=0") == 1);
+      CHECK(starts.size() == 1);
+      for (auto& e : starts) CHECK(screen_is(e, "640", "480"));
+    } else {
+      CHECK(count_in_log(w.scr_log, "relayout monitors=1->1 kept=0 moved=0 created=1 retired=1") == 1);
+      CHECK(starts.size() == 2);
+      if (starts.size() == 2) CHECK(screen_is(starts[0], "1280", "720") && screen_is(starts[1], "960", "720"));
+    }
+    check_hosts_gone(w);
+    if (g_failures) dump_logs(w);
+  }
+  // /p: 320x240 for an Intermission module as for any (the host renders it
+  // through a 640x480 guest display, which its scene fills).
+  {
+    fs::remove(w.scr_log);
+    fs::remove(w.host_log);
+    edit_settings(w, [](Settings& s) {
+      s.module = "swse.vader";
+      s.randomize.clear();
+    });
+    HWND parent = make_parent(152, 112);
+    EnvList env = base_env(o, w);
+    env.push_back({L"AD_SCR_TESTEXIT_AFTER_FRAMES", L"10"});
+    RunResult r = run_scr(o, L"/p " + hwnd_arg(parent), env, 60000);
+    DestroyWindow(parent);
+    if (!expect_exit(w, r, 0)) return 1;
+    auto starts = starts_of(w, "VADER.IMX");
+    CHECK(starts.size() == 1);
+    for (auto& e : starts) CHECK(screen_is(e, "320", "240"));
+    check_hosts_gone(w);
+    if (g_failures) dump_logs(w);
+  }
+  // The settings dialog: its live preview of an Intermission module, the
+  // background thumbnails (one module of each ABI still without a picture),
+  // then Preview, whose /s runs on the monitor staged off every real one and
+  // ends itself.
+  {
+    fs::remove(w.scr_log);
+    fs::remove(w.host_log);
+    seed_thumbs(w, {"swse.jawas", "ad40.twin"});
+    EnvList env = base_env(o, w);
+    env.push_back({L"AD_SCR_THUMBGEN", L"1"});
+    env.push_back({L"AD_SCR_TEST_MONITORS", wide});
+    env.push_back({L"AD_SCR_TESTEXIT_AFTER_FRAMES", L"20"});
+    DWORD dialog_pid = 0;
+    int step = 0;
+    RunResult r = run_scr(o, L"/c", env, 90000, [&](DWORD pid) {
+      dialog_pid = pid;
+      HWND dlg = find_dialog(pid);
+      if (!dlg) return;
+      if (step == 0) {
+        std::set<std::string> ran;
+        for (auto& e : hosts_of(w, pid)) ran.insert(fs::path(e["module"]).filename().string());
+        if (!ran.count("VADER.IMX") || !ran.count("JAWAS.IMX") || !ran.count("TWIN.AD")) return;
+        click(dlg, IDC_PREVIEW);
+        step = 1;
+      } else if (step == 1) {
+        // The Preview has ended (its test exit) and the dialog took it back.
+        if (!hosts_of(w, pid, true).empty() && IsWindowEnabled(GetDlgItem(dlg, IDC_PREVIEW))) {
+          PostMessageW(dlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+          step = 2;
+        }
+      }
+    });
+    CHECK(step == 2);
+    if (!expect_exit(w, r, 0)) return 1;
+    bool live = false, thumb_imx = false, thumb_ad = false;
+    for (auto& e : hosts_of(w, dialog_pid)) {
+      const std::string file = fs::path(e["module"]).filename().string();
+      if (file == "VADER.IMX") live |= screen_is(e, "640", "480");      // not the 16:9 preview's 856x480
+      if (file == "JAWAS.IMX") thumb_imx |= screen_is(e, "640", "480");
+      if (file == "TWIN.AD") thumb_ad |= screen_is(e, "640", "480");
+      if (file == "VADER.IMX" || file == "JAWAS.IMX") CHECK(screen_is(e, "640", "480"));
+    }
+    CHECK(live && thumb_imx && thumb_ad);
+    auto preview = hosts_of(w, dialog_pid, true);   // Preview's /s
+    CHECK(!preview.empty());
+    for (auto& e : preview) CHECK(ends_with(e["module"], "VADER.IMX") && screen_is(e, "640", "480"));
+    check_hosts_gone(w);
+    if (g_failures) dump_logs(w);
+  }
+  return 0;
+}
+
+// Star Trek: The Screen Saver's modules compose a fixed 640x480 scene (The
+// Mission at the top left of a larger screen beside a grey band, Final Exam
+// small in its middle), and the catalog gives each "screen": "640x480"
+// (PLAN §2.4, catalog-seven.json): whatever the Resolution setting (720
+// lines here), every host started for one asks for 640x480, exactly as an
+// Intermission module does by its ABI (geometry.h: own_screen,
+// module_screen), and its frame is scaled to fit the monitor.
+//  * /s on a 16:9 monitor staged off every real one, rotating between a Star
+//    Trek module and an After Dark one: 640x480 and 1280x720, switch after
+//    switch, and a seed picture planned for each; beside a Star Wars module,
+//    640x480 both;
+//  * the window shows the 640x480 frame at the monitor's full height;
+//  * a monitor change of aspect moves its window and keeps its host;
+//  * /p: 320x240, as for every module;
+//  * the settings dialog: its live preview and a thumbnail at 640x480, and
+//    Preview's /s too;
+//  * the live preview follows the catalog's "screen" alone: an import that
+//    only adds it to the module shown replaces its host with one at 640x480.
+int test_screen_field(const Opts& o) {
+  Work w = prepare_six(o, "screen-field", "catalog-seven.json");
+  edit_settings(w, [](Settings& s) {
+    s.scale = 1.5;
+    s.all_monitors = false;
+    s.module = "random";
+  });
+  const std::wstring wide = L"-16000,0,1280,720,p";
+  // Rotations: a Star Trek module and an After Dark one, then a Star Trek
+  // module and a Star Wars one.
+  for (bool with_swse : {false, true}) {
+    fs::remove(w.scr_log);
+    fs::remove(w.host_log);
+    edit_settings(w, [&](Settings& s) { s.randomize = {"startrek.final", with_swse ? "swse.vader" : "ad40.alpha"}; });
+    EnvList env = base_env(o, w);
+    env.push_back({L"AD_SCR_TEST_MONITORS", wide});
+    env.push_back({L"AD_SCR_TEST_ROTATE_MS", L"300"});
+    bool closed = false;
+    const ULONGLONG t0 = GetTickCount64();
+    RunResult r = run_scr(o, L"/s", env, 60000, [&](DWORD pid) {
+      if (!closed && (host_events(w, "start").size() >= 5 || GetTickCount64() - t0 > 20000)) {
+        close_saver(pid);
+        closed = true;
+      }
+    });
+    if (!expect_exit(w, r, 0)) return 1;
+    auto starts = host_events(w, "start");
+    CHECK(starts.size() >= 4);
+    int trek = 0, other = 0;
+    std::string last;
+    for (auto& e : starts) {
+      const bool is_trek = ends_with(e["module"], "FINAL.AD");
+      CHECK(is_trek || ends_with(e["module"], with_swse ? "VADER.IMX" : "ALPHA.AD"));
+      if (is_trek) {
+        ++trek;
+        CHECK(screen_is(e, "640", "480"));
+      } else {
+        ++other;
+        CHECK(with_swse ? screen_is(e, "640", "480") : screen_is(e, "1280", "720"));
+      }
+      CHECK(e["module"] != last);   // two modules: every switch a new host
+      last = e["module"];
+    }
+    CHECK(trek >= 2 && other >= 2);
+    CHECK(count_in_log(w.scr_log, "size=640x480 ") == (with_swse ? trek + other : trek));
+    CHECK(count_in_log(w.scr_log, "size=1280x720 ") == (with_swse ? 0 : other));
+    // One picture per screen its first host may be given, taken before the
+    // window appeared (first_module_screens, plan_seed_shots): a Star Trek
+    // module's 640x480 beside an After Dark module's 1280x720 is two (by the
+    // ABIs alone it was one); with a Star Wars module in the rotation, what
+    // Random plays waits on the host's answer, so every module available may
+    // come first: two as well. Each picture planned logs a line, taken or
+    // not (a desktop that can't be read back fails every capture).
+    CHECK(count_in_log(w.scr_log, "seed window=0 ") + count_in_log(w.scr_log, "seed window=0: capture failed") == 2);
+    CHECK(count_in_log(w.scr_log, "none taken at") == 0);
+    if (!starts.empty() && count_in_log(w.scr_log, "seed window=0 ") > 0) {
+      CHECK(count_in_log(w.scr_log, "seed window=0 640x480 from 960x720 (the frame's part of the monitor) in ") == 1);
+      CHECK(count_in_log(w.scr_log, "seed window=0 1280x720 from 1280x720 in ") == 1);
+      CHECK(starts[0]["seed_check"] == "ok " + starts[0]["ADSCREENW"] + "x" + starts[0]["ADSCREENH"]);
+    } else {
+      fprintf(stderr, "screen-field: no desktop capture here (a desktop that can't be read back); seeds not checked\n");
+    }
+    check_hosts_gone(w);
+    if (g_failures) dump_logs(w);
+  }
+  // What the window shows of The Mission: the 640x480 frame at the
+  // monitor's full height, black bars at the sides only (960x720 at x=160).
+  {
+    fs::remove(w.scr_log);
+    fs::remove(w.host_log);
+    edit_settings(w, [](Settings& s) {
+      s.module = "startrek.mission";
+      s.randomize.clear();
+    });
+    const fs::path caps = w.dir / "captures";
+    fs::create_directories(caps);
+    EnvList env = base_env(o, w);
+    env.push_back({L"AD_SCR_TEST_MONITORS", wide});
+    env.push_back({L"AD_SCR_TEST_CAPTURE", caps.wstring()});
+    env.push_back({L"AD_SCR_TEST_CAPTURE_FRAMES", L"20"});
+    env.push_back({L"AD_SCR_TESTEXIT_AFTER_FRAMES", L"30"});
+    RunResult r = run_scr(o, L"/s", env, 60000);
+    if (!expect_exit(w, r, 0)) return 1;
+    auto starts = host_events(w, "start");
+    CHECK(starts.size() == 1);
+    for (auto& e : starts) CHECK(ends_with(e["module"], "MISSION.AD") && screen_is(e, "640", "480"));
+    CHECK(count_in_log(w.scr_log, "capture window=0 frame=20 ok 1280x720 host=640x480 ") == 1);
+    int sw = 0, sh = 0;
+    std::vector<uint8_t> px;
+    if (load_png(caps / "window0-frame20.png", &sw, &sh, &px) && sw == 1280 && sh == 720) {
+      auto lit = [&](int x, int y) {
+        const uint8_t* q = &px[((size_t)y * sw + x) * 4];
+        return q[0] + q[1] + q[2] > 48;
+      };
+      const RectI fit = fit_rect(640, 480, 1280, 720);
+      CHECK((fit == RectI{160, 0, 960, 720}));
+      for (int y : {2, 180, 360, 540, 717}) {
+        CHECK(!lit(80, y) && !lit(fit.x - 2, y) && !lit(fit.x + fit.w + 1, y) && !lit(1200, y));   // the side bars
+      }
+      int top = 0, bottom = 0, n = 0;
+      for (int x = fit.x + 40; x < fit.x + fit.w - 40; x += 40, ++n) {
+        top += lit(x, 1);
+        bottom += lit(x, 718);
+      }
+      CHECK(top * 10 >= n * 9 && bottom * 10 >= n * 9);   // no bars above or below
+    } else {
+      failf("no 1280x720 capture of window 0 at frame 20");
+    }
+    check_hosts_gone(w);
+    if (g_failures) dump_logs(w);
+  }
+  // A monitor change of aspect (16:9 to 4:3): the window moves, its host
+  // carries on (an After Dark module's would be replaced: screen-abi).
+  {
+    fs::remove(w.scr_log);
+    fs::remove(w.host_log);
+    edit_settings(w, [](Settings& s) {
+      s.module = "startrek.tribble";
+      s.randomize.clear();
+    });
+    EnvList env = base_env(o, w);
+    env.push_back({L"AD_SCR_TEST_MONITORS", wide + L"|-16000,0,1024,768,p"});
+    env.push_back({L"AD_SCR_TESTEXIT_AFTER_FRAMES", L"200"});
+    bool posted = false;
+    RunResult r = run_scr(o, L"/s", env, 60000, [&](DWORD pid) {
+      if (!posted && count_in_log(w.scr_log, "spawn window=0 ") > 0) {
+        post_display_change(pid, 1);
+        posted = true;
+      }
+    });
+    if (!expect_exit(w, r, 0)) return 1;
+    CHECK(posted);
+    CHECK(count_in_log(w.scr_log, "relayout monitors=1->1 kept=0 moved=1 created=0 retired=0") == 1);
+    auto starts = host_events(w, "start");
+    CHECK(starts.size() == 1);
+    for (auto& e : starts) CHECK(ends_with(e["module"], "TRIBBLE.AD") && screen_is(e, "640", "480"));
+    check_hosts_gone(w);
+    if (g_failures) dump_logs(w);
+  }
+  // /p: 320x240, as for every module.
+  {
+    fs::remove(w.scr_log);
+    fs::remove(w.host_log);
+    edit_settings(w, [](Settings& s) {
+      s.module = "startrek.final";
+      s.randomize.clear();
+    });
+    HWND parent = make_parent(152, 112);
+    EnvList env = base_env(o, w);
+    env.push_back({L"AD_SCR_TESTEXIT_AFTER_FRAMES", L"10"});
+    RunResult r = run_scr(o, L"/p " + hwnd_arg(parent), env, 60000);
+    DestroyWindow(parent);
+    if (!expect_exit(w, r, 0)) return 1;
+    auto starts = starts_of(w, "FINAL.AD");
+    CHECK(starts.size() == 1);
+    for (auto& e : starts) CHECK(screen_is(e, "320", "240"));
+    check_hosts_gone(w);
+    if (g_failures) dump_logs(w);
+  }
+  // The settings dialog: its live preview of Final Exam, the background
+  // thumbnails (a Star Trek and an After Dark module still without a
+  // picture), then Preview, whose /s runs on the monitor staged off every
+  // real one and ends itself. In this copy of the catalog Tribbles' own
+  // screen is 800x600, so its thumbnail shows the catalog's size is used
+  // (a 4:3 capture at 480 lines would be 640x480 either way).
+  {
+    fs::remove(w.scr_log);
+    fs::remove(w.host_log);
+    {
+      const fs::path catalog = w.assets / "win" / "catalog-win.json";
+      std::string text;
+      read_file(catalog.wstring(), text);
+      phosg::JSON root = phosg::JSON::parse(text);
+      int edited = 0;
+      for (auto& m : root.at("modules").as_list()) {
+        if (m->at("id").as_string() != "startrek.tribble") continue;
+        m->at("screen") = phosg::JSON("800x600");
+        ++edited;
+      }
+      CHECK(edited == 1 && write_file_atomic(catalog.wstring(), root.serialize()));
+    }
+    seed_thumbs(w, {"startrek.tribble", "ad40.twin"});
+    EnvList env = base_env(o, w);
+    env.push_back({L"AD_SCR_THUMBGEN", L"1"});
+    env.push_back({L"AD_SCR_TEST_MONITORS", wide});
+    env.push_back({L"AD_SCR_TESTEXIT_AFTER_FRAMES", L"20"});
+    DWORD dialog_pid = 0;
+    int step = 0;
+    RunResult r = run_scr(o, L"/c", env, 90000, [&](DWORD pid) {
+      dialog_pid = pid;
+      HWND dlg = find_dialog(pid);
+      if (!dlg) return;
+      if (step == 0) {
+        std::set<std::string> ran;
+        for (auto& e : hosts_of(w, pid)) ran.insert(fs::path(e["module"]).filename().string());
+        if (!ran.count("FINAL.AD") || !ran.count("TRIBBLE.AD") || !ran.count("TWIN.AD")) return;
+        click(dlg, IDC_PREVIEW);
+        step = 1;
+      } else if (step == 1) {
+        if (!hosts_of(w, pid, true).empty() && IsWindowEnabled(GetDlgItem(dlg, IDC_PREVIEW))) {
+          PostMessageW(dlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+          step = 2;
+        }
+      }
+    });
+    CHECK(step == 2);
+    if (!expect_exit(w, r, 0)) return 1;
+    bool live = false, thumb_trek = false, thumb_ad = false;
+    for (auto& e : hosts_of(w, dialog_pid)) {
+      const std::string file = fs::path(e["module"]).filename().string();
+      if (file == "FINAL.AD") live |= screen_is(e, "640", "480");   // not the 16:9 preview's 856x480
+      if (file == "TRIBBLE.AD") thumb_trek |= screen_is(e, "800", "600");
+      if (file == "TWIN.AD") thumb_ad |= screen_is(e, "640", "480");
+      if (file == "FINAL.AD") CHECK(screen_is(e, "640", "480"));
+      if (file == "TRIBBLE.AD") CHECK(screen_is(e, "800", "600"));
+    }
+    CHECK(live && thumb_trek && thumb_ad);
+    CHECK(count_in_log(w.scr_log, "live preview: spawn ") > 0 &&
+          count_in_log(w.scr_log, "FINAL.AD size=640x480 abi=afterdark screen=640x480 ") > 0);
+    auto preview = hosts_of(w, dialog_pid, true);   // Preview's /s
+    CHECK(!preview.empty());
+    for (auto& e : preview) CHECK(ends_with(e["module"], "FINAL.AD") && screen_is(e, "640", "480"));
+    check_hosts_gone(w);
+    if (g_failures) dump_logs(w);
+  }
+  // The live preview follows the catalog's "screen" alone (live_preview.cc:
+  // same_target). The dialog opens on Final Exam from a catalog without the
+  // field (written by an adimport from before it), so its live preview runs
+  // it as any After Dark module, at the preview box's 16:9 480 lines. An
+  // import then adds "screen": "640x480" and changes nothing else about it
+  // (id, ABI, path, settings): with the dialog still open, its host is
+  // replaced by one at 640x480.
+  {
+    fs::remove(w.scr_log);
+    fs::remove(w.host_log);
+    const fs::path catalog = w.assets / "win" / "catalog-win.json";
+    const fs::path imported = w.dir / "catalog-imported.json";
+    std::string text;
+    CHECK(read_file((fs::path(o.fixtures) / "catalog-seven.json").wstring(), text));
+    CHECK(write_file_atomic(imported.wstring(), text));   // what the import leaves: the fixture as it is
+    {
+      phosg::JSON root = phosg::JSON::parse(text);
+      size_t dropped = 0;
+      for (auto& m : root.at("modules").as_list()) dropped += m->erase("screen");
+      CHECK(dropped == 4 && write_file_atomic(catalog.wstring(), root.serialize()));
+    }
+    edit_settings(w, [](Settings& s) {
+      s.module = "startrek.final";
+      s.randomize.clear();
+    });
+    EnvList env = base_env(o, w);
+    env.push_back({L"FAKEIMPORT_EXIT", L"0"});
+    env.push_back({L"FAKEIMPORT_CATALOG", imported.wstring()});
+    DWORD dialog_pid = 0;
+    int step = 0;
+    ULONGLONG clicked = 0;
+    auto finals = [&](DWORD pid) {   // the dialog's hosts of Final Exam, in order
+      std::vector<std::map<std::string, std::string>> v;
+      for (auto& e : hosts_of(w, pid)) {
+        if (ends_with(e["module"], "FINAL.AD")) v.push_back(e);
+      }
+      return v;
+    };
+    RunResult r = run_scr(o, L"/c", env, 60000, [&](DWORD pid) {
+      dialog_pid = pid;
+      if (step == 2) return;
+      HWND dlg = find_dialog(pid);
+      if (!dlg) return;
+      if (step == 0) {
+        if (finals(pid).empty()) return;   // its live preview runs
+        click(dlg, IDC_IMPORT);             // disables the button until the importer has exited
+        clicked = GetTickCount64();
+        step = 1;
+      } else if (step == 1) {
+        // The import is in once the button is back (the catalog read again
+        // in the same message): then a second host, or none within 10 s.
+        if (!IsWindowEnabled(GetDlgItem(dlg, IDC_IMPORT))) return;
+        if (finals(pid).size() < 2 && GetTickCount64() - clicked < 10000) return;
+        PostMessageW(dlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+        step = 2;
+      }
+    });
+    CHECK(step == 2);
+    if (!expect_exit(w, r, 0)) return 1;
+    CHECK(count_in_log(w.scr_log, "dialog: catalog reloaded") == 1);
+    auto v = finals(dialog_pid);
+    CHECK(v.size() == 2);
+    if (v.size() == 2) {
+      CHECK(v[0]["ADSCREENH"] == "480" && v[0]["ADSCREENW"] != "640");   // 856x480 (848x480 in a taller box)
+      CHECK(screen_is(v[1], "640", "480"));
+    }
+    // In the log: the spawn without a screen of its own, the new catalog,
+    // then the spawn with it, and no other.
+    const auto lines = lines_of(w.scr_log);
+    int without = -1, reloaded = -1, with = -1, spawns = 0;
+    for (int i = 0; i < (int)lines.size(); ++i) {
+      const std::string& l = lines[i];
+      if (l.find("dialog: catalog reloaded") != std::string::npos) reloaded = i;
+      if (l.find("live preview: spawn ") == std::string::npos) continue;
+      ++spawns;
+      if (l.find("FINAL.AD size=") == std::string::npos) continue;
+      if (l.find(" abi=afterdark screen=0x0 ") != std::string::npos) without = i;
+      if (l.find(" size=640x480 abi=afterdark screen=640x480 ") != std::string::npos) with = i;
+    }
+    CHECK(spawns == 2 && without >= 0 && reloaded > without && with > reloaded);
+    check_hosts_gone(w);
+    if (g_failures) dump_logs(w);
+  }
+  return 0;
+}
+
+// The tools of the tooltip windows `dlg` owns: each tool's window (a
+// TTF_IDISHWND tool's uId; null for the others) and its text, read through
+// memory in the dialog's process (TOOLINFO carries a pointer, which
+// comctl32 doesn't marshal across processes).
+std::vector<std::pair<HWND, std::string>> tooltip_tools(HWND dlg) {
+  std::vector<HWND> tips;
+  struct Find {
+    HWND dlg;
+    std::vector<HWND>* tips;
+  } f{dlg, &tips};
+  EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+    auto* f = reinterpret_cast<Find*>(lp);
+    wchar_t cls[64] = {};
+    GetClassNameW(h, cls, 64);
+    if (GetWindow(h, GW_OWNER) == f->dlg && wcscmp(cls, TOOLTIPS_CLASSW) == 0) f->tips->push_back(h);
+    return TRUE;
+  }, reinterpret_cast<LPARAM>(&f));
+  std::vector<std::pair<HWND, std::string>> out;
+  DWORD pid = 0;
+  GetWindowThreadProcessId(dlg, &pid);
+  HANDLE p = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ, FALSE, pid);
+  if (!p) return out;
+  constexpr size_t kChars = 1024;   // longer than any tip the dialog sets
+  if (void* mem = VirtualAllocEx(p, nullptr, sizeof(TOOLINFOW) + kChars * sizeof(wchar_t), MEM_COMMIT | MEM_RESERVE,
+                                 PAGE_READWRITE)) {
+    auto* remote_text = reinterpret_cast<wchar_t*>(static_cast<char*>(mem) + sizeof(TOOLINFOW));
+    std::vector<wchar_t> text(kChars);
+    for (HWND tip : tips) {
+      const int n = (int)SendMessageW(tip, TTM_GETTOOLCOUNT, 0, 0);
+      for (int i = 0; i < n; ++i) {
+        TOOLINFOW ti{};
+        ti.cbSize = sizeof(ti);
+        ti.lpszText = remote_text;
+        std::fill(text.begin(), text.end(), L'\0');
+        if (!WriteProcessMemory(p, mem, &ti, sizeof(ti), nullptr) ||
+            !WriteProcessMemory(p, remote_text, text.data(), kChars * sizeof(wchar_t), nullptr) ||
+            !SendMessageW(tip, TTM_ENUMTOOLSW, (WPARAM)i, (LPARAM)mem)) {
+          continue;
+        }
+        TOOLINFOW back{};
+        ReadProcessMemory(p, mem, &back, sizeof(back), nullptr);
+        ReadProcessMemory(p, remote_text, text.data(), kChars * sizeof(wchar_t), nullptr);
+        text.back() = L'\0';
+        out.push_back({(back.uFlags & TTF_IDISHWND) ? (HWND)back.uId : nullptr, narrow(text.data())});
+      }
+    }
+    VirtualFreeEx(p, mem, 0, MEM_RELEASE);
+  }
+  CloseHandle(p);
+  return out;
+}
+
+// The control with the keyboard focus in `dlg`'s thread (GetFocus() answers
+// for the caller's own thread only).
+HWND focus_in(HWND dlg) {
+  GUITHREADINFO gi{};
+  gi.cbSize = sizeof(gi);
+  return GetGUIThreadInfo(GetWindowThreadProcessId(dlg, nullptr), &gi) ? gi.hwndFocus : nullptr;
+}
+
+// A push button with the default-button state (BS_DEFPUSHBUTTON): the one
+// the dialog manager's Enter clicks while it has the focus.
+bool default_button(HWND b) { return (GetWindowLongW(b, GWL_STYLE) & BS_TYPEMASK) == BS_DEFPUSHBUTTON; }
+
+// The footer's credit (PLAN §6a.3): "Made With Love by StarrLord", a link
+// between the assets line and Preview. In the dialog: shown, named so for
+// screen readers (with where it goes), between Import and Preview in the tab
+// order; a click, Enter and Space each ask for the project's page, which the
+// test build records (AD_SCR_TEST_OPEN_LOG) and never opens. Hidden while it
+// has the focus (the window narrowed under it), it hands the focus on to
+// Preview with the default-button state, so Enter there runs Preview. Rendered
+// off screen: clear of the assets line's text and of Preview by the footer's
+// gap at the first-open size and the minimum, at 100% and 150%, in the
+// welcome too; hidden, never clipped, when the assets line leaves it no room.
+int test_config_credit(const Opts& o) {
+  Work w = prepare_six(o, "config-credit");
+  edit_settings(w, [](Settings& s) { s.module = "swse.vader"; });
+  const fs::path open_log = w.dir / "open.log";
+  const std::string url = "https://github.com/starrlord/longafterdark";
+  EnvList env = base_env(o, w);
+  env.push_back({L"AD_SCR_TEST_OPEN_LOG", open_log.wstring()});
+  auto requests = [&] { return count_in_log(open_log, "open\t" + url); };
+  bool visible = false, tip = false;
+  std::string text;
+  A11y a;
+  HWND tab_after_import = nullptr, tab_after_credit = nullptr, credit_hwnd = nullptr, preview_hwnd = nullptr;
+  int step = 0, after_click = -1, after_enter = -1, after_space = -1;
+  RunResult r = run_scr(o, L"/c", env, 60000, [&](DWORD pid) {
+    HWND dlg = find_dialog(pid);
+    HWND list = dlg ? GetDlgItem(dlg, IDC_MODULE_LIST) : nullptr;
+    if (!list || SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) == 0) return;
+    HWND link = GetDlgItem(dlg, IDC_FOOTER_CREDIT);
+    if (step == 0) {
+      credit_hwnd = link;
+      preview_hwnd = GetDlgItem(dlg, IDC_PREVIEW);
+      visible = link && IsWindowVisible(link);
+      text = window_text(link);
+      a = a11y_of(link);
+      tab_after_import = GetNextDlgTabItem(dlg, GetDlgItem(dlg, IDC_IMPORT), FALSE);
+      tab_after_credit = GetNextDlgTabItem(dlg, link, FALSE);
+      for (const auto& [tool, tool_text] : tooltip_tools(dlg)) tip |= tool == link && tool_text == url;
+      click(dlg, IDC_FOOTER_CREDIT);
+      after_click = requests();
+      // The keyboard: the link focused as Tab would, then Enter.
+      SendMessageW(dlg, WM_NEXTDLGCTL, (WPARAM)link, TRUE);
+      PostMessageW(link, WM_KEYDOWN, VK_RETURN, 0x001C0001);
+      PostMessageW(link, WM_KEYUP, VK_RETURN, 0xC01C0001);
+      step = 1;
+    } else if (step == 1 && requests() >= 2) {
+      after_enter = requests();
+      PostMessageW(link, WM_KEYDOWN, VK_SPACE, 0x00390001);
+      PostMessageW(link, WM_KEYUP, VK_SPACE, 0xC0390001);
+      step = 2;
+    } else if (step == 2 && requests() >= 3) {
+      after_space = requests();
+      PostMessageW(dlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+      step = 3;
+    }
+  });
+  if (!expect_exit(w, r, 0)) return 1;
+  CHECK(step == 3);
+  // What screen readers hear is what the link draws, and it reads as asked.
+  const std::string phrase = narrow(std::wstring(kFooterCreditLead) + L" " + kFooterCreditName);
+  CHECK(phrase == "Made With Love by StarrLord");
+  CHECK(visible && text == phrase);
+  CHECK(tip);   // its tooltip is the address
+  CHECK(a.ok && a.name == phrase && a.control_type == UIA_ButtonControlTypeId);
+  CHECK(a.help == "Opens " + url + " in your browser");
+  CHECK(credit_hwnd && tab_after_import == credit_hwnd && tab_after_credit == preview_hwnd);
+  CHECK(after_click == 1 && after_enter == 2 && after_space == 3);
+  CHECK(count_in_log(w.scr_log, "dialog: open " + url + " (the test build opens nothing)") == 3);
+  check_hosts_gone(w);
+  if (g_failures) {
+    fprintf(stderr, "credit: visible=%d tip=%d text=\"%s\" name=\"%s\" type=%d help=\"%s\" requests=%d/%d/%d\n",
+            visible, tip, text.c_str(), a.name.c_str(), a.control_type, a.help.c_str(), after_click, after_enter,
+            after_space);
+    dump_logs(w);
+  }
+
+  // The link hiding while it has the focus. With Star Wars Screen
+  // Entertainment alone imported, its long title leaves the credit room only
+  // in a wide window: the link is focused there as Tab would focus it (the
+  // dialog manager makes it the default push button), then the window is
+  // narrowed to its minimum. The link hides and the focus moves on to Preview
+  // with the default-button state (Preview BS_DEFPUSHBUTTON, the link no
+  // longer), so Enter there runs Preview's /s and the dialog stays open, having
+  // saved nothing. Left with the hidden link, the default state sends Enter to
+  // the dialog's default, OK, which saves and closes.
+  {
+    Work f = prepare_swse_only(o, "config-credit-focus");
+    edit_settings(f, [](Settings& s) { s.module = "swse.vader"; });
+    EnvList fenv = base_env(o, f);
+    // Preview's /s inherits these: it runs on a monitor staged off every real
+    // one and ends itself, its temporary files in the test's folder.
+    const fs::path tmp = f.dir / "tmp";
+    fs::create_directories(tmp);
+    fenv.push_back({L"AD_SCR_TEST_MONITORS", L"-16000,0,1280,720,p"});
+    fenv.push_back({L"AD_SCR_TESTEXIT_AFTER_FRAMES", L"20"});
+    fenv.push_back({L"TMP", tmp.wstring()});
+    fenv.push_back({L"TEMP", tmp.wstring()});
+    bool wide = false, focused = false, link_default = false, hidden = false, on_preview = false,
+         preview_default = false, link_plain = false, forced = false, reactivated_on_preview = false, still_open = false;
+    int fstep = 0;
+    DWORD dialog_pid = 0;
+    RunResult fr = run_scr(o, L"/c", fenv, 60000, [&](DWORD pid) {
+      dialog_pid = pid;
+      HWND dlg = find_dialog(pid);
+      HWND list = dlg ? GetDlgItem(dlg, IDC_MODULE_LIST) : nullptr;
+      if (!list || SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) == 0) return;
+      HWND link = GetDlgItem(dlg, IDC_FOOTER_CREDIT), preview = GetDlgItem(dlg, IDC_PREVIEW);
+      if (fstep == 0) {
+        if (!IsWindowEnabled(preview)) return;   // not until the host's answer is in
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        GetMonitorInfoW(MonitorFromWindow(dlg, MONITOR_DEFAULTTONEAREST), &mi);
+        const RECT& wa = mi.rcWork;
+        RECT wr{};
+        GetWindowRect(dlg, &wr);
+        const int height = std::min(wr.bottom - wr.top, wa.bottom - wa.top);
+        // As wide as its monitor's work area (SetWindowPos returns once the
+        // dialog has laid itself out again).
+        SetWindowPos(dlg, nullptr, wa.left, wa.top, wa.right - wa.left, height, SWP_NOZORDER | SWP_NOACTIVATE);
+        wide = IsWindowVisible(link) != FALSE;
+        if (!wide) {
+          // A monitor too narrow for the credit beside this assets line: no
+          // step here (it is skipped below, not failed).
+          PostMessageW(dlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+          fstep = 3;
+          return;
+        }
+        SendMessageW(dlg, WM_NEXTDLGCTL, (WPARAM)link, TRUE);
+        focused = focus_in(dlg) == link;
+        link_default = default_button(link);
+        // The narrowest it goes: SetWindowPos stops at the window's minimum size.
+        SetWindowPos(dlg, nullptr, 0, 0, 1, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        hidden = !IsWindowVisible(link);
+        on_preview = focus_in(dlg) == preview;
+        preview_default = default_button(preview);
+        link_plain = !default_button(link);
+        // The link hidden while the dialog was inactive: the dialog manager
+        // saved the focus on it and gives it back on activation. The focus
+        // put there as it would be, then a deactivation and an activation.
+        SendMessageW(dlg, WM_NEXTDLGCTL, (WPARAM)link, TRUE);
+        forced = focus_in(dlg) == link;
+        SendMessageW(dlg, WM_ACTIVATE, MAKEWPARAM(WA_INACTIVE, 0), 0);
+        SendMessageW(dlg, WM_ACTIVATE, MAKEWPARAM(WA_ACTIVE, 0), 0);
+        fstep = 10;
+      } else if (fstep == 10) {
+        // The dialog's check after the restore has run (posted, before this poll).
+        reactivated_on_preview = focus_in(dlg) == preview && default_button(preview) && !default_button(link);
+        if (!reactivated_on_preview) {
+          // Enter would go to the hidden link: stop here, the checks below say why.
+          PostMessageW(dlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+          fstep = 3;
+          return;
+        }
+        PostMessageW(preview, WM_KEYDOWN, VK_RETURN, 0x001C0001);
+        PostMessageW(preview, WM_KEYUP, VK_RETURN, 0xC01C0001);
+        fstep = 1;
+      } else if (fstep == 1 && !hosts_of(f, pid, true).empty()) {
+        // Preview's /s has started its host, and the dialog is still there.
+        still_open = IsWindow(dlg) && count_in_log(f.scr_log, "dialog: saved") == 0;
+        fstep = 2;
+      } else if (fstep == 2 && IsWindowEnabled(preview)) {
+        // The Preview has ended (its test exit) and the dialog took it back.
+        PostMessageW(dlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+        fstep = 3;
+      }
+    });
+    if (!expect_exit(f, fr, 0)) return 1;
+    if (!wide) {
+      // The credit needs about 1,030 DIP beside the Star Wars-only assets
+      // line; a narrower work area never shows it, so there is nothing to hide.
+      fprintf(stderr, "credit focus: skipped (the credit does not show at this monitor's work-area width)\n");
+    } else {
+      CHECK(focused && link_default);
+      CHECK(hidden && on_preview && preview_default && link_plain);
+      CHECK(forced && reactivated_on_preview);
+      CHECK(fstep == 3 && still_open);
+      CHECK(count_in_log(f.scr_log, "dialog: saved") == 0);
+      auto preview_hosts = hosts_of(f, dialog_pid, true);
+      CHECK(!preview_hosts.empty());
+      for (auto& e : preview_hosts) CHECK(ends_with(e["module"], "VADER.IMX"));
+    }
+    check_hosts_gone(f);
+    if (g_failures) {
+      fprintf(stderr, "credit focus: step=%d wide=%d focused=%d link_default=%d hidden=%d on_preview=%d "
+                      "preview_default=%d link_plain=%d forced=%d reactivated_on_preview=%d still_open=%d\n",
+              fstep, wide, focused, link_default, hidden, on_preview, preview_default, link_plain, forced,
+              reactivated_on_preview, still_open);
+      dump_logs(f);
+    }
+  }
+
+  // Off screen: where it shows, at 100% and 150%, light and dark.
+  auto rect_of = [](const std::string& v) {
+    RectI r{};
+    return sscanf(v.c_str(), "%d,%d,%d,%d", &r.x, &r.y, &r.w, &r.h) == 4 ? r : RectI{};
+  };
+  struct Shot {
+    const char* state;
+    bool shown;
+  };
+  // (At 150% in the narrowest window it fits by a few pixels in Segoe UI
+  // Variable, so there it is only held to the rules when it shows.)
+  for (const Shot& shot : {Shot{"theme=light;dpi=96;size=1040x800", true}, Shot{"theme=dark;dpi=144;size=1040x800", true},
+                           Shot{"theme=hc;dpi=144;size=1040x800", true}, Shot{"theme=light;dpi=96;size=900x680", true},
+                           Shot{"theme=dark;dpi=144;size=900x680", false}}) {
+    auto kv = dialog_report(o, w, std::string(shot.state) + ";mode=single;module=swse.vader;wait=2500;frames=2");
+    if (!shot.shown && kv["credit"] == "hidden") continue;
+    const RectI box = rect_of(kv["credit"]), lead = rect_of(kv["credit_lead"]), name = rect_of(kv["credit_name"]);
+    const RectI assets = rect_of(kv["assets_text"]), preview = rect_of(kv["preview_button"]);
+    const int dpi = atoi(kv["dpi"].c_str()), gap = dip(kCreditGapDip, std::max(96, dpi));
+    CHECK(kv["credit"] != "hidden" && box.w > 0 && preview.w > 0 && assets.w > 0);
+    CHECK(box.x >= assets.x + assets.w + gap && box.x + box.w <= preview.x - gap);
+    CHECK(std::abs((box.x - (assets.x + assets.w)) - (preview.x - (box.x + box.w))) <= 1);   // centred between them
+    CHECK(std::abs((box.y + box.h / 2) - (preview.y + preview.h / 2)) <= 1);               // on the buttons' line
+    CHECK(lead.y == name.y && lead.x >= box.x && lead.x + lead.w < name.x && name.x + name.w <= box.x + box.w);
+    CHECK(lead.y == assets.y);   // one line with the assets line's text
+  }
+  // The assets line at its longest (files missing) in the minimum window:
+  // no room, so the credit hides.
+  {
+    Work m = prepare_six(o, "config-credit-missing");
+    Catalog c;
+    load_catalog((m.assets / "win" / "catalog-win.json").wstring(), c, nullptr);
+    for (const char* id : {"ad40.alpha", "ad40.twin"}) {
+      if (const Module* mod = c.find(id)) fs::remove(resolve_module_path((m.assets / "win").wstring(), mod->path));
+    }
+    auto kv = dialog_report(o, m, "theme=light;dpi=96;size=900x680;mode=single;module=swse.vader;wait=2500;frames=2");
+    CHECK(kv["credit"] == "hidden" && kv["credit_lead"] == "hidden");
+    if (g_failures) dump_logs(m);
+  }
+  // Nothing imported: the welcome's footer has room for it (no Import button).
+  {
+    Work e = prepare(o, "config-credit-welcome", false);
+    auto kv = dialog_report(o, e, "theme=light;dpi=96;size=900x600;wait=1500");
+    const RectI box = rect_of(kv["credit"]), assets = rect_of(kv["assets_text"]), preview = rect_of(kv["preview_button"]);
+    CHECK(kv["credit"] != "hidden" && box.x > assets.x + assets.w && box.x + box.w < preview.x);
+  }
   return 0;
 }
 
@@ -2478,9 +3919,10 @@ int test_resources(const Opts& o) {
   std::string shipped_bytes, test_bytes;
   CHECK(read_file(o.shipped, shipped_bytes) && read_file(o.scr, test_bytes));
   for (const char* hook : {"AD_SCR_TEST_IGNORE_INPUT", "AD_SCR_TEST_INPUT", "AD_SCR_TEST_MONITORS", "AD_SCR_TEST_STALL_MS",
-                           "AD_SCR_TEST_FIRSTFRAME_MS", "AD_SCR_TEST_DISPLAY_OFF_MS", "AD_SCR_TEST_ROTATE_MS",
-                           "AD_SCR_TESTEXIT_AFTER_FRAMES", "AD_SCR_TEST_SCREENSHOT", "AD_SCR_TEST_SCREENSHOT_STATE",
-                           "AD_SCR_TEST_CAPTURE", "AD_UI_TEST_HC_SCHEME"}) {
+                           "AD_SCR_TEST_FIRSTFRAME_MS", "AD_SCR_TEST_DISPLAY_OFF_MS", "AD_SCR_TEST_DISPLAY_ON",
+                           "AD_SCR_TEST_ROTATE_MS", "AD_SCR_TESTEXIT_AFTER_FRAMES", "AD_SCR_TEST_SCREENSHOT",
+                           "AD_SCR_TEST_SCREENSHOT_STATE", "AD_SCR_TEST_CAPTURE", "AD_UI_TEST_HC_SCHEME",
+                           "AD_SCR_TEST_OPEN_LOG"}) {
     if (binary_mentions(shipped_bytes, hook)) failf("the shipped LongAfterDark.scr reads %s", hook);
     if (!binary_mentions(test_bytes, hook)) failf("LongAfterDark-test.scr doesn't read %s", hook);
   }
@@ -2528,6 +3970,8 @@ int test_resources(const Opts& o) {
   return 0;
 }
 
+std::vector<DWORD> spawn_pids(const Work& w, int window);   // below
+
 // Sends WM_DISPLAYCHANGE to every saver window of `pid`, as Windows does to
 // every top-level window when the monitors change.
 void post_display_change(DWORD pid, int times) {
@@ -2574,9 +4018,18 @@ int test_display_change(const Opts& o) {
   CHECK(step == 2);
   auto starts = host_events(w, "start");
   CHECK(starts.size() == 3);
-  if (starts.size() == 3) {
-    CHECK(starts[0]["ADSCREENW"] == "640" && starts[1]["ADSCREENW"] == "856");
-    CHECK(starts[2]["ADSCREENW"] == "640" && starts[2]["ADSCREENH"] == "480");   // portrait: never narrower than 4:3
+  // Each window's host by the saver's own spawn lines: the two first hosts
+  // start together, and either may write its start line first.
+  std::map<std::string, std::map<std::string, std::string>> by_pid;
+  for (auto& e : starts) by_pid[e["pid"]] = e;
+  const std::vector<DWORD> w0 = spawn_pids(w, 0), w1 = spawn_pids(w, 1), w2 = spawn_pids(w, 2);
+  CHECK(w0.size() == 1 && w1.size() == 1 && w2.size() == 1);
+  if (w0.size() == 1 && w1.size() == 1 && w2.size() == 1) {
+    auto& s0 = by_pid[std::to_string(w0[0])];
+    auto& s1 = by_pid[std::to_string(w1[0])];
+    auto& s2 = by_pid[std::to_string(w2[0])];
+    CHECK(s0["ADSCREENW"] == "640" && s1["ADSCREENW"] == "856");
+    CHECK(s2["ADSCREENW"] == "640" && s2["ADSCREENH"] == "480");   // portrait: never narrower than 4:3
   }
   CHECK(count_in_log(w.scr_log, "relayout monitors=2->2 kept=0 moved=1 created=1 retired=1") == 1);
   CHECK(count_in_log(w.scr_log, "relayout monitors=2->2 kept=2 moved=0 created=0 retired=0") == 1);
@@ -2585,8 +4038,8 @@ int test_display_change(const Opts& o) {
   // kept one (which ran on until the new window had its frames too).
   std::map<std::string, long long> frames;
   for (auto& e : host_events(w, "exit")) frames[e["pid"]] = atoll(e["frames"].c_str());
-  if (starts.size() == 3) {
-    const std::string kept = starts[0]["pid"], retired = starts[1]["pid"];
+  if (w0.size() == 1 && w1.size() == 1) {
+    const std::string kept = std::to_string(w0[0]), retired = std::to_string(w1[0]);
     CHECK(frames.count(kept) && frames.count(retired));
     CHECK(frames[retired] < frames[kept]);
   }
@@ -2838,7 +4291,8 @@ int test_input_play(const Opts& o) {
   CHECK(find_line(lines, "not-exited") < 0);
   for (int i = 0; i < exit_key && i < (int)lines.size(); ++i) {
     if (lines[i].find("] input: ") != std::string::npos && lines[i].find("input: caps") == std::string::npos &&
-        lines[i].find("input: hold") == std::string::npos && lines[i].find("input: kept") == std::string::npos)
+        lines[i].find("input: numlock") == std::string::npos && lines[i].find("input: hold") == std::string::npos &&
+        lines[i].find("input: kept") == std::string::npos)
       failf("an input exit before the last key: %s", lines[i].c_str());
   }
   // Play started after Caps Lock and ended after Caps Lock again.
@@ -2861,11 +4315,22 @@ int test_input_play(const Opts& o) {
     if (inputs[i]["line"] == "KEY 37 1" && inputs[i]["interactive"] == "1") ++arrow_eaten;
   }
   CHECK(arrow_eaten == 1);
-  int caps_lines = 0;
+  int caps_lines = 0, numlock_lines = 0;
   for (auto& e : inputs) caps_lines += e["line"].rfind("CAPS ", 0) == 0;
   CHECK(caps_lines == 2);   // on, off: once each
-  // ADCAPS at spawn (the synthetic toggle starts off), and the state folder.
-  for (auto& e : host_events(w, "start")) CHECK(e["ADCAPS"] == "0");
+  // Num Lock turned on (fakehost keeps the toggle, numlock=1): one NUMLOCK
+  // line, numbered with the rest, after its key (right after it once the
+  // host has answered --capabilities; test_numlock pins the order).
+  bool numlock_key = false;
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    numlock_key |= inputs[i]["line"] == "KEY 144 1";
+    if (inputs[i]["line"].rfind("NUMLOCK ", 0) != 0) continue;
+    ++numlock_lines;
+    CHECK(inputs[i]["line"] == "NUMLOCK 1" && numlock_key);
+  }
+  CHECK(numlock_lines == 1);
+  // ADCAPS and ADNUMLOCK at spawn (the synthetic toggles start off), and the state folder.
+  for (auto& e : host_events(w, "start")) CHECK(e["ADCAPS"] == "0" && e["ADNUMLOCK"] == "0");
   check_state_everywhere(w);
   // The last-exit log, next to settings.ini (§9.1).
   std::string last;
@@ -2954,6 +4419,145 @@ int test_input_rotate(const Opts& o) {
   check_state_everywhere(w);
   check_hosts_gone(w);
   if (g_failures) dump_logs(w);
+  return 0;
+}
+
+// Num Lock (INTERACTION.md §3.2, PLAN §2.4): the owner's host hears it only
+// when its --capabilities says numlock=1 (fakehost says so, as today's host):
+//  * every host starts with ADNUMLOCK, the (synthetic) toggle then;
+//  * the key that flips it (KEY 144) sends NUMLOCK 1 right after that key's
+//    KEY line, a change without a key (NUMLOCKSTATE) NUMLOCK 0 within
+//    250 ms, each numbered as the host numbers its input lines;
+//  * a host started while it is on gets ADNUMLOCK=1, and no line for it;
+//  * Num Lock never ends the saver (Alt does, at the end).
+// A host from before the toggle (FAKEHOST_NUMLOCK=0) hears no NUMLOCK line,
+// which it would not number (every later line's number would be one off);
+// hosts started after its answer get no ADNUMLOCK (the first, started
+// before it, gets one, which such a host ignores).
+int test_numlock(const Opts& o) {
+  Work w = prepare(o, "numlock");
+  auto run = [&](const EnvList& extra, bool rotate, const std::string& script_text) {
+    fs::remove(w.scr_log);
+    fs::remove(w.host_log);
+    edit_settings(w, [&](Settings& s) {
+      s.module = rotate ? "random" : "test.rings";
+      s.randomize.clear();
+      if (rotate) s.randomize = {"test.rings", "test.plain"};
+      s.all_monitors = false;
+    });
+    EnvList env = input_env(o, w, write_script(w, "input.txt", script_text));
+    env.insert(env.end(), extra.begin(), extra.end());
+    if (rotate) env.push_back({L"AD_SCR_TEST_ROTATE_MS", L"700"});
+    RunResult r = run_scr(o, L"/s", env, 60000);
+    if (!expect_exit(w, r, 0)) return false;
+    // Num Lock ended nothing: Alt did, at the end.
+    auto lines = lines_of(w.scr_log);
+    CHECK(find_line(lines, "exit code=0 reason=syskey vk=0x12") > find_line(lines, "test: step exit"));
+    CHECK(count_in_log(w.scr_log, "input: key vk=") == 0 && count_in_log(w.scr_log, "not-exited") == 0);
+    return true;
+  };
+  // The input lines each host got, in order ("pid" -> lines), their numbers
+  // checked: 1, 2, 3 ... per host, whatever the saver sent.
+  auto inputs_by_host = [&] {
+    std::map<std::string, std::vector<std::string>> by;
+    for (auto& e : host_events(w, "input")) {
+      auto& v = by[e["pid"]];
+      v.push_back(e["line"]);
+      if (e["seq"] != std::to_string(v.size())) failf("pid %s: input line \"%s\" numbered %s, not %zu", e["pid"].c_str(),
+                                                       e["line"].c_str(), e["seq"].c_str(), v.size());
+    }
+    return by;
+  };
+  using Lines = std::vector<std::string>;
+  const std::string on_off = "WAIT 1000\nLOG step numlock-on\nKEY 144 1\nKEY 144 0\nKEY 16 1\nKEY 16 0\nFRAMES 5\n"
+                             "LOG step numlock-off\nNUMLOCKSTATE 0\nWAIT 700\nFRAMES 3\n"
+                             "LOG step exit\nSYSKEY 18 1\nWAIT 5000\nLOG not-exited\n";
+  // A host that keeps the toggle: its lines, numbered with the others.
+  {
+    if (!run({}, false, on_off)) return 1;
+    auto starts = host_events(w, "start");
+    CHECK(starts.size() == 1);
+    for (auto& e : starts) CHECK(e["ADNUMLOCK"] == "0");
+    auto by = inputs_by_host();
+    CHECK(by.size() == 1);
+    for (auto& [pid, lines] : by) {
+      CHECK((lines == Lines{"KEY 144 1", "NUMLOCK 1", "KEY 144 0", "KEY 16 1", "KEY 16 0", "NUMLOCK 0"}));
+    }
+    CHECK(count_in_log(w.scr_log, "input: numlock 1 -> owner (n=2)") == 1);
+    CHECK(count_in_log(w.scr_log, "input: numlock 0 -> owner (n=6)") == 1);
+    CHECK(host_events(w, "unknown").empty());
+    auto exits = host_events(w, "exit");
+    CHECK(exits.size() == 1 && exits[0]["numlock"] == "0" && exits[0]["input_lines"] == "6");
+    check_hosts_gone(w);
+    if (g_failures) dump_logs(w);
+  }
+  // Rotating while it is on: a host started then gets ADNUMLOCK=1 and no line.
+  const std::string on_rotate = "WAIT 1000\nLOG step numlock-on\nKEY 144 1\nKEY 144 0\nWAIT 2200\n"
+                                "LOG step exit\nSYSKEY 18 1\nWAIT 5000\nLOG not-exited\n";
+  {
+    if (!run({}, true, on_rotate)) return 1;
+    const auto lines = lines_of(w.scr_log);
+    const int sent = find_line(lines, "input: numlock 1 -> owner");
+    CHECK(sent > 0);
+    // Each spawn's ADNUMLOCK is the toggle then: 0 before the line, 1 after.
+    std::map<std::string, std::string> want;   // pid -> ADNUMLOCK
+    for (int i = 0; i < (int)lines.size(); ++i) {
+      const size_t at = lines[i].find("spawn window=0 "), p = lines[i].find(" pid=");
+      if (at == std::string::npos || p == std::string::npos) continue;
+      const std::string pid = std::to_string(strtoul(lines[i].c_str() + p + 5, nullptr, 10));
+      want[pid] = i < sent ? "0" : "1";
+      CHECK(lines[i].find(i < sent ? " numlock=0 " : " numlock=1 ") != std::string::npos);
+    }
+    int after = 0;
+    for (auto& e : host_events(w, "start")) {
+      CHECK(want.count(e["pid"]) && e["ADNUMLOCK"] == want[e["pid"]]);
+      after += e["ADNUMLOCK"] == "1";
+    }
+    CHECK(after >= 1);   // a host was started while it was on
+    // The one line went to the host that was the owner's then, started with
+    // it off; the ones started with it on heard none.
+    int numlock_lines = 0;
+    for (auto& [pid, got] : inputs_by_host()) {
+      const int n = (int)std::count(got.begin(), got.end(), std::string("NUMLOCK 1"));
+      numlock_lines += n;
+      if (n) CHECK(want[pid] == "0");
+      CHECK(std::none_of(got.begin(), got.end(), [](const std::string& l) { return l == "NUMLOCK 0"; }));
+    }
+    CHECK(numlock_lines == 1);
+    CHECK(host_events(w, "unknown").empty());
+    check_hosts_gone(w);
+    if (g_failures) dump_logs(w);
+  }
+  // A host from before the toggle: no NUMLOCK line, ever; ADNUMLOCK only
+  // for the host started before its answer.
+  for (bool rotate : {false, true}) {
+    if (!run({{L"FAKEHOST_NUMLOCK", L"0"}}, rotate, rotate ? on_rotate : on_off)) return 1;
+    CHECK(count_in_log(w.scr_log, "input: numlock") == 0);
+    CHECK(host_events(w, "unknown").empty());   // nothing it doesn't know was sent
+    for (auto& [pid, got] : inputs_by_host()) {
+      CHECK(std::none_of(got.begin(), got.end(), [](const std::string& l) { return l.rfind("NUMLOCK", 0) == 0; }));
+    }
+    const auto lines = lines_of(w.scr_log);
+    const int answered = find_line(lines, "host capabilities: lanes=");
+    CHECK(answered > 0 && lines[answered].find("numlock") == std::string::npos);
+    std::map<std::string, bool> before;   // pid -> started before the answer
+    for (int i = 0; i < (int)lines.size(); ++i) {
+      const size_t at = lines[i].find("spawn window=0 "), p = lines[i].find(" pid=");
+      if (at == std::string::npos || p == std::string::npos) continue;
+      before[std::to_string(strtoul(lines[i].c_str() + p + 5, nullptr, 10))] = i < answered;
+      CHECK(lines[i].find(i < answered ? " numlock=0 " : " numlock=-1 ") != std::string::npos);
+    }
+    auto starts = host_events(w, "start");
+    CHECK(!starts.empty() && before[starts[0]["pid"]]);   // the first host starts before the answer comes
+    int after = 0;
+    for (auto& e : starts) {
+      CHECK(e["ADNUMLOCK"] == (before[e["pid"]] ? "0" : ""));
+      after += !before[e["pid"]];
+    }
+    if (rotate) CHECK(after >= 1);
+    check_hosts_gone(w);
+    if (g_failures) dump_logs(w);
+  }
   return 0;
 }
 
@@ -3124,6 +4728,81 @@ int test_seed(const Opts& o) {
     dump_logs(w);
     dump_logs(w2);
   }
+  return 0;
+}
+
+// §8 with a catalog whose modules each give a screen of their own (a
+// hand-edited or tampered one: adimport writes "640x480" alone). A window
+// that may start with any of them gets three pictures at most, taken before
+// it appears (plan_seed_shots): After Dark's, 640x480 and the smallest of the
+// other sizes, each logging a line, taken or not (a desktop that can't be
+// read back fails every capture); a line counts the screens left out, and a
+// first host whose screen is one of them starts on black.
+int test_seed_screens(const Opts& o) {
+  Work w = prepare(o, "seed-screens", false);
+  const fs::path win = w.assets / "win";
+  fs::create_directories(win);
+  // id, file, screen ("": none, After Dark's that follows the display).
+  const std::vector<std::array<std::string, 3>> mods = {
+      {"many.plain", "PLAIN", ""},        {"many.vga", "VGA", "640x480"},    {"many.qvga", "QVGA", "320x240"},
+      {"many.m400", "M400", "400x300"},   {"many.m512", "M512", "512x384"},  {"many.svga", "SVGA", "800x600"},
+      {"many.xga", "XGA", "1024x768"},    {"many.m1152", "M1152", "1152x864"}, {"many.sxga", "SXGA", "1280x1024"},
+      {"many.wide", "WIDE", "1024x640"},  {"many.hd", "HD", "1280x720"},      {"many.tall", "TALL", "480x640"}};
+  std::string json = "{\"version\": 1, \"modules\": [";
+  for (size_t i = 0; i < mods.size(); ++i) {
+    const auto& [id, file, screen] = mods[i];
+    json += std::string(i ? ",\n" : "\n") + "{\"id\": \"" + id + "\", \"displayName\": \"" + file +
+            "\", \"lane\": \"pe32\", \"path\": \"FILES/MANY/" + file + ".AD\"" +
+            (screen.empty() ? "" : ", \"screen\": \"" + screen + "\"") + "}";
+  }
+  json += "]}\n";
+  CHECK(write_file_atomic((win / "catalog-win.json").wstring(), json));
+  Catalog c;
+  CHECK(load_catalog((win / "catalog-win.json").wstring(), c, nullptr) && c.modules.size() == mods.size());
+  for (const auto& m : c.modules) {
+    fs::path p = resolve_module_path(win.wstring(), m.path);
+    fs::create_directories(p.parent_path());
+    write_file_atomic(p.wstring(), "placeholder module file for the LongAfterDark.scr smoke tests\n");
+  }
+  // 1024x768, one of the screens left out, leads a list of all the others.
+  edit_settings(w, [&](Settings& s) {
+    s.module = "many.xga";
+    s.randomize.clear();
+    for (const auto& m : mods) {
+      if (m[0] != s.module) s.randomize.push_back(m[0]);
+    }
+    s.scale = 1.0;
+    s.all_monitors = false;
+  });
+  EnvList env = base_env(o, w);
+  env.push_back({L"AD_SCR_TEST_MONITORS", L"-16000,0,1280,720,p"});
+  env.push_back({L"AD_SCR_TESTEXIT_AFTER_FRAMES", L"5"});
+  DWORD scr_pid = 0;
+  RunResult r = run_scr(o, L"/s", env, 60000, [&](DWORD pid) { scr_pid = pid; });
+  if (!expect_exit(w, r, 0)) return 1;
+  // Twelve screens (After Dark's 856x480 on this 16:9 monitor, and eleven of
+  // their own): three pictures, nine left out.
+  const int taken = count_in_log(w.scr_log, "seed window=0 ");
+  CHECK(taken + count_in_log(w.scr_log, "seed window=0: capture failed") == 3);
+  CHECK(count_in_log(w.scr_log, "seed window=0: none taken at 9 more screens of modules' own (2 at most: 640x480, "
+                                "then the smallest); a first host at one starts on black") == 1);
+  auto starts = host_events(w, "start");
+  CHECK(starts.size() == 1);
+  if (!starts.empty()) {
+    CHECK(ends_with(starts[0]["module"], "XGA.AD") && screen_is(starts[0], "1024", "768"));
+    CHECK(starts[0]["ADSEEDIMG"].empty() && starts[0]["seed_check"] == "none");
+  }
+  if (taken > 0) {
+    CHECK(count_in_log(w.scr_log, "seed window=0 856x480 from 1280x720 in ") == 1);
+    CHECK(count_in_log(w.scr_log, "seed window=0 640x480 from 960x720 (the frame's part of the monitor) in ") == 1);
+    CHECK(count_in_log(w.scr_log, "seed window=0 320x240 from 960x720 (the frame's part of the monitor) in ") == 1);
+    CHECK(count_in_log(w.scr_log, "seed window=0: none taken at 1024x768; the module starts on black") == 1);
+  } else {
+    fprintf(stderr, "seed-screens: no desktop capture here (a desktop that can't be read back); pictures not checked\n");
+  }
+  CHECK(seed_files_left(scr_pid) == 0);
+  check_hosts_gone(w);
+  if (g_failures) dump_logs(w);
   return 0;
 }
 
@@ -3878,10 +5557,18 @@ int wmain(int argc, wchar_t** argv) {
       {L"input-display-change", test_input_display_change},
       {L"present", test_present},
       {L"seed", test_seed},
+      {L"seed-screens", test_seed_screens},
       {L"config-buttons", test_config_buttons},
       {L"config-collections", test_config_collections},
       {L"config-cover", test_config_cover},
       {L"rotate-collections", test_rotate_collections},
+      {L"config-abi", test_config_abi},
+      {L"rotate-abi", test_rotate_abi},
+      {L"rotate-abi-wait", test_rotate_abi_wait},
+      {L"screen-abi", test_screen_abi},
+      {L"screen-field", test_screen_field},
+      {L"numlock", test_numlock},
+      {L"config-credit", test_config_credit},
       {L"config-details", test_config_details},
       {L"data-root", test_data_root},
       {L"e2e-rodger", test_e2e_rodger},

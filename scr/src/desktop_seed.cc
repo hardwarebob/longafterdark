@@ -51,45 +51,75 @@ HANDLE write_seed_file(const std::wstring& path, const std::vector<uint8_t>& p6,
 }
 
 std::vector<uint8_t> capture_monitor_p6(const RECT& monitor, SizeI emu) {
-  std::vector<uint8_t> out;
   const int mw = monitor.right - monitor.left, mh = monitor.bottom - monitor.top;
-  if (mw <= 0 || mh <= 0 || emu.w <= 0 || emu.h <= 0) return out;
-  HDC screen = GetDC(nullptr);
-  if (!screen) return out;
-  HDC src = CreateCompatibleDC(screen), dst = CreateCompatibleDC(screen);
-  auto dib = [&](int w, int h, void** bits) {
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = w;
-    bi.bmiHeader.biHeight = -h;   // top-down
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    return CreateDIBSection(screen, &bi, DIB_RGB_COLORS, bits, nullptr, 0);
-  };
-  void *src_bits = nullptr, *dst_bits = nullptr;
-  HBITMAP src_bmp = src ? dib(mw, mh, &src_bits) : nullptr;
-  HBITMAP dst_bmp = dst ? dib(emu.w, emu.h, &dst_bits) : nullptr;
-  if (src_bmp && dst_bmp) {
-    HGDIOBJ old_src = SelectObject(src, src_bmp), old_dst = SelectObject(dst, dst_bmp);
-    // CAPTUREBLT: layered windows too, as the user sees the desktop.
-    if (BitBlt(src, 0, 0, mw, mh, screen, monitor.left, monitor.top, SRCCOPY | CAPTUREBLT)) {
-      SetStretchBltMode(dst, HALFTONE);
-      SetBrushOrgEx(dst, 0, 0, nullptr);
-      if (StretchBlt(dst, 0, 0, emu.w, emu.h, src, 0, 0, mw, mh, SRCCOPY)) {
-        GdiFlush();
-        out = encode_p6(static_cast<const uint8_t*>(dst_bits), emu.w, emu.h, emu.w * 4);
+  std::vector<uint8_t> out;
+  capture_monitor_shots(monitor, {{{0, 0, mw, mh}, emu}}, [&](size_t, const std::vector<uint8_t>& p6) { out = p6; });
+  return out;
+}
+
+namespace {
+// A top-down 32-bpp DIB section of w x h.
+HBITMAP make_dib(HDC dc, int w, int h, void** bits) {
+  BITMAPINFO bi{};
+  bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+  bi.bmiHeader.biWidth = w;
+  bi.bmiHeader.biHeight = -h;   // top-down
+  bi.bmiHeader.biPlanes = 1;
+  bi.bmiHeader.biBitCount = 32;
+  bi.bmiHeader.biCompression = BI_RGB;
+  return CreateDIBSection(dc, &bi, DIB_RGB_COLORS, bits, nullptr, 0);
+}
+}  // namespace
+
+void capture_monitor_shots(const RECT& monitor, const std::vector<SeedShot>& shots, const SeedTake& take) {
+  const int mw = monitor.right - monitor.left, mh = monitor.bottom - monitor.top;
+  bool taken = false;
+  HDC screen = mw > 0 && mh > 0 && !shots.empty() ? GetDC(nullptr) : nullptr;
+  if (screen) {
+    HDC src = CreateCompatibleDC(screen);
+    void* src_bits = nullptr;
+    HBITMAP src_bmp = src ? make_dib(screen, mw, mh, &src_bits) : nullptr;
+    if (src_bmp) {
+      HGDIOBJ old_src = SelectObject(src, src_bmp);
+      // CAPTUREBLT: layered windows too, as the user sees the desktop.
+      if (BitBlt(src, 0, 0, mw, mh, screen, monitor.left, monitor.top, SRCCOPY | CAPTUREBLT)) {
+        shrink_parts(src, mw, mh, shots, take);
+        taken = true;
+      }
+      SelectObject(src, old_src);
+      DeleteObject(src_bmp);
+    }
+    if (src) DeleteDC(src);
+    ReleaseDC(nullptr, screen);
+  }
+  if (!taken) {
+    for (size_t i = 0; i < shots.size(); ++i) take(i, {});
+  }
+}
+
+void shrink_parts(HDC src, int mw, int mh, const std::vector<SeedShot>& shots, const SeedTake& take) {
+  HDC dst = src ? CreateCompatibleDC(src) : nullptr;
+  for (size_t i = 0; i < shots.size(); ++i) {
+    const SeedShot& s = shots[i];
+    std::vector<uint8_t> p6;
+    if (dst && s.emu.w > 0 && s.emu.h > 0 && s.src.w > 0 && s.src.h > 0 && s.src.x >= 0 && s.src.y >= 0 &&
+        s.src.x + s.src.w <= mw && s.src.y + s.src.h <= mh) {
+      void* dst_bits = nullptr;
+      if (HBITMAP dst_bmp = make_dib(src, s.emu.w, s.emu.h, &dst_bits)) {
+        HGDIOBJ old_dst = SelectObject(dst, dst_bmp);
+        SetStretchBltMode(dst, HALFTONE);
+        SetBrushOrgEx(dst, 0, 0, nullptr);
+        if (StretchBlt(dst, 0, 0, s.emu.w, s.emu.h, src, s.src.x, s.src.y, s.src.w, s.src.h, SRCCOPY)) {
+          GdiFlush();
+          p6 = encode_p6(static_cast<const uint8_t*>(dst_bits), s.emu.w, s.emu.h, s.emu.w * 4);
+        }
+        SelectObject(dst, old_dst);
+        DeleteObject(dst_bmp);   // before it is taken: the P6 alone is held while it is written
       }
     }
-    SelectObject(src, old_src);
-    SelectObject(dst, old_dst);
+    take(i, p6);
   }
-  if (src_bmp) DeleteObject(src_bmp);
-  if (dst_bmp) DeleteObject(dst_bmp);
-  if (src) DeleteDC(src);
   if (dst) DeleteDC(dst);
-  ReleaseDC(nullptr, screen);
-  return out;
 }
 
 }  // namespace adw::scr

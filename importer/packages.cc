@@ -28,6 +28,14 @@ const KnownFile kSimpsonsKnown[] = {
 #include "known_files_simpsons.inc"
     {nullptr, 0, nullptr},
 };
+const KnownFile kSwseKnown[] = {
+#include "known_files_swse.inc"
+    {nullptr, 0, nullptr},
+};
+const KnownFile kStartrekKnown[] = {
+#include "known_files_startrek.inc"
+    {nullptr, 0, nullptr},
+};
 
 template <size_t N>
 std::span<const KnownFile> manifest(const KnownFile (&a)[N]) {
@@ -142,6 +150,167 @@ const char* const kSimpsonsArchives[] = {"BURNS.ZIP",    "CHALKBRD.ZIP", "CLOCKS
                                          "GRASSKRT.ZIP", "HOMEREAT.ZIP", "HOW2DRAW.ZIP", "INS.ZIP",     "KRUSTY.ZIP",
                                          "MLISA.ZIP",    "PHYSICS.ZIP",  "SFILES.ZIP",  "SNOWBALL.ZIP", "STRIVIA.ZIP"};
 
+// ---- swse --------------------------------------------------------------------------------
+//
+// Star Wars Screen Entertainment (LucasArts, 1994; by Presage Software) is not
+// an After Dark release: its 14 modules are Intermission IMX modules (16-bit
+// NE DLLs exporting SAVERINIT/SAVERDRAW, driven by Intermission's IMX reader
+// IMIMXPLY.IMQ). The disc is a CD copy of the five install floppies: Presage's
+// INSTALL.EXE + INSTALL.DAT, multi-volume ARJ archives and SZDD-compressed
+// loose files (research/win/pkg/swse, gitignored).
+
+const char* const kSwseModuleDirs[] = {"SAVER"};
+// The CD, and the Redump dump of the same pressing (raw 2352-byte sectors;
+// cooked, its first 3529 sectors are that ISO byte for byte).
+const KnownImage kSwseImages[] = {
+    {"bfa63c1bce15dcbea965dfd7c2ed44e8", 7227392, "ISO-9660 CD of the five install disks", "SWSE"},
+    {"ce51614a3484b9269b5ed9e61510e971", 9005808, "the same CD as raw 2352-byte sectors (Redump)", "SWSE"},
+};
+// The exact ISO; the Redump BIN of it; a flat ZIP of the disc's 40 files,
+// each md5-identical to the disc's (verified 2026-09-28:
+// research/win/pkg/swse/sources.json). Three files, three names.
+const Download kSwseDownloads[] = {
+    {"https://archive.org/download/cd_AfterDark_Star_Wars_ScreenSaver_for_Win3.1/AfterDarkStarWars.iso",
+     L"AfterDarkStarWars.iso", 7227392, "bfa63c1bce15dcbea965dfd7c2ed44e8", "image"},
+    {"https://archive.org/download/swse1/SWSE.bin", L"Star Wars - Screen Entertainment (USA).bin", 9005808,
+     "ce51614a3484b9269b5ed9e61510e971", "image"},
+    {"https://archive.org/download/swse_20240317/SWSE.zip", L"SWSE.zip", 7013137, "c7a4c5322a784a3e88964c5a7f499226",
+     "zip"},
+};
+// Every install disk: SWSE1.ARJ is disk 1; SWSE2.ARJ and .A01-.A03 are one
+// archive over disks 2-5 (INSTALL.DAT [disks]).
+const char* const kSwseArchives[] = {"SWSE1.ARJ", "SWSE2.ARJ", "SWSE2.A01", "SWSE2.A02", "SWSE2.A03"};
+// What every module loads (INTRMLIB -> ANTSW; SWSE.DLL -> MEMMIDI, SWSFX),
+// the IMX reader, and the modules' default settings.
+const char* const kSwseRequired[] = {"SAVER/INTRMLIB.DLL", "SAVER/ANTSW.DLL",    "SAVER/SWSE.DLL",
+                                     "SAVER/READJPG.DLL",  "SAVER/STRESS.DLL",   "SAVER/SWSFX.DLL",
+                                     "SAVER/MEMMIDI.DLL",  "ENGINE/IMIMXPLY.IMQ", "WINDOWS/SWSE.INI"};
+// INSTALL.DAT lines 4, 10-13 and 37: STRESS.DLL beside the modules, the
+// General MIDI set (CHECK=24) under the names the modules open, directly in
+// the module folder as the installer put them in C:\SAVER, and the default
+// settings, which it put in C:\WINDOWS.
+const LooseFile kSwseLoose[] = {
+    {"STRESS.DL_", "SAVER/STRESS.DLL", Codec::szdd},    {"GM_BATTL.MI_", "SAVER/BATTLE.MID", Codec::szdd},
+    {"GM_CNTNA.MI_", "SAVER/CANTINA.MID", Codec::szdd}, {"GM_EMPIR.MI_", "SAVER/EMPIRE.MID", Codec::szdd},
+    {"GM_TITLE.MI_", "SAVER/SWTHEME.MID", Codec::szdd}, {"SWSE.INI", "WINDOWS/SWSE.INI", Codec::plain},
+};
+// The names SAVERINIT returns (the modules' SWSE.INI sections); no resource
+// holds them.
+const NameOverride kSwseNames[] = {
+    {"SAVER/BATTLES.IMX", "Space Battles"},    {"SAVER/BIOS.IMX", "Character Biographies"},
+    {"SAVER/BLUPRINT.IMX", "Blueprints"},      {"SAVER/CANTINA.IMX", "Cantina"},
+    {"SAVER/HYPERSPC.IMX", "Hyperspace"},      {"SAVER/ICLOCK.IMX", "Imperial Clock"},
+    {"SAVER/JAWAS.IMX", "Jawas"},              {"SAVER/POSTERS.IMX", "Poster Art"},
+    {"SAVER/RCLOCK.IMX", "Rebel Clock"},       {"SAVER/SABRDUEL.IMX", "Lightsaber Duel"},
+    {"SAVER/STORYBRD.IMX", "Storyboards"},     {"SAVER/SWTEXT.IMX", "Scrolling Text"},
+    {"SAVER/TRENCH.IMX", "Death Star Trench"}, {"SAVER/VADER.IMX", "Darth Vader"},
+};
+
+// ---- startrek ----------------------------------------------------------------------------
+//
+// Star Trek: The Screen Saver ("After Dark, Version 2.0b - The Star Trek
+// Edition", Berkeley Systems, 1992): 16 After Dark 2.0 modules (16-bit NE DLLs
+// exporting MODULE, the Classic lane) on two 1.44 MB floppies installed by
+// Microsoft Setup 2.0, nearly every file KWAJ-compressed (kwaj.h). The recipe
+// is ST_NSTLL.INF and AD_NSTLL.MST baked into a table: SETUP.LST is read only
+// to identify the release (research/win/pkg/startrek, gitignored).
+
+// The modules' own folder: the installer's C:\AFTERDRK, which the 16-bit lane
+// mounts there (the modules find ST_RES\ and SOUNDS\ below AD_PREFS.INI's
+// [After Dark] Path).
+const char* const kStartrekModuleDirs[] = {"AFTERDRK"};
+// The Internet Archive's two images (item afterdark-20b_startrek, also what
+// the user's ZIP holds), and the same disks as a Windows 9x copy wrote to them
+// (item startrektosscreensaver1992win: the boot sector's OEM name and
+// root-directory access dates differ; every file is the same byte for byte).
+// A release on two disks: only a set of both is the release.
+const KnownImage kStartrekImages[] = {
+    {"28e33608b8d3bafa28585472c4a7a9ac", 1474560, "FAT12 1.44 MB floppy image, install disk 1 of 2", "", 1},
+    {"c630da5f6839303b599947f56fdd7c25", 1474560, "FAT12 1.44 MB floppy image, install disk 2 of 2", "", 2},
+    {"6ee71b45e32b07001d46ab8c80af589d", 1474560,
+     "FAT12 1.44 MB floppy image, install disk 1 of 2 (a copy Windows 9x wrote to)", "", 1},
+    {"af9d29a7ddea2c03618899c1c5733c67", 1474560,
+     "FAT12 1.44 MB floppy image, install disk 2 of 2 (a copy Windows 9x wrote to)", "", 2},
+};
+// Both copies are images of both disks (verified 2026-09-29:
+// research/win/pkg/startrek/importer/sources.json); each part is checked
+// against its published size and md5. Other bytes, other names. (The user's
+// own ZIP is the Internet Archive's on-the-fly ZIP of the first item, whose
+// md5 changes with every download: it is identified by its images' md5s.)
+const DownloadPart kStartrekDisk2[] = {
+    {"https://archive.org/download/afterdark-20b_startrek/afterdark-20b_startrek_disk2.img",
+     L"afterdark-20b_startrek_disk2.img", 1474560, "c630da5f6839303b599947f56fdd7c25"},
+};
+const DownloadPart kStartrekDisk2Win9x[] = {
+    {"https://archive.org/download/startrektosscreensaver1992win/startrek2.img", L"startrek2.img", 1474560,
+     "af9d29a7ddea2c03618899c1c5733c67"},
+};
+const Download kStartrekDownloads[] = {
+    {"https://archive.org/download/afterdark-20b_startrek/afterdark-20b_startrek_disk1.img",
+     L"afterdark-20b_startrek_disk1.img", 1474560, "28e33608b8d3bafa28585472c4a7a9ac", "image", kStartrekDisk2},
+    {"https://archive.org/download/startrektosscreensaver1992win/startrek1.img", L"startrek1.img", 1474560,
+     "6ee71b45e32b07001d46ab8c80af589d", "image", kStartrekDisk2Win9x},
+};
+// What the modules cannot run without: their framework (AD_MOD, AD_RSRC), the
+// art and sound databases AD_MOD opens from <Path>ST_RES\, and the sound
+// library the native bridge loads.
+const char* const kStartrekRequired[] = {
+    "AFTERDRK/AD_MOD.DLL",          "AFTERDRK/AD_RSRC.DLL",       "AFTERDRK/ST_RES/ST_RESDB.DLL",
+    "AFTERDRK/ST_RES/ST_MASKS.DLL", "AFTERDRK/ST_RES/ST_VGA.DLL", "AFTERDRK/ST_RES/ST_SVGA.DLL",
+    "AFTERDRK/ST_RES/ST_SND.DLL",   "ENGINE/AD_SND.DLL"};
+// Every install disk: the tag files of ST_NSTLL.INF [Source Media
+// Descriptions] (disk 1's is the fingerprint's, beside SETUP.LST).
+const char* const kStartrekDiskTags[] = {"MISSION.AD_", "ST_SND.DL_"};
+// ST_NSTLL.INF and AD_NSTLL.MST, flattened: what the modules use, nothing
+// edited. The modules and their DLLs in the module folder, as installed in
+// C:\AFTERDRK (the installer put AD_MOD and AD_RSRC in C:\WINDOWS; the
+// modules import them, so they sit beside them, invariant I2); the
+// multimedia sound driver AD_SND loads from there ([Sound] SoundDriver);
+// ST_RES\ and SOUNDS\ below it (Sounder refuses to load without a .WAV);
+// AD_SND 1.0 and the pristine AD.EXE in ENGINE (the host replaces AD.EXE, which
+// is kept for reference as INTERMIS.EXE is; nothing loads it). Never
+// installed: the disk's AD_PREFS.INI (its SoundDriver=AD_MPT.DRV would win
+// over the lane's seed and hang the emulator), the PC-speaker path
+// (AD_MPT.DRV, SPALETTE.DLL, AD_LIB.DLL), AD_SB.DRV (it refuses Windows 3.1
+// and later), the network password DLLs and utility, AD.386, AD_WRAP.COM,
+// AFTERDRK.NSS, ADINIT.EXE, AD.HLP, AD_MESG.ADS (the data of a Messages module
+// this release does not ship) and every setup file.
+const LooseFile kStartrekLoose[] = {
+    {"BRAINCEL.AD_", "AFTERDRK/BRAINCEL.AD", Codec::kwaj},
+    {"COMMS.AD_", "AFTERDRK/COMMS.AD", Codec::kwaj},
+    {"FINAL.AD_", "AFTERDRK/FINAL.AD", Codec::kwaj},
+    {"FRONTIER.AD_", "AFTERDRK/FRONTIER.AD", Codec::kwaj},
+    {"HORTA.AD_", "AFTERDRK/HORTA.AD", Codec::kwaj},
+    {"IONSTORM.AD_", "AFTERDRK/IONSTORM.AD", Codec::kwaj},
+    {"MISSION.AD_", "AFTERDRK/MISSION.AD", Codec::kwaj},
+    {"PANELS.AD_", "AFTERDRK/PANELS.AD", Codec::kwaj},
+    {"PLANETS.AD_", "AFTERDRK/PLANETS.AD", Codec::kwaj},
+    {"SCOTTYS.AD_", "AFTERDRK/SCOTTYS.AD", Codec::kwaj},
+    {"SICKBAY.AD_", "AFTERDRK/SICKBAY.AD", Codec::kwaj},
+    {"SOUNDER.AD_", "AFTERDRK/SOUNDER.AD", Codec::kwaj},
+    {"SPACE.AD_", "AFTERDRK/SPACE.AD", Codec::kwaj},
+    {"SPOCK.AD_", "AFTERDRK/SPOCK.AD", Codec::kwaj},
+    {"THOLIAN.AD_", "AFTERDRK/THOLIAN.AD", Codec::kwaj},
+    {"TRIBBLE.AD_", "AFTERDRK/TRIBBLE.AD", Codec::kwaj},
+    {"AD_MOD.DL_", "AFTERDRK/AD_MOD.DLL", Codec::kwaj},
+    {"AD_RSRC.DL_", "AFTERDRK/AD_RSRC.DLL", Codec::kwaj},
+    {"AD_MME.DR_", "AFTERDRK/AD_MME.DRV", Codec::kwaj},
+    {"ST_RESDB.DL_", "AFTERDRK/ST_RES/ST_RESDB.DLL", Codec::kwaj},
+    {"ST_MASKS.DL_", "AFTERDRK/ST_RES/ST_MASKS.DLL", Codec::kwaj},
+    {"ST_VGA.DL_", "AFTERDRK/ST_RES/ST_VGA.DLL", Codec::kwaj},
+    {"ST_SVGA.DL_", "AFTERDRK/ST_RES/ST_SVGA.DLL", Codec::kwaj},
+    {"ST_SND.DL_", "AFTERDRK/ST_RES/ST_SND.DLL", Codec::kwaj},
+    {"JIM.WA_", "AFTERDRK/SOUNDS/JIM.WAV", Codec::kwaj},
+    {"AD_SND.DL_", "ENGINE/AD_SND.DLL", Codec::kwaj},
+    {"AD.EX_", "ENGINE/AD.EXE", Codec::kwaj},
+};
+// PLANETS.AD's name resource says " PlanetaryAtlas"; its About heading and
+// Berkeley's own later PREVIOUS.INF (After Dark 4.0 Deluxe) say "Planetary
+// Atlas".
+const NameOverride kStartrekNames[] = {
+    {"AFTERDRK/PLANETS.AD", "Planetary Atlas"},
+};
+
 // ---- box covers (COVERS.md §2.3) ------------------------------------------------------------
 //
 // Only URLs, md5s, sizes, paths and crops: the pictures are fetched (md5- and
@@ -230,6 +399,51 @@ const CoverSource kSimpsonsCovers[] = {
                Crop{0, 0, 387, 172}, 2, 7500),
 };
 
+// Star Wars Screen Entertainment: the box front from Presage's own product
+// page (1997, through the Wayback Machine; 150x200), else Wookieepedia's photo
+// of the same US box (the Wayback Machine's byte-exact capture of the stored
+// original: Fandom's live URL rewrites what it serves), else two archive.org
+// scans of the disc label, the second cropped to the disc. LucasArts' art:
+// fetched onto the user's machine only, never bundled. The disc itself has no
+// picture a disc source can reach (every one is inside the ARJ archives).
+const CoverSource kSwseCovers[] = {
+    cover_download("box", "Box front", "Wayback Machine",
+                   "https://web.archive.org/web/19970310054846id_/"
+                   "http://www.presage.com:80/images/pimages/box-starwars.JPEG",
+                   "8b84792a21f3a21e09cc2809d263d9c1", 30600, L"presage_box-starwars.jpg"),
+    cover_download("box", "Box front", "Wayback Machine",
+                   "https://web.archive.org/web/20221205171117id_/"
+                   "https://static.wikia.nocookie.net/starwars/images/9/9a/SWScreenEntertainment.jpg/revision/latest",
+                   "dc4e541d1a79a46747caf0cb6f425c0a", 190239, L"wookieepedia_SWScreenEntertainment.jpg"),
+    cover_download("disc", "Disc label", "Internet Archive", "https://archive.org/download/swse1/1.jpg",
+                   "a40d11a61ee0288048bdfdd28e48e57c", 2156659, L"swse1_1.jpg"),
+    cover_download("disc", "Disc label", "Internet Archive",
+                   "https://archive.org/download/cd_AfterDark_Star_Wars_ScreenSaver_for_Win3.1/"
+                   "AfterDark%20Star%20Wars%20-%20CD.jpg",
+                   "b8ac25eb20a87f44e47ff8ed097698d7", 948614, L"cd_AfterDark_Star_Wars_ScreenSaver_for_Win3.1_CD.jpg",
+                   Crop{20, 14, 1424, 1424}),
+};
+
+// Star Trek: The Screen Saver: the Windows retail box front from the
+// Internet Archive's box scans (item afterdark-20b_startrek_box, 1180x1525:
+// it fills the tile), else the same front at 600 dpi, else the scan of disk
+// 1's label in the disk images' own item (drawn as a picture, never cut to a
+// disc: it is a floppy's). Paramount's and Berkeley's art: fetched onto the
+// user's machine only, never bundled. The disks have no picture a disc source
+// can reach (every one is KWAJ-compressed).
+const CoverSource kStartrekCovers[] = {
+    cover_download("box", "Box front", "Internet Archive",
+                   "https://archive.org/download/afterdark-20b_startrek_box/Aaa_itemimage.jpg",
+                   "157eb04fcc9bdc0d4a831148ca6cc260", 577239, L"afterdark-20b_startrek_box_Aaa_itemimage.jpg"),
+    cover_download("box", "Box front", "Internet Archive",
+                   "https://archive.org/download/afterdark-20b_startrek_box/"
+                   "After%20Dark%202.0b%20-%20Star%20Trek%20-%20Box%20-%20Front.jpg",
+                   "f41d1dbdaadaeeb0f9bc0a6aa76754ce", 9277274, L"After Dark 2.0b - Star Trek - Box - Front.jpg"),
+    cover_download("panel", "Disk label", "Internet Archive",
+                   "https://archive.org/download/afterdark-20b_startrek/afterdark-20b_startrek_disk1.jpg",
+                   "dbda3bc66b809f446a17138073579b53", 569964, L"afterdark-20b_startrek_disk1.jpg"),
+};
+
 const Package kPackages[] = {
     {"deluxe", "After Dark 4.0 Deluxe", "Deluxe", Recipe::tree, "FILES", kDeluxeModuleDirs, kDeluxeImages,
      kDeluxeRequired, kDeluxeCopy, nullptr, {}, nullptr, nullptr, nullptr, {}, {}, {}, manifest(kDeluxeKnown),
@@ -246,11 +460,46 @@ const Package kPackages[] = {
     {"simpsons", "The Simpsons Screen Saver", "Simpsons", Recipe::ad3zip, "packages/simpsons", kSimpsonsModuleDirs,
      kSimpsonsImages, kSimpsonsRequired, {}, nullptr, {}, "SIMPSONS", "ADXPL310.DLL", "SAX.AFI", kSimpsonsArchives,
      {}, {}, manifest(kSimpsonsKnown), kSimpsonsDownloads, kSimpsonsCovers, "1994-08"},  // modules dated 1994-08-02
+    // Every Windows build found dates from 1994-08-20 at the earliest
+    // (INTERMIS.EXE); LucasArts announced July 1994 for both platforms. This
+    // CD is a later build (files 1994-10), mastered 1995-05-24. It sorts after
+    // the Simpsons (1994-08) by registry order on the tie.
+    {"swse", "Star Wars Screen Entertainment", "Star Wars", Recipe::intermission, "packages/swse", kSwseModuleDirs,
+     kSwseImages, kSwseRequired, {}, nullptr, {}, "SAVER", nullptr, nullptr, kSwseArchives, {}, kSwseNames,
+     manifest(kSwseKnown), kSwseDownloads, kSwseCovers, "1994-08", "SWSE", kSwseLoose},
+    // The newest files on the disks are dated 1992-11-16 (the modules). Last in
+    // the registry, so the first six keep their places (the GUI's per-release
+    // command ids go by registry index); first in the catalog's packages list.
+    // Some of its modules compose a fixed 640x480 scene (at larger screens
+    // The Mission sits top-left with a band; Final Exam and Sickbay sit small
+    // in the middle), and the others lay out for whatever screen they get:
+    // the catalog gives all 16 that screen, so the release looks as it did at
+    // 640x480.
+    {"startrek", "Star Trek: The Screen Saver", "Star Trek", Recipe::ad2kwaj, "packages/startrek",
+     kStartrekModuleDirs, kStartrekImages, kStartrekRequired, {}, nullptr, {}, "AFTERDRK", nullptr, nullptr,
+     kStartrekDiskTags, {}, kStartrekNames, manifest(kStartrekKnown), kStartrekDownloads, kStartrekCovers, "1992-11",
+     nullptr, kStartrekLoose, "Star Trek\xAE: The Screen Saver", "640x480", Package::About::ad20},
 };
 
 }  // namespace
 
 bool Package::is_deluxe() const { return std::string_view(root) == "FILES"; }
+
+const char* recipe_name(Recipe r) {
+  switch (r) {
+    case Recipe::tree: return "tree";
+    case Recipe::ad3zip: return "ad3zip";
+    case Recipe::intermission: return "intermission";
+    case Recipe::ad2kwaj: return "ad2kwaj";
+  }
+  return "?";
+}
+
+uint64_t download_size(const Download& d) {
+  uint64_t n = d.size;
+  for (const DownloadPart& p : d.more_images) n += p.size;
+  return n;
+}
 
 std::span<const Package> builtin_packages() { return kPackages; }
 

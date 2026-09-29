@@ -104,7 +104,18 @@ bool contains(const std::vector<std::string>& v, const std::string& s) {
 }  // namespace
 
 bool HostCapabilities::has_lane(const std::string& lane) const { return contains(lanes, lane); }
+bool HostCapabilities::has_abi(const std::string& abi) const { return contains(abis, abi); }
 bool HostCapabilities::can_configure(const std::string& lane) const { return contains(configure, lane); }
+
+bool HostCapabilities::runs(const std::string& lane, const std::string& abi) const {
+  return !known || (has_lane(lane) && has_abi(abi.empty() ? std::string(kAfterDarkAbi) : abi));
+}
+
+ModuleRun module_run(const Module& m, const HostCapabilities& caps, bool probing, bool exited_3) {
+  if (exited_3) return ModuleRun::coming_soon;
+  if (probing) return ModuleRun::waiting;
+  return caps.runs(m.lane, m.abi) ? ModuleRun::runs : ModuleRun::coming_soon;
+}
 
 HostCapabilities parse_capabilities(const std::string& text) {
   HostCapabilities c;
@@ -125,16 +136,25 @@ HostCapabilities parse_capabilities(const std::string& text) {
       any = true;
     } else if (k == "configure") {
       c.configure = split_list(v);
+    } else if (k == "abis") {
+      c.abis = split_list(v);   // as listed: "abis=" alone runs no module ABI at all
     } else if (k == "status") {
       c.status = v == "1";
     } else if (k == "state") {
       c.state = v == "1";
     } else if (k == "seed") {
       c.seed = v == "1";
+    } else if (k == "numlock") {
+      c.numlock = v == "1";
     }
   }
   c.known = any;
   return c;
+}
+
+std::pair<std::wstring, std::wstring> numlock_env(const HostCapabilities& caps, bool on) {
+  if (!caps.takes_numlock_env()) return {L"ADNUMLOCK", L""};
+  return {L"ADNUMLOCK", on ? L"1" : L"0"};
 }
 
 HostTool::~HostTool() {

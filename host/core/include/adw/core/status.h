@@ -31,7 +31,8 @@ inline constexpr uint32_t ADWS_INTERACTIVE = 0x01;  // the module takes keys, cl
 inline constexpr uint32_t ADWS_CURSOR = 0x02;       // show a cursor (AD4 +0x08 bit 1; AD3 0x11 until 0x12)
 inline constexpr uint32_t ADWS_ROTATE_OK = 0x04;    // may be rotated away while interactive (AD4 +0x08 bit 2)
 inline constexpr uint32_t ADWS_KEY_FILTER = 0x08;   // the guest may consume input without being interactive
-inline constexpr uint32_t ADWS_WAKE = 0x10;         // the guest asked the saver window to close
+inline constexpr uint32_t ADWS_WAKE = 0x10;         // the guest asked the saver to end (WM_CLOSE/SC_CLOSE to
+                                                    // its window; an After Dark 2.0 module's result 5)
 inline constexpr uint32_t ADWS_READY = 0x20;        // lane init done
 
 // source

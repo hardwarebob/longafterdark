@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <oleacc.h>
+#include <shellapi.h>
 #include <windowsx.h>
 #include <uxtheme.h>
 
@@ -56,15 +57,14 @@ constexpr UINT WM_APP_THUMBS = WM_APP + 14;            // from the ThumbnailQueu
 constexpr UINT WM_APP_SCHEDULE_THUMBS = WM_APP + 15;
 constexpr UINT WM_APP_CONFIGURE_DONE = WM_APP + 16;    // wParam: exit code, lParam: std::string* (its JSON line)
 constexpr UINT WM_APP_COVER_DONE = WM_APP + 17;        // "Change cover…"'s adimport exited (wParam: exit code)
+constexpr UINT WM_APP_FOOTER_CREDIT_FOCUS = WM_APP + 18;  // after an activation's focus restore (dialog_proc)
 
 // ListView group ids: 1 + the release's index in the catalog (COVERS.md §1.7).
 int group_id(int release) { return 1 + release; }
 // Row geometry of the module list, DIPs.
-constexpr int kRowH = 40, kIconDip = 28, kBoxDip = 20;
+constexpr int kRowH = 40, kIconDip = 28, kBoxDip = kListBoxDip;
 // Space between one group's last row and the next group's header, DIPs.
 constexpr int kGroupGapDip = 12;
-
-enum class Lane { unknown, available, missing };
 
 struct State {
   HINSTANCE hinst = nullptr;
@@ -89,9 +89,13 @@ struct State {
   std::wstring import_note;                             // why the last import changed nothing
   bool random = true;
   bool sound_on = true;                                 // the Sound dropdown says "Primary monitor" (AUDIO.md §9)
-  Lane classic = Lane::unknown;                         // can this adhostwin run Classic modules?
-  bool probing = false;                                 // ...being asked right now
+  // What this adhostwin can run (dialog_support.h, module_run): its
+  // `--capabilities` answer (the lanes and module ABIs it lists; asked once,
+  // and again at a new catalog only while it hasn't answered), and the
+  // modules whose own runs exited 3 (no lane for them, whatever it listed).
+  bool probing = false;                                 // the host is being asked right now
   HostCapabilities caps;                                // what `adhostwin --capabilities` said
+  std::set<std::string> cant_run;                       // ids whose preview or thumbnail exited 3
   // A module button's run (INTERACTION.md §6.3): one at a time.
   bool configuring = false;
   std::string configure_id;                             // the module whose button runs
@@ -141,8 +145,16 @@ struct State {
   std::string cover_id;
   bool covers_missing = false;                          // a release still shows a generated cover: "Get the covers"
   HWND chip_tip = nullptr;                              // the release chip's "Also on:" tooltip (tool 1)
+  // Group headers drawn ellipsized: group id -> the header's rect in the list
+  // and the whole title, a tool of chip_tip on the list (set_header_tip).
+  std::map<int, std::pair<RECT, std::wstring>> header_tips;
+  std::map<int, std::wstring> header_drawn;             // group id -> its title as last drawn (the screenshot report)
   std::wstring chip_text;
   std::wstring rotation_tip_text;                       // the rotation line's tooltip (tool 2): copies, the lead
+  // The footer's credit (ui_model.h: layout_footer_credit), the link IDC_FOOTER_CREDIT.
+  FooterCreditLayout footer_credit;
+  int assets_right = 0;                                 // px: where the assets line's text ends
+  bool footer_credit_hover = false;                            // screenshot hook: the link drawn as under the pointer
 };
 
 State* g_state = nullptr;   // for the focus event hook (one dialog per process)
@@ -233,8 +245,13 @@ std::string lead_id(const State& st) { return st.settings.has_lead() ? st.settin
 // Its row's badge in Random (and, for screen readers, its item text).
 constexpr wchar_t kPlaysFirst[] = L"Plays first";
 
-// A Classic module this adhostwin can't run (its lane isn't built in yet).
-bool coming_soon(const State& st, const Module& m) { return m.lane == "ne16" && st.classic == Lane::missing; }
+// Whether this adhostwin can run the module (module_run): it waits while
+// the host is asked; it is "Coming soon" when the host doesn't list its lane
+// or its ABI, or when a run of this very module exited 3.
+ModuleRun run_state(const State& st, const Module& m) {
+  return module_run(m, st.caps, st.probing, st.cant_run.count(m.id) != 0);
+}
+bool coming_soon(const State& st, const Module& m) { return run_state(st, m) == ModuleRun::coming_soon; }
 
 // A module button the dialog can press (INTERACTION.md §6.3): the host opens
 // module windows for its lane (--capabilities: configure=…) and the module
@@ -367,16 +384,23 @@ void refresh_preview(State& st) {
     live_preview_message(st.preview, L"Module file missing", L"Import its disc again to restore it.");
     return;
   }
-  if (coming_soon(st, m)) {
-    live_preview_message(st.preview, L"Coming soon", L"Modules like this one will run in a future version.");
-    return;
-  }
-  if (m.lane == "ne16" && st.probing) {
-    // The host is being asked whether it has this lane; start nothing yet.
-    live_preview_message(st.preview, L"", L"");
-    return;
+  switch (run_state(st, m)) {
+    case ModuleRun::coming_soon:
+      live_preview_message(st.preview, L"Coming soon", L"Modules like this one will run in a future version.");
+      return;
+    case ModuleRun::waiting:
+      // The host is being asked what it runs; start nothing yet.
+      live_preview_message(st.preview, L"", L"");
+      return;
+    case ModuleRun::runs:
+      break;
   }
   LiveTarget t;
+  t.id = m.id;
+  // Its screen: its own when it has one (an Intermission or a Star Trek
+  // module's 640x480; geometry.h: own_screen, module_screen).
+  t.abi = m.abi;
+  t.screen = m.screen;
   t.host_exe = host_exe_path();
   t.module_path = resolve_module_path(st.win_dir, m.path);
   t.win_dir = st.win_dir;
@@ -494,8 +518,10 @@ void load_logo(State& st) {
   if (HICON old = (HICON)SendMessageW(st.dlg, WM_SETICON, ICON_SMALL, (LPARAM)small)) DestroyIcon(old);
 }
 
-// A status line of caption text (one or two lines), centred vertically on `r`.
-void place_caption(State& st, HWND h, const Rc& r) {
+// A status line of caption text (one or two lines), centred vertically on
+// `r`. `fit`: the window only as wide as its text (its widest line), so it
+// covers nothing beside it. Returns that width, px.
+int place_caption(State& st, HWND h, const Rc& r, bool fit = false) {
   HDC dc = GetDC(h);
   RECT m{0, 0, std::max(1, r.w), 0};
   HGDIOBJ old = SelectObject(dc, st.theme.fonts.caption);
@@ -504,18 +530,66 @@ void place_caption(State& st, HWND h, const Rc& r) {
   SelectObject(dc, old);
   ReleaseDC(h, dc);
   const int th = std::max(1, std::min<int>(r.h, m.bottom - m.top));
-  place(h, Rc{r.x, r.y + (r.h - th) / 2, r.w, th});
+  const int tw = std::clamp<int>(m.right - m.left, 0, r.w);
+  // 2 DIP to spare, so the static never breaks its lines otherwise.
+  place(h, Rc{r.x, r.y + (r.h - th) / 2, fit ? std::min(r.w, tw + st.theme.px(2)) : r.w, th});
   InvalidateRect(h, nullptr, TRUE);
+  return tw;
 }
 
-// The footer's assets line is one or two lines of caption text, centred on the buttons.
+void place_footer_credit(State& st);
+
+// The footer's assets line is one or two lines of caption text, centred on
+// the buttons; the credit goes in the room it leaves before Preview.
 void place_assets_status(State& st) {
   Rc r = st.L.assets;
   if (welcome(st)) {
     r.w += r.x - st.L.import.x;
     r.x = st.L.import.x;
   }
-  place_caption(st, GetDlgItem(st.dlg, IDC_ASSETS_STATUS), r);
+  st.assets_right = r.x + place_caption(st, GetDlgItem(st.dlg, IDC_ASSETS_STATUS), r, true);
+  place_footer_credit(st);
+}
+
+// The footer's credit (ui_model.h: layout_footer_credit), laid out for the assets
+// line's text as it now reads: the link IDC_FOOTER_CREDIT, hidden when it doesn't
+// fit whole with the footer's gap each side.
+void place_footer_credit(State& st) {
+  HWND link = GetDlgItem(st.dlg, IDC_FOOTER_CREDIT);
+  if (!link) return;
+  const Theme& t = st.theme;
+  FooterCreditInput in;
+  in.assets_right = st.assets_right;
+  {
+    HDC dc = GetDC(st.dlg);
+    in.lead_w = measure_text(dc, kFooterCreditLead, t.fonts.caption).cx;
+    // A space's width, as it sets between two words.
+    in.space_w = measure_text(dc, L"a b", t.fonts.caption).cx - measure_text(dc, L"ab", t.fonts.caption).cx;
+    const SIZE name = measure_text(dc, kFooterCreditName, t.fonts.caption);
+    in.name_w = name.cx;
+    in.line_h = name.cy;
+    ReleaseDC(st.dlg, dc);
+  }
+  st.footer_credit = layout_footer_credit(st.L, in);
+  if (st.footer_credit.shown) {
+    place(link, st.footer_credit.box, focus_margin(t.dpi));
+    ShowWindow(link, SW_SHOWNA);
+    InvalidateRect(link, nullptr, TRUE);
+  } else {
+    // Too narrow: hidden whole, never clipped. The keyboard moves on to the
+    // next control rather than stay on a hidden one, through the dialog
+    // manager (WM_NEXTDLGCTL, sent while the link still has the focus), which
+    // moves the default push button with it as Tab does: the link gives up
+    // BS_DEFPUSHBUTTON and Preview takes it. A plain SetFocus left both as
+    // they were, so Enter on Preview went to the dialog's default, OK, which
+    // saves and closes.
+    if (GetFocus() == link) {
+      if (HWND next = GetNextDlgTabItem(st.dlg, link, FALSE); next && next != link) {
+        SendMessageW(st.dlg, WM_NEXTDLGCTL, (WPARAM)next, TRUE);
+      }
+    }
+    ShowWindow(link, SW_HIDE);
+  }
 }
 
 // The rotation line's tooltip (the chip's tooltip control, tool 2), over the
@@ -1281,7 +1355,8 @@ void update_summary(State& st) {
   // Random's line and its links count the rows shown (COVERS.md §1.8).
   const ShownChecks sc = shown_checks(st);
   const int total = (int)sc.shown;
-  // How many of the checked modules can run now (the Classic lane may be missing).
+  // How many of the checked modules can run now (the host may lack a lane or
+  // a module ABI, or a module exited 3).
   long long runnable = 0;
   for (const ListGroup& g : st.model.groups) {
     for (const ListRow& r : g.rows) {
@@ -1672,6 +1747,38 @@ int first_group(const State& st) {
   return first;
 }
 
+// The whole title of a group header drawn ellipsized, as its tooltip: a tool
+// of chip_tip on the list (id kHeaderTipBase + the group's), over the header
+// (`r`, list client px); an empty `r` puts it out of reach. Only what changed
+// is sent, since every paint of the list passes here.
+constexpr UINT_PTR kHeaderTipBase = 100;
+void set_header_tip(State& st, int group, const RECT& r, const std::wstring& title) {
+  if (!st.chip_tip || !st.list) return;
+  TOOLINFOW ti{sizeof(ti)};
+  ti.hwnd = st.list;
+  ti.uId = kHeaderTipBase + (UINT_PTR)group;
+  auto it = st.header_tips.find(group);
+  if (it == st.header_tips.end()) {
+    if (IsRectEmpty(&r)) return;
+    ti.uFlags = TTF_SUBCLASS;
+    ti.rect = r;
+    ti.lpszText = const_cast<wchar_t*>(title.c_str());
+    SendMessageW(st.chip_tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+    st.header_tips[group] = {r, title};
+    return;
+  }
+  if (!EqualRect(&it->second.first, &r)) {
+    ti.rect = r;
+    SendMessageW(st.chip_tip, TTM_NEWTOOLRECTW, 0, (LPARAM)&ti);
+    it->second.first = r;
+  }
+  if (!title.empty() && it->second.second != title) {
+    ti.lpszText = const_cast<wchar_t*>(title.c_str());
+    SendMessageW(st.chip_tip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+    it->second.second = title;
+  }
+}
+
 // Group headers: the list view sends no custom draw for them, so they are
 // painted over its own at the end of each paint (it paints into its double
 // buffer, so nothing flickers). Every group after the first is set apart by
@@ -1682,6 +1789,7 @@ void draw_group_headers(State& st, HDC dc) {
   const Palette& p = t.pal;
   RECT cr = list_visible_rect(st);
   const int first = first_group(st);
+  std::set<int> tipped;   // headers in view this time (the others lose their tooltip)
   for (const ListGroup& lg : st.model.groups) {
     const int id = group_id(lg.release);
     RECT r{};
@@ -1695,13 +1803,12 @@ void draw_group_headers(State& st, HDC dc) {
     r.left = cr.left;
     r.right = cr.right;
     fill_rect(dc, r, p.card);
-    // The release's title; every one of its modules waiting for a lane this
-    // host lacks makes the whole release "Coming soon".
+    // The release's title; every one of its modules being one this host
+    // can't run yet makes the whole release "Coming soon".
     const std::wstring name = widen(st.catalog.releases[lg.release].title);
     const bool all_soon = std::all_of(lg.rows.begin(), lg.rows.end(),
                                       [&](const ListRow& row) { return coming_soon(st, st.catalog.modules[row.module]); });
     const GroupChecks gc = group_checks(st, id);
-    int x = r.left + t.px(16);
     if (st.random && gc.total) {
       RECT b = group_box(st, r);
       const float rad = t.pxf(4);
@@ -1719,26 +1826,46 @@ void draw_group_headers(State& st, HDC dc) {
         fill_round(dc, b, rad, p.control);
         stroke_round(dc, b, rad, p.strong_stroke, (float)t.hairline());
       }
-      x = b.right + t.px(12);
     }
-    RECT tr{x, r.top, r.right - t.px(16), r.bottom};
-    SIZE ns = measure_text(dc, name, t.fonts.body_strong);
+    // The count, and the "Coming soon" pill at the right, always show whole:
+    // a title too long for what is left ("Star Wars Screen Entertainment" in
+    // the narrowest list) is ellipsized (layout_group_header), and the whole
+    // title is its tooltip; screen readers read it whole anyway (group_name).
+    const std::wstring count = std::to_wstring(gc.total), soon = L"Coming soon";
+    const bool pill = all_soon && !lg.rows.empty();
+    // The frame: the title after the group's checkbox (Random), the count,
+    // the pill 8 DIP short of the scroll bar's gutter (group_header_frame).
+    GroupHeaderInput hin = group_header_frame(r.right - r.left, t.dpi, st.random && gc.total, list_scrolls(st));
+    hin.left += r.left;
+    hin.right += r.left;
+    hin.pill_right += r.left;
+    const RECT tr{hin.left, r.top, hin.right, r.bottom};
+    hin.title = name;
+    hin.count_w = measure_text(dc, count, t.fonts.caption).cx;
+    hin.pill_w = pill ? measure_text(dc, soon, t.fonts.caption).cx + t.px(16) : 0;
+    const GroupHeaderLayout hl =
+        layout_group_header(hin, [&](const std::wstring& s) { return (int)measure_text(dc, s, t.fonts.body_strong).cx; });
     // Unclipped: the list view's header box can be shorter than the line at
     // high DPI, and release titles have descenders ("Anniversary"); the
     // header is painted after the rows, over the card's own margin under it.
-    draw_text(dc, name, tr, t.fonts.body_strong, p.text, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_NOCLIP);
-    RECT cnt{tr.left + ns.cx + t.px(8), tr.top, tr.right, tr.bottom};
-    draw_text(dc, std::to_wstring(gc.total), cnt, t.fonts.caption, p.text2, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-    if (all_soon && !lg.rows.empty()) {
-      std::wstring soon = L"Coming soon";
-      SIZE ss = measure_text(dc, soon, t.fonts.caption);
-      const int bh = t.px(20), w = ss.cx + t.px(16);
-      const int cy = (tr.top + tr.bottom) / 2;
-      const int right = r.right - (list_scrolls(st) ? t.px(12) : t.px(4)) - t.px(8);
-      RECT b{right - w, cy - bh / 2, right, cy - bh / 2 + bh};
+    draw_text(dc, hl.title, tr, t.fonts.body_strong, p.text, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_NOCLIP);
+    RECT cnt{hl.count_x, tr.top, pill ? hl.pill_x : tr.right, tr.bottom};
+    draw_text(dc, count, cnt, t.fonts.caption, p.text2, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    if (pill) {
+      const int bh = t.px(20), cy = (tr.top + tr.bottom) / 2;
+      RECT b{hl.pill_x, cy - bh / 2, hin.pill_right, cy - bh / 2 + bh};
       draw_badge(dc, b, soon, BadgeKind::caution, t, p.card);
     }
+    set_header_tip(st, id, hl.ellipsized ? r : RECT{}, name);
+    tipped.insert(id);
+    st.header_drawn[id] = hl.title;
   }
+  // Headers scrolled out of view (or gone with a filter) have no tooltip.
+  std::vector<int> out_of_view;
+  for (const auto& [id, tip] : st.header_tips) {
+    if (!tipped.count(id)) out_of_view.push_back(id);
+  }
+  for (int id : out_of_view) set_header_tip(st, id, RECT{}, L"");
 }
 
 void draw_row(State& st, NMLVCUSTOMDRAW* cd) {
@@ -1801,8 +1928,8 @@ void draw_row(State& st, NMLVCUSTOMDRAW* cd) {
     }
     st.icons.draw(dc, m, st.win_dir, rp.icon, dim);
     RECT tr = rp.text;
-    // Classic modules that can't run yet are dimmed; the group header and
-    // the details say why. Only a missing file gets a badge of its own.
+    // Modules this host can't run yet are dimmed; the group header and the
+    // details say why. Only a missing file gets a badge of its own.
     // In Random, the module the file names to play first (lead_id) says so.
     std::wstring badge = missing ? L"Missing" : st.random && m.id == lead_id(st) ? kPlaysFirst : L"";
     if (!badge.empty()) {
@@ -2173,9 +2300,10 @@ void on_filter_changed(State& st) {
   }().c_str());
 }
 
-// Ask the host, once per catalog, what it can do (`--capabilities`): whether
-// it has the Classic lane, and which lanes can open a module's own settings
-// windows. No module runs for this.
+// Ask the host what it can do (`--capabilities`; at the first catalog, and
+// at a later one only until it has answered: reload_catalog): which lanes
+// and module ABIs it runs, and which lanes can open a module's own settings
+// windows. No module runs for this; until it answers, none starts.
 void start_lane_probe(State& st) {
   std::wstring host = host_exe_path();
   if (st.catalog.modules.empty() || !file_exists(host)) return;
@@ -2187,27 +2315,56 @@ void start_lane_probe(State& st) {
   }).detach();
 }
 
-void set_classic_lane(State& st, Lane lane) {
-  if (st.classic == lane) return;
-  st.classic = lane;
-  log_line("dialog: classic lane %s", lane == Lane::missing ? "missing" : lane == Lane::available ? "available" : "unknown");
+// Which modules this host can run has changed (its --capabilities answer, or
+// a module's exit 3); `shown_before` is how the module the details show
+// stood before. The rows' dimming and the groups' pills, "… can run now",
+// Preview and the thumbnails follow, and so do the details when their own
+// module changed: rebuilt when it became (or stopped being) "Coming soon",
+// only its preview started when it had waited for the answer (rebuilding the
+// panel for anything less would take the keyboard focus from under the
+// user). Returns whether the details were rebuilt.
+bool availability_changed(State& st, ModuleRun shown_before) {
   InvalidateRect(st.list, nullptr, TRUE);
   update_summary(st);   // "… can run now"
-  // Only a Classic module's details change (and rebuilding the panel for
-  // any other would take the keyboard focus from under the user).
-  if (st.shown >= 0 && st.shown < (int)st.catalog.modules.size() && st.catalog.modules[st.shown].lane == "ne16") {
-    show_details(st, st.shown);
+  bool rebuilt = false;
+  if (const Module* m = shown_module(st)) {
+    const ModuleRun now = run_state(st, *m);
+    if (now != shown_before && (now == ModuleRun::coming_soon || shown_before == ModuleRun::coming_soon)) {
+      show_details(st, st.shown);
+      rebuilt = true;
+    } else if (now != shown_before) {
+      refresh_preview(st);
+    }
   }
   update_preview_button(st);
   PostMessageW(st.dlg, WM_APP_SCHEDULE_THUMBS, 0, 0);
+  return rebuilt;
+}
+
+// A module's preview or thumbnail exited 3 before a frame: the host has no
+// lane for it (host.h: kExitLaneMissing), whatever it listed; a host too old
+// to answer --capabilities says so this way, one module at a time. It alone
+// becomes "Coming soon"; the rest of its lane and ABI are left as they are.
+// (A host that lacks a module's ABI fails it with exit 1 instead, like a
+// damaged module: its abis= answer is what covers that.)
+void mark_cant_run(State& st, const std::vector<std::string>& ids) {
+  const Module* m = shown_module(st);
+  const ModuleRun before = m ? run_state(st, *m) : ModuleRun::runs;
+  bool any = false;
+  for (const std::string& id : ids) {
+    if (id.empty() || !st.catalog.find(id) || !st.cant_run.insert(id).second) continue;
+    log_line("dialog: %s exited 3: this host can't run it", id.c_str());
+    any = true;
+  }
+  if (any) availability_changed(st, before);
 }
 
 // ---- thumbnails ------------------------------------------------------------------------
 
 // Every module still without a picture gets a thumbnail taken in the
 // background (thumbnails.h: ThumbnailQueue), one at a time, in the order the
-// list shows them. Classic modules wait for the lane probe's answer and are
-// left out when this host can't run them.
+// list shows them. They wait for the host's answer (--capabilities), and a
+// module this host can't run (run_state) is left out.
 void schedule_thumbnails(State& st) {
   if (!st.thumbgen_allowed || st.import_running) return;
   std::vector<ThumbJob> jobs;
@@ -2221,10 +2378,10 @@ void schedule_thumbnails(State& st) {
       if (!ListView_GetItem(st.list, &it) || it.lParam < 0 || it.lParam >= (LPARAM)st.catalog.modules.size()) continue;
       const int mi = (int)it.lParam;
       const Module& m = st.catalog.modules[mi];
-      if (!is_present(st, mi) || coming_soon(st, m) || (m.lane == "ne16" && st.probing)) continue;
+      if (!is_present(st, mi) || run_state(st, m) != ModuleRun::runs) continue;
       if (st.icons.has_picture(m, st.win_dir)) continue;
       jobs.push_back(ThumbJob{m.id, host, resolve_module_path(st.win_dir, m.path), st.win_dir, st.icons.thumb_path(m.id),
-                              module_cvset(st, m)});
+                              module_cvset(st, m), m.abi, m.screen});
     }
   }
   if (!st.probing) st.thumbgen_ran = true;
@@ -2322,7 +2479,10 @@ void on_preview(State& st) {
   const int mi = st.shown;
   if (mi < 0 || mi >= (int)st.catalog.modules.size() || st.preview_running) return;
   // Run exactly what the dialog shows (even unsaved): a throwaway settings
-  // file handed to "/s" through AD_SETTINGS (dialog_support.h).
+  // file handed to "/s" through AD_SETTINGS (dialog_support.h). Its host gets
+  // the module's own screen, as the saver's always do (module_screen: an
+  // Intermission or a Star Trek module's 640x480, whatever the Resolution
+  // setting).
   Settings s = gather(st);
   s.module = st.catalog.modules[mi].id;
   s.randomize.clear();   // just this module, for as long as the preview runs
@@ -2475,8 +2635,14 @@ void reload_catalog(State& st) {
                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
   }
-  st.classic = Lane::unknown;
-  start_lane_probe(st);
+  // A module that exited 3 gets another chance. The host is the same
+  // program, so its answer stands: it is asked only when there is none yet
+  // (a first import leaves the welcome, which never asked; a host that
+  // didn't answer). Asking again would stop the live preview and the
+  // background thumbnail of every lane until it answered (module_run:
+  // waiting) and grey the module buttons meanwhile, all for nothing.
+  st.cant_run.clear();
+  if (!st.caps.known && !st.probing) start_lane_probe(st);
   populate_list(st);
   update_mode(st);
   update_assets_status(st);
@@ -2615,6 +2781,100 @@ INT_PTR ctl_color(State& st, HDC dc, HWND ctl) {
   SetBkColor(dc, bg);
   SetBkMode(dc, OPAQUE);
   return (INT_PTR)(bg == p.card ? st.theme.card_brush : st.theme.base_brush);
+}
+
+// The footer's credit (IDC_FOOTER_CREDIT, NM_CUSTOMDRAW): the dialog's link look,
+// adw_ui's ButtonRole::subtle (a fill under the pointer and a deeper one
+// pressed, the focus ring round its box), with its text in the caption face
+// of the assets line beside it: the lead in text2, the name in the accent
+// text colour and underlined under the pointer (the hover cue high contrast
+// keeps: its hover fill is the window colour). Pressed under high contrast:
+// the highlight and its text.
+LRESULT draw_footer_credit(State& st, NMCUSTOMDRAW* cd) {
+  if (cd->dwDrawStage != CDDS_PREPAINT) return CDRF_DODEFAULT;
+  HWND h = cd->hdr.hwndFrom;
+  const Theme& t = st.theme;
+  const Palette& p = t.pal;
+  const RECT cr = cd->rc;
+  const int w = cr.right - cr.left, hgt = cr.bottom - cr.top;
+  if (w <= 0 || hgt <= 0 || !st.footer_credit.shown) return CDRF_SKIPDEFAULT;
+  HDC dc = CreateCompatibleDC(cd->hdc);
+  HBITMAP bmp = CreateCompatibleBitmap(cd->hdc, w, hgt);
+  HGDIOBJ old = SelectObject(dc, bmp);
+  const RECT all{0, 0, w, hgt};
+  fill_rect(dc, all, p.base);
+  const int fm = focus_margin(t.dpi);
+  const float s = t.dpi / 96.0f, radius = 4 * s;
+  const bool pressed = (cd->uItemState & CDIS_SELECTED) != 0;
+  const bool hot = (cd->uItemState & CDIS_HOT) != 0 || st.footer_credit_hover;
+  const bool focus = ((cd->uItemState & CDIS_FOCUS) || focused_window() == h) && keyboard_cues(h);
+  const RECT body{fm, fm, w - fm, hgt - fm};
+  if (hot || pressed) fill_round(dc, body, radius, pressed ? p.row_selected : p.row_hover);
+  const COLORREF lead_ink = pressed && p.high_contrast ? p.on_accent : p.text2;
+  const COLORREF name_ink = !pressed ? p.accent_text : p.high_contrast ? p.on_accent : blend(p.accent_text, p.base, 0.25);
+  // The texts where the layout put them, in this window's coordinates.
+  const int ox = st.footer_credit.box.x - fm, oy = st.footer_credit.box.y - fm;
+  auto local = [&](const Rc& r) { return RECT{r.x - ox, r.y - oy, r.right() - ox + 1, r.bottom() - oy}; };
+  const UINT fmt = DT_SINGLELINE | DT_LEFT | DT_TOP | DT_NOPREFIX;
+  draw_text(dc, kFooterCreditLead, local(st.footer_credit.lead), t.fonts.caption, lead_ink, fmt);
+  HFONT underlined = nullptr;
+  if (hot) {
+    LOGFONTW lf{};
+    if (GetObjectW(t.fonts.caption, sizeof(lf), &lf)) {
+      lf.lfUnderline = TRUE;
+      underlined = CreateFontIndirectW(&lf);
+    }
+  }
+  draw_text(dc, kFooterCreditName, local(st.footer_credit.name), underlined ? underlined : t.fonts.caption, name_ink,
+            fmt);
+  if (underlined) DeleteObject(underlined);
+  if (focus) draw_focus_ring(dc, all, radius + fm, p, s);
+  BitBlt(cd->hdc, cr.left, cr.top, w, hgt, dc, 0, 0, SRCCOPY);
+  SelectObject(dc, old);
+  DeleteObject(bmp);
+  DeleteDC(dc);
+  return CDRF_SKIPDEFAULT;
+}
+
+// What screen readers hear of the credit besides its name (its window text,
+// "Made With Love by StarrLord"): where it goes, as its MSAA description and
+// its UI Automation help text (UIA's own property: its button proxy doesn't
+// map the description).
+void describe_footer_credit(HWND link) {
+  // CLSID_AccPropServices, IID_IAccPropServices, PROPID_ACC_DESCRIPTION, HelpText_Property_GUID.
+  static const GUID kClsid = {0xb5f8350b, 0x0548, 0x48b1, {0xa6, 0xee, 0x88, 0xbd, 0x00, 0xb4, 0xa5, 0xe7}};
+  static const GUID kIid = {0x6e26e776, 0x04f0, 0x495d, {0x80, 0xe4, 0x33, 0x30, 0x35, 0x2e, 0x31, 0x69}};
+  static const GUID kDescription = {0x4d48dfe4, 0xbd3f, 0x491f, {0xa6, 0x48, 0x49, 0x2d, 0x6f, 0x20, 0xc5, 0x88}};
+  static const GUID kHelpText = {0x08555685, 0x0977, 0x45c7, {0xa7, 0xa6, 0xab, 0xaf, 0x56, 0x84, 0x12, 0x1a}};
+  const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  IAccPropServices* props = nullptr;
+  if (SUCCEEDED(CoCreateInstance(kClsid, nullptr, CLSCTX_INPROC_SERVER, kIid, reinterpret_cast<void**>(&props))) && props) {
+    const std::wstring text = std::wstring(L"Opens ") + kFooterCreditUrl + L" in your browser";
+    for (const GUID* prop : {&kDescription, &kHelpText}) {
+      props->SetHwndPropStr(link, (DWORD)OBJID_CLIENT, (DWORD)CHILDID_SELF, *prop, text.c_str());
+    }
+    props->Release();
+  }
+  if (SUCCEEDED(co)) CoUninitialize();
+}
+
+// The credit's link: the project's page in the default browser. The test
+// build (AD_SCR_TEST_HOOKS) never opens anything, whatever runs it: it logs
+// the request and appends it to AD_SCR_TEST_OPEN_LOG, so no test starts a
+// browser.
+void open_credit(State& st) {
+#if AD_SCR_TEST_HOOKS
+  (void)st;
+  log_line("dialog: open %s (the test build opens nothing)", narrow(kFooterCreditUrl).c_str());
+  if (const std::wstring f = env_w(L"AD_SCR_TEST_OPEN_LOG"); !f.empty()) {
+    std::string text;
+    read_file(f, text);
+    write_file_atomic(f, text + "open\t" + narrow(kFooterCreditUrl) + "\n");
+  }
+#else
+  const auto r = (INT_PTR)ShellExecuteW(st.dlg, L"open", kFooterCreditUrl, nullptr, nullptr, SW_SHOWNORMAL);
+  log_line("dialog: open %s%s", narrow(kFooterCreditUrl).c_str(), r > 32 ? "" : (" failed (" + std::to_string(r) + ")").c_str());
+#endif
 }
 
 void dpi_changed(State& st, int dpi) {
@@ -2894,7 +3154,16 @@ void init_dialog(State& st) {
     SendMessageW(st.chip_tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
     ti.uId = 2;   // the rotation line (update_rotation_tip)
     SendMessageW(st.chip_tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+    // The footer's credit: where its link goes.
+    ti.uFlags = TTF_SUBCLASS | TTF_IDISHWND;
+    ti.uId = (UINT_PTR)item(IDC_FOOTER_CREDIT);
+    ti.lpszText = const_cast<wchar_t*>(kFooterCreditUrl);
+    SendMessageW(st.chip_tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
   }
+  // The link's window text, which screen readers read, is the phrase it
+  // draws (the .rc's is a placeholder).
+  SetWindowTextW(item(IDC_FOOTER_CREDIT), (std::wstring(kFooterCreditLead) + L" " + kFooterCreditName).c_str());
+  describe_footer_credit(item(IDC_FOOTER_CREDIT));
   st.preview = create_live_preview(st.dlg, IDC_LIVE_PREVIEW, st.hinst);
   SetWindowPos(st.preview, item(IDC_CHECK_NONE), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
@@ -2980,7 +3249,7 @@ void init_dialog(State& st) {
     }
   }
   st.chosen = st.settings.is_random() ? std::string() : st.settings.module;
-  start_lane_probe(st);   // first: a Classic module's preview waits for its answer
+  start_lane_probe(st);   // first: every module's preview waits for its answer
   populate_list(st);
 
   update_mode(st);
@@ -3001,6 +3270,24 @@ INT_PTR CALLBACK dialog_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       return FALSE;   // focus already set (or, off-screen, none wanted)
     case WM_ERASEBKGND:
       return TRUE;    // WM_PAINT covers every pixel
+    case WM_ACTIVATE:
+      // The dialog manager gives the focus back, on activation, to the control
+      // that had it when the dialog lost it. If that is the footer credit and
+      // it has hidden since (the window narrowed while inactive), the keyboard
+      // moves on as place_footer_credit moves it: checked once that restore
+      // is done.
+      if (st && st->list && LOWORD(wp) != WA_INACTIVE) PostMessageW(h, WM_APP_FOOTER_CREDIT_FOCUS, 0, 0);
+      break;   // DefDlgProc saves and restores the focus
+    case WM_APP_FOOTER_CREDIT_FOCUS:
+      if (st && st->list) {
+        HWND link = GetDlgItem(h, IDC_FOOTER_CREDIT);
+        if (link && GetFocus() == link && !IsWindowVisible(link)) {
+          if (HWND next = GetNextDlgTabItem(h, link, FALSE); next && next != link) {
+            SendMessageW(h, WM_NEXTDLGCTL, (WPARAM)next, TRUE);
+          }
+        }
+      }
+      return TRUE;
     case WM_PAINT: {
       if (!st || !st->list) break;
       PAINTSTRUCT ps;
@@ -3112,6 +3399,10 @@ INT_PTR CALLBACK dialog_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
       }
+      if (hdr->code == NM_CUSTOMDRAW && hdr->idFrom == IDC_FOOTER_CREDIT) {
+        SetWindowLongPtrW(h, DWLP_MSGRESULT, draw_footer_credit(*st, reinterpret_cast<NMCUSTOMDRAW*>(lp)));
+        return TRUE;
+      }
       if (hdr->code == NM_CUSTOMDRAW) {
         wchar_t cls[32] = {};
         GetClassNameW(hdr->hwndFrom, cls, 32);
@@ -3167,6 +3458,9 @@ INT_PTR CALLBACK dialog_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_STRIP_GET_COVERS:
           on_get_covers(*st);
           return TRUE;
+        case IDC_FOOTER_CREDIT:
+          open_credit(*st);
+          return TRUE;
         case IDC_PANEL_DEFAULTS:
           if (const Module* m = shown_module(*st)) {
             st->controls.erase(m->id);
@@ -3200,6 +3494,14 @@ INT_PTR CALLBACK dialog_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       }
       break;
     }
+    case WM_SETCURSOR:
+      // A link's pointer over the credit (a button passes WM_SETCURSOR to us first).
+      if (st && st->list && (HWND)wp == GetDlgItem(h, IDC_FOOTER_CREDIT) && LOWORD(lp) == HTCLIENT) {
+        SetCursor(LoadCursorW(nullptr, IDC_HAND));
+        SetWindowLongPtrW(h, DWLP_MSGRESULT, TRUE);
+        return TRUE;
+      }
+      break;
     case WM_MOUSELEAVE:
       if (st && st->hover_preview) {
         st->hover_preview = false;
@@ -3225,22 +3527,19 @@ INT_PTR CALLBACK dialog_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_LANE_PROBE: {
       std::unique_ptr<HostCapabilities> caps(reinterpret_cast<HostCapabilities*>(lp));
       if (!st || !caps) break;
-      st->probing = false;
       const bool was_live = button_live(*st, st->shown);
+      const Module* m = shown_module(*st);
+      const ModuleRun before = m ? run_state(*st, *m) : ModuleRun::runs;
+      st->probing = false;
       st->caps = *caps;
       log_line("dialog: host capabilities: %s", caps->known ? caps->line.c_str() : "(no answer)");
-      const Lane before = st->classic;
-      // A host too old to answer is taken to run everything (it says so
-      // itself, with exit 3, when a module's lane is missing).
-      set_classic_lane(*st, !caps->known ? Lane::unknown : caps->has_lane("ne16") ? Lane::available : Lane::missing);
-      if (st->classic == before) {
-        refresh_preview(*st);   // a Classic module waiting on the answer
-        PostMessageW(h, WM_APP_SCHEDULE_THUMBS, 0, 0);
-      }
+      // Every module waited for this. A host too old to answer is taken to
+      // run everything: a module whose lane it lacks exits 3 there, and
+      // becomes "Coming soon" by itself (mark_cant_run).
+      const bool rebuilt = availability_changed(*st, before);
       // The shown module's buttons may have come alive (rebuilt only then:
       // a rebuild takes the keyboard focus from under the user).
-      const Module* m = shown_module(*st);
-      if (m && button_live(*st, st->shown) != was_live &&
+      if (!rebuilt && m && button_live(*st, st->shown) != was_live &&
           std::any_of(m->controls.begin(), m->controls.end(),
                       [](const Control& c) { return c.type == ControlType::button; })) {
         build_panel(*st, st->shown);
@@ -3264,7 +3563,7 @@ INT_PTR CALLBACK dialog_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       return TRUE;
     case WM_APP_THUMBS:
       if (!st) break;
-      if (wp == kThumbLaneMissing) set_classic_lane(*st, Lane::missing);
+      if (wp == kThumbLaneMissing && st->thumbgen) mark_cant_run(*st, st->thumbgen->take_cant_run());
       if (wp == kThumbSaved) {
         st->icons.recheck_pictureless();
         InvalidateRect(st->list, nullptr, FALSE);
@@ -3273,7 +3572,7 @@ INT_PTR CALLBACK dialog_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       }
       return TRUE;
     case WM_APP_LIVE_STATUS:
-      if (st && wp == kLiveLaneMissing) set_classic_lane(*st, Lane::missing);
+      if (st && wp == kLiveLaneMissing) mark_cant_run(*st, live_preview_take_cant_run(st->preview));
       if (st && wp == kLiveThumbSaved) {
         // A new thumbnail: modules still on the placeholder look again.
         st->icons.recheck_pictureless();
@@ -3336,10 +3635,16 @@ INT_PTR CALLBACK dialog_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 //     report=<path> (write where the list shows in the picture, the card colour, and
 //     whether anything straddles the list's top edge: the smoke tests check the pixels;
 //     also where the box-cover strip's tiles area shows, strip_mode=regular|compact|hidden,
-//     the base colour and how many rows the list shows)
+//     the base colour and how many rows the list shows; each group's accessible name and
+//     its title as drawn; the host's capabilities line, the modules "Coming soon", and the
+//     shown module's id, chip, whether its buttons are live and Preview is enabled)
 //     collections=<id>,… (the strip's filter)  focus=strip (the first selected tile, else
 //     the first)  hover=strip:<id> (that tile hovered)
 //     sound=off (the Sound dropdown at Off)  volume=<0..100>  focus=sound|volume
+//     hover=credit (the footer's credit under the pointer)  pressed=credit (...held down)
+//     focus=credit (its focus ring); the report says where it shows (credit=, credit_lead=,
+//     credit_name=; "hidden" when it doesn't fit), the assets line's text (assets_text=) and
+//     Preview (preview_button=), in the picture's pixels
 
 std::map<std::wstring, std::wstring> parse_state(const std::wstring& s) {
   std::map<std::wstring, std::wstring> kv;
@@ -3438,6 +3743,11 @@ int run_screenshot(State& st, const std::wstring& png) {
     st.hover_preview = true;
     live_preview_set_hover(st.preview, true);
   }
+  if (kv[L"hover"] == L"credit") {
+    st.footer_credit_hover = true;
+    InvalidateRect(GetDlgItem(dlg, IDC_FOOTER_CREDIT), nullptr, TRUE);
+  }
+  if (kv[L"pressed"] == L"credit") SendDlgItemMessageW(dlg, IDC_FOOTER_CREDIT, BM_SETSTATE, TRUE, 0);
   if (kv[L"hover"].rfind(L"strip:", 0) == 0 && st.strip) {
     const std::string id = narrow(kv[L"hover"].substr(6));
     for (size_t i = 0; i < st.strip->count(); ++i) {
@@ -3451,7 +3761,7 @@ int run_screenshot(State& st, const std::wstring& png) {
     static const std::map<std::wstring, int> ids = {{L"list", IDC_MODULE_LIST}, {L"ok", IDOK}, {L"single", IDC_MODE_SINGLE},
                                                     {L"random", IDC_MODE_RANDOM}, {L"duration", IDC_DURATION},
                                                     {L"preview", IDC_PREVIEW}, {L"sound", IDC_SOUND},
-                                                    {L"volume", IDC_VOLUME}};
+                                                    {L"volume", IDC_VOLUME}, {L"credit", IDC_FOOTER_CREDIT}};
     SendMessageW(dlg, WM_CHANGEUISTATE, MAKEWPARAM(UIS_CLEAR, UISF_HIDEFOCUS | UISF_HIDEACCEL), 0);
     HWND f = nullptr;
     if (auto it = ids.find(kv[L"focus"]); it != ids.end()) f = GetDlgItem(dlg, it->second);
@@ -3517,7 +3827,8 @@ int run_screenshot(State& st, const std::wstring& png) {
              sa.left, sa.top, sa.right - sa.left, sa.bottom - sa.top,
              mode == StripMode::regular ? "regular" : mode == StripMode::compact ? "compact" : "hidden", GetRValue(base),
              GetGValue(base), GetBValue(base), st.model.shown, list_geom(st).pos);
-    // What screen readers call each group (its LVGROUP header).
+    // What screen readers call each group (its LVGROUP header), and its
+    // title as the header last drew it (whole, or ellipsized: "drawn<g>=").
     std::string report = buf;
     for (size_t g = 0; g < st.model.groups.size(); ++g) {
       wchar_t name[256] = {};
@@ -3526,9 +3837,45 @@ int run_screenshot(State& st, const std::wstring& png) {
       info.mask = LVGF_HEADER;
       info.pszHeader = name;
       info.cchHeader = 256;
-      ListView_GetGroupInfo(st.list, group_id(st.model.groups[g].release), &info);
+      const int gid = group_id(st.model.groups[g].release);
+      ListView_GetGroupInfo(st.list, gid, &info);
       report += "group" + std::to_string(g) + "=" + narrow(name) + "\n";
+      if (auto d = st.header_drawn.find(gid); d != st.header_drawn.end()) {
+        report += "drawn" + std::to_string(g) + "=" + narrow(d->second) + "\n";
+      }
     }
+    // What this host can run (the smoke tests' config-abi): its answer, the
+    // modules "Coming soon", and the module the details show ("details="):
+    // its chip, its buttons live or not, Preview enabled or not.
+    std::string soon;
+    for (const Module& m : st.catalog.modules) {
+      if (coming_soon(st, m)) soon += (soon.empty() ? "" : ",") + m.id;
+    }
+    const Module* shown = shown_module(st);
+    report += "caps=" + (st.caps.known ? st.caps.line : std::string()) + "\nsoon=" + soon +
+              "\ndetails=" + (shown ? shown->id : std::string()) +
+              "\nbadge=" + narrow(window_text(GetDlgItem(dlg, IDC_MODULE_BADGE))) +
+              "\nbutton_live=" + (button_live(st, st.shown) ? "1" : "0") +
+              "\npreview_enabled=" + (IsWindowEnabled(GetDlgItem(dlg, IDC_PREVIEW)) ? "1" : "0") + "\n";
+    // The footer's credit (the smoke tests' and the renders' checks): its
+    // link's box and its two texts, the assets line's text and Preview.
+    auto pic = [&](const Rc& r) {
+      RECT a{r.x, r.y, r.right(), r.bottom()};
+      MapWindowPoints(dlg, nullptr, reinterpret_cast<POINT*>(&a), 2);
+      OffsetRect(&a, -origin.x, -origin.y);
+      return std::to_string(a.left) + "," + std::to_string(a.top) + "," + std::to_string(a.right - a.left) + "," +
+             std::to_string(a.bottom - a.top);
+    };
+    RECT ar{};
+    GetWindowRect(GetDlgItem(dlg, IDC_ASSETS_STATUS), &ar);
+    MapWindowPoints(nullptr, dlg, reinterpret_cast<POINT*>(&ar), 2);
+    const bool credit =
+        st.footer_credit.shown && (GetWindowLongW(GetDlgItem(dlg, IDC_FOOTER_CREDIT), GWL_STYLE) & WS_VISIBLE) != 0;
+    report += "credit=" + (credit ? pic(st.footer_credit.box) : std::string("hidden")) +
+              "\ncredit_lead=" + (credit ? pic(st.footer_credit.lead) : std::string("hidden")) +
+              "\ncredit_name=" + (credit ? pic(st.footer_credit.name) : std::string("hidden")) +
+              "\nassets_text=" + pic(Rc{(int)ar.left, (int)ar.top, st.assets_right - (int)ar.left, (int)(ar.bottom - ar.top)}) +
+              "\npreview_button=" + pic(st.L.preview_button) + "\n";
     write_file_atomic(kv[L"report"], report);
   }
   DestroyWindow(dlg);

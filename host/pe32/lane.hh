@@ -45,6 +45,9 @@
 // bit 2, source 1 (AD4) while interactive, wake when the module posted
 // WM_CLOSE / SC_CLOSE to the saver window. ADCAPS gives the Caps Lock toggle
 // the engine latches at PREINITIALIZE (GetCapsLockChange reacts to changes).
+// NUMLOCK lines and ADNUMLOCK (Num Lock's toggle, for the Classic lane's
+// Final Exam) change nothing here: the Win32 GetKeyState reports Caps Lock's
+// toggle alone.
 //
 // Configure mode (adhostwin --configure, §6.1): ADPAGE's button sequence
 // (0x9001fbf) on a fresh zeroed block with cbSize, +0x0C = the --owner as a
@@ -199,6 +202,7 @@ class Pe32Lane : public Lane {
   ~Pe32Lane() override;
 
   const char* name() const override { return "pe32"; }
+  std::vector<std::string> abis() const override { return {"afterdark"}; }  // --capabilities (core lane.h)
   bool init(const std::string& module_path, LaneContext& ctx) override;
   uint32_t frame_interval_us() const override { return 16667; }
   void on_command(const Command& c) override;

@@ -424,9 +424,13 @@ std::string Vfs::state_mutex_name() const {
 std::string Vfs::full_path(std::string_view guest) const {
   std::string p = slashes(std::string(guest));
   std::string abs;
-  if (p.size() >= 2 && p[1] == ':') {
+  if (p.size() > 2 && p[1] == ':' && p[2] == '\\') {
     abs = p;
-    if (abs.size() == 2 || abs[2] != '\\') abs.insert(2, "\\");  // "C:X" → "C:\X"
+  } else if (p.size() >= 2 && p[1] == ':') {
+    // "X:name" (or "X:"): against drive X's own current directory.
+    abs = drive_cwd(p[0]);
+    if (abs.back() != '\\') abs += '\\';
+    abs += p.substr(2);
   } else if (!p.empty() && p[0] == '\\') {
     abs = cwd_.substr(0, 2) + p;
   } else {
@@ -616,11 +620,40 @@ std::string Vfs::host_to_guest(std::string_view host_path) const {
 
 bool Vfs::set_cwd(std::string_view guest) {
   std::string g = full_path(guest);
-  Resolved r = resolve(g);
-  Stat st;
-  bool ok = r.m ? !(stat_resolved(r, &st) && !st.dir) : synthetic_dir(g);
-  if (ok) cwd_ = g;
-  return ok;
+  if (!is_dir(g)) return false;
+  if (g[0] != cwd_[0]) drive_cwds_[cwd_[0]] = cwd_;
+  drive_cwds_.erase(g[0]);  // the current drive's is cwd_
+  cwd_ = g;
+  return true;
+}
+
+bool Vfs::set_drive_cwd(std::string_view guest) {
+  std::string g = full_path(guest);
+  if (!is_dir(g)) return false;
+  if (g[0] == cwd_[0]) cwd_ = g;
+  else drive_cwds_[g[0]] = g;
+  return true;
+}
+
+std::string Vfs::drive_cwd(char letter) const {
+  char l = char(toupper(uint8_t(letter)));
+  if (l == cwd_[0]) return cwd_;
+  auto it = drive_cwds_.find(l);
+  return it != drive_cwds_.end() ? it->second : std::string(1, l) + ":\\";
+}
+
+bool Vfs::set_drive(char letter) {
+  char l = char(toupper(uint8_t(letter)));
+  if (l < 'A' || l > 'Z') return false;
+  if (l == cwd_[0]) return true;
+  std::string root = std::string(1, l) + ":\\";
+  if (!is_dir(root)) return false;
+  std::string d = drive_cwd(l);
+  if (!is_dir(d)) d = root;
+  drive_cwds_[cwd_[0]] = cwd_;
+  drive_cwds_.erase(l);
+  cwd_ = d;
+  return true;
 }
 
 // ---- Vfs: metadata ------------------------------------------------------------------------------------
@@ -800,6 +833,14 @@ bool Vfs::read_file(std::string_view guest, std::string* out) const {
 
 void Vfs::note_written(const std::string& guest_full) {
   if (std::find(written_.begin(), written_.end(), guest_full) == written_.end()) written_.push_back(guest_full);
+}
+
+std::vector<std::string> Vfs::written() const {
+  std::vector<std::string> out;
+  for (const std::string& p : written_) {
+    if (exists(p)) out.push_back(p);
+  }
+  return out;
 }
 
 uint64_t Vfs::next_mem_time() {

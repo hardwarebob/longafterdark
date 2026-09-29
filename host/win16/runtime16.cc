@@ -581,6 +581,11 @@ void Runtime16::dispatch_thunk(uint16_t id) {
     }
     if (e->conv != Conv16::register_) c.ret(0);
   }
+  if (gdi_flush_) {
+    // The call drew on a surface the guest reads itself (a DIB driver DC).
+    gdi_flush_ = false;
+    GdiFlush();
+  }
 
   if (traced) {
     trace("api16", "%s(%s) -> %0*X%s  [from %s]", e->label().c_str(), args.c_str(), e->ret16 ? 4 : 8, c.result(),

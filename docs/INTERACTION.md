@@ -30,10 +30,11 @@ into `research/win/dis`.
 | Who decides "wake or play" | The `.scr`, from a **status record** each host publishes in a shared-memory page (§3.4) plus **input sequence numbers** (§3.2). stdout still carries frames only. |
 | Interactive | A module is interactive when the host says so: AD4 `WantEvents` (block `+0x08` bit 0), AD3 result `0x0E` toggle. Input a module *consumes* without being interactive (a WH_KEYBOARD hook that eats the key, a module that pulls the saver window's messages) is reported per input line, and the `.scr` waits for that verdict before exiting (§4.3). |
 | Caps Lock | Never wakes the saver (as in AFTERDAR.SCR). The `.scr` sends `KEY 20 …` and `CAPS <state>`; the initial state goes in `ADCAPS` so modules latch it at start (§3.1). |
+| Num Lock | Never wakes the saver either (as in AFTERDAR.SCR and After Dark 2.0). The `.scr` sends `KEY 144 …` as any key; since the seventh release also `NUMLOCK <state>`, to a host whose `--capabilities` says `numlock=1`, and the initial state in `ADNUMLOCK`: Star Trek: The Screen Saver's Final Exam begins its exam on a change of it, and ends it with a wake request (result 5) that ends the saver (§3, §4.1, §4.4, §5.2). |
 | Exit gestures | Not playing: any key except Shift/Ctrl/Caps Lock/Num Lock, any click or wheel, a move past 10 px, switching away. Playing: Caps Lock toggles the game off (then any input exits), **Alt or F10 exits at once**, switching away exits. |
-| Multi-monitor | One **input owner**: the primary monitor's window. Only its host gets `KEY`/`CAPS`/`MOUSE`; only its status is read. The cursor is confined to it while playing. |
+| Multi-monitor | One **input owner**: the primary monitor's window. Only its host gets `KEY`/`CAPS`/`NUMLOCK`/`MOUSE`; only its status is read. The cursor is confined to it while playing. |
 | Module buttons | `adhostwin --configure <module> --button <slot> --owner <hwnd>` runs the module's own button handler; its `DialogBox*`/`MessageBox`/`GetOpenFileName` become **real** dialogs owned by the settings window, forwarding to the guest dialog procedure (§6). |
-| Module state | A per-user, per-package **writable overlay** over the guest's `C:\WINDOWS` and `C:\AFTERDRK` in `ADSTATE`, which the `.scr` always passes (`state\` next to `settings.ini`); without it a host keeps the overlay in memory, so headless runs stay deterministic and write nothing (§7). |
+| Module state | A per-user, per-package **writable overlay** over the guest's `C:\WINDOWS` and `C:\AFTERDRK` (`C:\SAVER` for Star Wars Screen Entertainment's Intermission modules) in `ADSTATE`, which the `.scr` always passes (`state\` next to `settings.ini`); without it a host keeps the overlay in memory, so headless runs stay deterministic and write nothing (§7). |
 | Desktop seed | The `.scr` captures each monitor before its windows appear, writes a delete-on-close P6 at the emulated size and passes `ADSEEDIMG` to that window's first host only (§8). |
 | DOS Shell | Not reproducible on the current build (§9.1); ships with exit-reason logging and a 5-minute regression. |
 
@@ -153,6 +154,8 @@ hook, or reads the message queue itself (§1.5).
 | `FindWindow("After Dark", NULL)` then `PeekMessage(hwnd, 0, 0, PM_REMOVE)` loops, keeping `WM_KEYDOWN`/`WM_KEYUP` | LUNATIC (`26:008f`, `26:0187`, `26:01b0..26:01ed`) | **VERIFIED**. The AD 2/3 host's blanker window; the module takes the keys out of the host's queue so the host never sees them. Under AFTERDAR.SCR the class does not exist (inference: Lunatic was not playable under AD4) |
 | `GetAsyncKeyState(vk) & 0x8001` polling | LUNATIC (`26:01f5..`), many others | **VERIFIED**: bit 0 ("pressed since the last call") matters |
 | Caps Lock one-shot (`GetKeyState/GetAsyncKeyState(0x14)`), no `0x0E` | TUNNEL, CONFETTI, SATORI, NIRVANA, FISHPRO, MANDELBR, STRANGE, TOILET(S), CHAM, CS, ARTIST, RAY, TOAST3, BADDOG3, SIMPCLOK, GRAMPA, HOMEREAT, PHYSICS, SIMPFILE, SNOWBALL | **VERIFIED** call sites + **EMPIRICAL** (no `0x0E`) |
+| Caps Lock as "next" (`GetKeyState(0x14) & 1`, called by the module itself, or through `AD_MOD.DLL` for MISSION and PANELS), no `0x0E` (Star Trek: The Screen Saver, since the seventh release) | FRONTIER (the next scene), HORTA (a new cavern), IONSTORM (the next colours), MISSION (the next scene), PANELS (the next panel), PLANETS (the next planet), SCOTTYS (the next schematic), SICKBAY (the next case) | **EMPIRICAL**: a `CAPS 1`/`CAPS 0` script against a run without it (the content survey) |
+| Num Lock's toggle (`GetKeyState(0x90) & 1`) latched at start; a change starts an exam that hooks the keyboard (`WH_KEYBOARD`) and returns `0x0E`; a mouse move ends it with `0x0E`, then 5 (§1.7) | FINAL (Star Trek: The Screen Saver's Final Exam) | **VERIFIED** `FINAL.AD 3:732e`; **EMPIRICAL**: the host's scripted exam (`ne16.startrek`) |
 
 The About texts announce the games: "Caps-lock gets you in and out of
 interactive mode" (Rodger Dodger), "hit CAPS LOCK … hit 1, 2, or 3"
@@ -160,7 +163,9 @@ interactive mode" (Rodger Dodger), "hit CAPS LOCK … hit 1, 2, or 3"
 … pressing 1, 2, or 3" (Simpsons Trivia), "CapsLock: Take control of the
 crosshairs — click the mouse" (Mime Hunt), "Press Caps-lock to display the
 edit window" (Magic Turtle), "press Caps-lock and click and drag the pins"
-(Marbles), "Press Caps-lock to choose your fighter" (RPS).
+(Marbles), "Press Caps-lock to choose your fighter" (RPS), and "Depress the
+Num Lock key to begin, and type the number of your answer. Move the mouse
+to end the exam." (Final Exam).
 
 ### 1.6 Module buttons — VERIFIED
 
@@ -175,6 +180,14 @@ edit window" (Magic Turtle), "press Caps-lock and click and drag the pins"
   (`1:0b01`); copy back a replaced error text; `FreeLibrary`; unload
   AD_SND. **No CLOSE, and the values are not copied back**: modules persist
   their button results themselves.
+* **Intermission** (Star Wars Screen Entertainment; `ABI.md` §3.8.4): the
+  control panel's **Confi&gure...** loads the module through the reader
+  (`SAVERMAIN(10)`), sets the record's window to the panel's dialog, sends
+  `SAVERMAIN(8)` — `IMIMXPLY.IMQ`'s `DialogBox(hLib, "DIALOGBOX", owner,
+  SAVERDLGPROC)`, the module's own modal dialog (the reader answers 0 for a
+  module without a `SAVERDLGPROC`) — and frees it (`SAVERMAIN(11)`); no
+  QUERY, no START (`INTERMIS 2:1cb2..2:1d7d`). The dialog's OK writes the
+  module's keys to `SWSE.INI` itself.
 * What the buttons call and where they persist (static imports and
   strings):
 
@@ -187,9 +200,44 @@ edit window" (Magic Turtle), "press Caps-lock and click and drag the pins"
 | BUGS, FISHPRO (ne16) | Bug Type, Select Fish… | `DialogBoxParam` | engine/helper prefs (trace with `ADTRACE=file`) |
 | MESSAGE3, NONSENSE, SLIDE, GLOBE, WMORPH, LUNATIC (ne16) | Edit / Select, Edit Names…, Slides…, Map…, Edit…/Revert, Clear Scores/Keys… | `DialogBox`, `EndDialog`, `MessageBox` (LUNATIC's "Do you really want to clear…") | `MESG_AD3.DAT`, `NONSENSE.TXT`, `LunData.dat` (`_lcreat`/`_lwrite`/`OpenFile`), `MODULES.INI`/`AFTERDRK.INI`/`AD_PREFS.INI`/`WriteProfileString` |
 | `tt` MESSYGES, `ad32` LOGO, `ad32` BUGS, `simpsons` HOW2DRAW (ne16) | Edit Custom, Picture…, Bug Type, Help | `DialogBox` (+ engine prefs) | as above |
+| the 14 `swse` modules (ne16, Intermission) | Configure... | `SAVERMAIN(8)` → `DialogBox` of `"DIALOGBOX"` (named through the module's `NAMETABLE`), with INTRMLIB's `ANT3DBOX`/`ANT3DCHECK`/`ANT3DSCROLL`/`ANT3DTEXT`/`ANT3DONEORMORE` controls and SWSE's animated credits box; Scrolling Text adds `GetOpenFileName`, `GetSaveFileName` and `ChooseFont` | `WritePrivateProfileString` into `SWSE.INI` in the Windows directory, one section per module (Scrolling Text also writes its edit box to `SWTXEDBX.TXT` there) |
+| `startrek` COMMS, SOUNDER (ne16, After Dark 2.0) | Edit Custom... (Communications, MODULE 10), Sounds.. (Sounder, MODULE 9) | `DialogBox`: "Edit Message" (a multi-line edit, id 103); "Select Directory", whose folder list is `DlgDirList(…, DDL_EXCLUSIVE \| DDL_DRIVES \| DDL_DIRECTORY)` beside the folder's `*.WAV` (§6.2) | `WritePrivateProfileString` into `AD_PREFS.INI`: `[Communications] MessageText`, `[Sounder] SoundPath` (nothing for a folder without a `.WAV`) |
 
-39 button controls in the merged catalog (202 modules); 22 distinct
-binaries.
+The merged catalog of the six releases (216 modules) has 58 button
+controls on 53 modules, from 35 distinct binaries: the 202 After Dark
+modules have 44 on 39 modules (21 binaries; counted in the catalog when
+Star Wars Screen Entertainment was added, where this line had said 39 and
+22), and each of the 14 Intermission modules has one. With the seventh
+release's two (232 modules) it has 60 on 55 modules, from 37 binaries.
+
+### 1.7 After Dark 2.0 (`AD.EXE` 2.0b, Star Trek: The Screen Saver) — VERIFIED
+
+Added with the seventh release (`ABI.md` §3.9; listings in
+`research/win/pkg/startrek/lane/dis/` and `…/content/dis/`, gitignored):
+
+* `AD.EXE` forwards no input to a module, as AFTERDAR.SCR forwards none to
+  a Classic one. Its idle and wake detection is `AD_LIB.DLL`'s journal
+  hook (`SAVERHOOK`, `2:0086..2:00b3`), which did not wake on Num Lock,
+  Shift, Ctrl, Caps Lock or the four arrow keys (VK `0x25`–`0x28`), and
+  passed every key while a module played (game mode, toggled by result
+  `0x0E`). The saver's exemptions (§4.1) differ only in the arrows, which
+  no Star Trek module uses outside Final Exam's exam, where every key is
+  the game's.
+* DRAWFRAME's result 5 posted `AD.EXE` its own wake message, 0x7EE: the
+  module's wake request. Final Exam is the one module that returns it.
+* **Final Exam** (`FINAL.AD`, the Starfleet Academy exam) latches
+  `GetKeyState(VK_NUMLOCK) & 1` as it starts (`3:732e`) and cycles in review
+  mode (a question, its timer, the answer; "PRESS NUM LOCK TO BEGIN EXAM").
+  A change of the toggle restarts the module (result 3, handled inside its
+  own `MODULE`), and the new instance hooks the keyboard
+  (`SetWindowsHook(WH_KEYBOARD, …)`, a hook that records each key down and
+  passes it on) and returns `0x0E`: the exam, interactive. Its answers are
+  the keys 1–4, on the top row or the keypad (with Num Lock off the
+  keypad's 1–4 are End, Down, PgDn and Left, which it takes too). Num Lock
+  again removes the hook and returns `0x0E` (back to review). A mouse move
+  (`GetCursorPos`) removes the hook, returns `0x0E`, and then 5: the wake.
+  The exam is offered only while `AD_SYSTEM+0x1E` is not 1 and `+0x28`
+  (the multi-module mode) is 0; the bridge writes 0 to both.
 
 ---
 
@@ -200,7 +248,8 @@ binaries.
   read. Other monitors' hosts run untouched (they are "other machines").
   If the primary window runs no host (a "not imported" message), no input is
   forwarded and every input exits, as today.
-* **Input line.** `KEY`, `CAPS` and `MOUSE` are *input lines*. Each host
+* **Input line.** `KEY`, `CAPS` and `MOUSE` are *input lines*, and since
+  the seventh release `NUMLOCK` (§3.2). Each host
   numbers them 1, 2, 3 … in the order it reads them. The `.scr` keeps the
   same counter per host, so it knows every line's number without an
   acknowledgement.
@@ -224,6 +273,7 @@ binaries.
 | Variable | Meaning | Default |
 |---|---|---|
 | `ADCAPS=0\|1` | Caps Lock toggle state at start, applied to `InputState.caps` before `Lane::init` (like `ADCVSET`). Modules latch it at PREINITIALIZE (§1.2), so a first `CAPS` line must never be needed to establish it. | 0 |
+| `ADNUMLOCK=0\|1` | Since the seventh release: Num Lock toggle state at start, applied to `InputState.numlock` before `Lane::init` (and in `--configure`), like `ADCAPS`. Final Exam latches it as it starts and begins its exam when it changes (§1.7), so a first `NUMLOCK` line must never be needed to establish it. The start log says `num lock on`. | 0 |
 | `ADSTATUSHANDLE=<n>` | Decimal (or `0x` hex) value of an **inherited** handle to a pagefile-backed section of at least 4096 bytes. The host maps it read/write and publishes the status record (§3.4) there. A value that does not map is logged once and ignored. | none |
 | `ADSTATUSLOG=1` | Also print `STATUS <frame> flags=0x<hex> applied=<n> eaten=<n> src=<s>` on stderr at frame 0 and whenever flags, `applied` or `eaten` change. For tests and `AD_SCR_HOSTLOG`. | off |
 | `ADSTATE=<dir>\|:memory:` | The per-user state root (§7). Unset or `:memory:`: the overlay lives in memory for the process (headless runs, censuses, `FBHASH` never see or write user state). Exception: `--configure` with `ADSTATE` unset uses `%LOCALAPPDATA%\LongAfterDark\state`. The `.scr` passes it on every spawn (§7.1). | in memory |
@@ -246,6 +296,16 @@ binaries.
   `seq`; `input_applied` counts it when it is applied.
 * No new text commands: `KEY`, `CAPS`, `MOUSE`, `SET`, `GO`, `QUIT` cover
   everything.
+* **`NUMLOCK <0|1>`** came later, with the seventh release: Num Lock's
+  toggle, as `CAPS` is Caps Lock's (`Command::Kind::numlock`,
+  `InputState::numlock`). It is an input line, numbered like `CAPS`, so
+  `input_seq`, `input_applied` and `input_eaten` count it; the `KEY 144`
+  line before it is the key itself. A host that does not know it ignores
+  it without numbering it, as it does any line it does not know, and every
+  later line would then be one off in the saver's count: so the saver sends
+  it only to a host whose `--capabilities` says `numlock=1` (§3.3, §4.1).
+  The Win16 runtime answers `GetKeyState(VK_NUMLOCK)`'s bit 0 from it; the
+  pe32 lane ignores it.
 
 ### 3.3 New command-line forms
 
@@ -257,7 +317,14 @@ adhostwin.exe --configure <module> --button <slot> [--owner <hwnd>] [NAME=VALUE 
 * `--capabilities` prints one line and exits 0:
   `lanes=pe32,ne16 configure=pe32,ne16 status=1 state=1 seed=1` (only what
   this build has). The settings dialog uses it instead of the exit-3/exit-2
-  probe.
+  probe. Later additions: `audio=1` (AUDIO.md), and
+  `abis=afterdark,intermission`, the module ABIs the build's lanes run
+  (PACKAGES.md §7.5), and, since the seventh release, `numlock=1`: the host
+  takes the `NUMLOCK` line and `ADNUMLOCK` (§3.1, §3.2). Today's line
+  reads `lanes=pe32,ne16 configure=pe32,ne16 abis=afterdark,intermission
+  status=1 state=1 seed=1 audio=1 numlock=1`. The saver takes `numlock=1`
+  exactly: `numlock=0`, another spelling or nothing means no Num Lock
+  toggle.
 * `--configure`: §6.1.
 
 ### 3.4 The status record
@@ -289,6 +356,8 @@ struct AdwHostStatusV1 {           // 64 bytes
                                    // read the saver window's queue with removal (PeekMessage PM_REMOVE
                                    // or GetMessage, hwnd = saver or NULL, a range that includes keys)
 #define ADWS_WAKE          0x10    // the guest posted WM_CLOSE / SC_CLOSE to the saver window
+                                   // (since the seventh release also: an After Dark 2.0 module
+                                   // returned 5, its wake request, §5.2)
 #define ADWS_READY         0x20    // lane init done
 ```
 
@@ -325,8 +394,26 @@ struct AdwHostStatusV1 {           // 64 bytes
   from the last value sent to the owner, sends `CAPS <state>`. (Checking on
   both down and up makes this independent of when Windows flips the toggle
   bit.) A 250 ms timer repeats the check.
+* **Num Lock** (since the seventh release), the same way for a host that
+  takes it (§3.3):
+  * At every spawn: `ADNUMLOCK = GetKeyState(VK_NUMLOCK) & 1` (every
+    window's host, owner or not, `/p` too), except for a host whose
+    `--capabilities` answer came without `numlock=1`: then the variable is
+    removed, so nothing inherited reaches it. Unless the rotation waits for
+    the answer (it holds a module of another ABI: `App::caps_gate`, up to
+    2 s), the saver's first hosts start before it, so they get `ADNUMLOCK`
+    anyway: a host that does not know the variable ignores it, and without
+    it Final Exam would latch a guessed state and take the first correcting
+    `NUMLOCK` line for a toggle, starting its exam by itself.
+  * After each `KEY` line to the owner (after the `CAPS` check), on the
+    250 ms timer, and when the answer arrives: `NUMLOCK <state>` when it
+    differs from the last value sent to the owner, but only once the
+    owner's host has answered with `numlock=1`.
+  * The saver logs `input: numlock N -> owner (n=K)`, and each spawn line
+    says what the host started with (`numlock=0|1`, or `-1`: none).
 * Caps Lock, Num Lock, Shift and Ctrl never wake the saver (AFTERDAR.SCR
-  `0x4028db..0x4028f2`).
+  `0x4028db..0x4028f2`; After Dark 2.0's hook did not wake on them either,
+  §1.7).
 
 ### 4.2 Event table
 
@@ -349,7 +436,12 @@ event goes to the owner's host.
 
 * **MOUSE coordinates** are the cursor's position mapped into the owner's
   letterboxed frame rectangle, scaled to the host's emulated screen and
-  clamped to it; `buttons` from `GetKeyState(VK_LBUTTON/RBUTTON/MBUTTON)`.
+  clamped to it (that host's own: an Intermission module's 640×480, which
+  its ABI gives it, or since the seventh release a Star Trek module's,
+  which its catalog entry's `"screen": "640x480"` gives it, whatever the
+  Resolution setting, DESIGN.md §6a; its frame pillarboxed on a widescreen;
+  a game's cursor clip is that frame, and Final Exam's mouse move is mapped
+  into it); `buttons` from `GetKeyState(VK_LBUTTON/RBUTTON/MBUTTON)`.
   Moves are coalesced: while a `MOUSE` line is queued and not yet written, a
   newer position replaces its text and keeps its number, so line numbers
   are assigned when a line is queued and never skipped.
@@ -395,12 +487,21 @@ while a hold is pending. The decision logic is a pure function
 * Not playing: any key except Shift/Ctrl/Caps Lock/Num Lock, any click, the
   wheel or a nudge of the mouse ends the saver. Caps Lock never does; in some
   modules it does something (scares the fish, changes the colours) or
-  starts a game.
+  starts a game. Num Lock never does either; in Final Exam it starts the
+  exam.
 * Playing (after Caps Lock in Rodger Dodger, You Bet Your Head, Simpsons
   Trivia, Mime Hunt, Frankenscreen, Marbles, RPS, Magic Turtle's editor,
   How to Draw…): keys, clicks and the mouse belong to the game. Press Caps
   Lock again to stop playing (the next key or move then ends the saver), or
   press **Alt** to end it at once.
+* **Final Exam** (Star Trek: The Screen Saver, since the seventh release)
+  is a Num Lock game: Num Lock starts the Starfleet Academy exam, whose
+  answers are the number keys (the exam is interactive through the status
+  record as any game is), and Num Lock again stops it. A move of the mouse
+  ends the exam, and the module then asks its host to wake the saver
+  (result 5, §5.2): the saver ends through the status's `ADWS_WAKE`
+  (`input: wake`), as After Dark 2.0 ended. **Alt** ends it at once, as any
+  game.
 * Only the primary monitor plays; the others keep running on their own.
 
 ---
@@ -465,6 +566,51 @@ while a hold is pending. The decision logic is a pure function
   layout (`VkKeyScan` inverse, Shift state from `InputState`).
 * Mouse coordinates are scaled for the small-screen guest display, as
   `sync_input()` already does.
+* `CAPS` and `NUMLOCK` lines are toggle states only: `GetKeyState`'s bit 0
+  for `VK_CAPITAL` and `VK_NUMLOCK` (since the seventh release for Num
+  Lock). The `KEY 20` or `KEY 144` line before each is the key itself,
+  which goes to the hook chain and the queue as any key does.
+* **After Dark 2.0's wake** (Star Trek: The Screen Saver, since the seventh
+  release; `PACKAGES.md` §7.3). An After Dark 2.0 module's DRAWFRAME
+  result 5 is its wake request, as `AD.EXE` 2.0b took it (`ABI.md` §3.9).
+  The status gets `ADWS_WAKE`, so the saver ends as when the user wakes it;
+  the frame of the wake is presented, and the module is called no more.
+  Headless, the run ends at the next step: exit 0, "module finished", after
+  the log line `<module>: frame N: the module woke the saver (result 5);
+  the run ends`. Streamed, the frames repeat the last picture, input and
+  `SET` going nowhere, until the front end ends the run (`QUIT`, or stdin
+  closing): a host that exited instead would race the saver, which ignores
+  the status of a host whose stdout has closed. For every other module 5
+  still ends the run as the module's error. Final Exam, the one module
+  that returns it, does so when a mouse move ends its exam (§1.7), after a
+  `0x0E` that ends its interactive state.
+* **Intermission modules** (Star Wars Screen Entertainment,
+  `PACKAGES.md` §7.5) are **never interactive**: Intermission gave its IMX
+  modules no input at all (its reader never sets the record's input flag,
+  `ABI.md` §3.8.3), so the status source stays 0 and the lane is still 2
+  (ne16).
+  **No `KEY` line becomes a key message for them**: the lane runs no
+  keyboard hook chain and posts nothing to the saver window's queue; a key
+  only changes the key state that `GetAsyncKeyState` and `GetKeyState`
+  read. `MOUSE` lines are posted as above. The modules poll, through
+  SWSE.DLL's `USERABORT`: `GetCursorPos`, `GetAsyncKeyState` for the
+  buttons, and `GetInputState`, true while a key or button message waits
+  in the queue. Under Intermission's default wake-up options ("mbk") every
+  key but Ctrl ended the blank, so no module ever saw a key without that
+  end. A posted key the saver does not wake on (Shift, Ctrl, Caps Lock, Num
+  Lock, and any key-up, such as that of the key that started a preview)
+  made `USERABORT` report input during a module's start instead, and the
+  module gave its start up, as it did when Intermission was about to stop
+  it, staying on its title card until the saver ended. So those keys change
+  nothing for a Star Wars module, and a button that reaches `GetInputState`
+  wakes the saver anyway. Key-filter and wake follow the same rules as for
+  any ne16 module. When `USERABORT` sees input, SWSE's `FORCETOWAKE` posts
+  fake mouse and Shift-key messages to its own task
+  (`PostAppMessage(GetCurrentTask(), …)`, `ABI.md` §3.8.4) for Intermission
+  to end the blank on. **That is not mapped to a wake**: the lane's pump
+  removes and counts those posts (`user16_dispatch_guest`), and the saver's
+  uniform rules (§4) stay in charge: a Star Wars module ends on the same
+  input as any other module (a move past 10 pixels, not any move).
 
 ---
 
@@ -492,6 +638,24 @@ adhostwin.exe --configure <module> --button <slot> [--owner <hwnd>] [NAME=VALUE 
     native AD3 bridge, the same sequence in C++ (`MODULE(5)` on the screen
     DC with `AD_SYSTEM+0x26` = owner16; unless 1 or 7: copy values,
     `MODULE(7 + slot)`; error copy-back; free).
+  * **ne16, an Intermission module** (Star Wars Screen Entertainment; added
+    later, `PACKAGES.md` §7.5): its only button is slot 0,
+    **Configure...**. The lane sends `SAVERMAIN(10)`, loading the module
+    through its reader, then `SAVERMAIN(7)`, the query INTRMLIB's
+    enumeration had sent before the control panel offered the button (so
+    the module's `palette(0)` and `saverinit` run first, and the record
+    holds its name); it sets the record's window to owner16, sends
+    `SAVERMAIN(8)` and frees the module with `SAVERMAIN(11)`.
+    Intermission's control panel itself sent 10, 8 and 11, with no 7 (§1.6,
+    `ABI.md` §3.8.4). The reader's `DialogBox` of the module's `DIALOGBOX`
+    becomes a real modal dialog (§6.2), its ANT3D controls (classes
+    INTRMLIB's LibMain registered in the guest) real windows forwarding to
+    the guest. The reader answers 0 only for a module without a
+    `SAVERDLGPROC` (none of the 14), which exits 4; any other slot is
+    refused ("control N is not a button", exit 1). The module
+    writes its settings to `C:\WINDOWS\SWSE.INI`, which lands in
+    `<state>\swse\WINDOWS\SWSE.INI` (§7); the profile seeds of §7.2 are
+    never written out.
 * stdout (not streaming in this mode) gets one JSON line:
   `{"result":"ok"|"nothing"|"error","dialogs":<n>,"message":"…","written":["<guest path>",…]}`.
 * Exit codes: **0** the button ran and showed at least one dialog or message
@@ -612,8 +776,30 @@ Windows 95; emulated windows start at `0x00010010`.
 * `COMMDLG.GetOpenFileName`/`GetSaveFileName` (16-bit `OPENFILENAME`):
   real dialog, **8.3 short paths** returned (`GetShortPathNameW`, under `H:`,
   §7.4), since Win16 modules expect them.
+* `COMMDLG.ChooseFont` (added for Star Wars Screen Entertainment's
+  Scrolling Text): the real font dialog, started from the guest's
+  `LOGFONT`; on OK the `LOGFONT`, point size, font type and colour go back
+  to the guest. Hidden (`ADCONFIGHIDDEN`), where no script line can pick a
+  font, it is cancelled and logged (`host/win16/README.md`).
 * `MessageBox` becomes a real `MessageBoxW` (today it logs and answers IDOK).
 * `WinHelp`: logged, returns 1 (HOW2DRAW "Help" then shows nothing: exit 4).
+* `DlgDirList`, `LB_DIR` and `CB_DIR` with `DDL_DRIVES` list `[-h-]` after
+  `[-c-]` while the host's drives are mounted as `H:` (§7.4), and
+  `DlgDirSelect` answers `h:` for it (since the seventh release: Star Trek's
+  Sounder chooses its folder of `.WAV` files in such a list, so the user
+  reaches their own folders; before, it listed `[-c-]` alone).
+  `DlgDirList` takes the guest's DOS to the drive and directory it lists,
+  as Windows 3.1's USER did through DOS (select disk, chdir), and each
+  drive keeps its own current directory, so `[-c-]` returns to where `C:`
+  was left. A module's `getcwd()` (INT 21h AH=19h, then AH=47h) therefore
+  names the chosen folder with its drive: Sounder saves `[Sounder]
+  SoundPath=H:\C\WINDOWS\MEDIA`, and Globe's "Map..." in After Dark 4.0
+  Deluxe and 3.2 saves `[After Dark] GlobeFile=H:\…`, which every later run
+  finds. A folder whose short path is longer than DOS's current directory
+  (66 characters with the drive) is not entered: the list stays as it was.
+* The configure script's `PICK <id> <text…>` selects the list-box or
+  combo-box item whose text this is, ignoring case, wherever a sorted list
+  holds it, then acts as `SELECT` (e.g. `PICK 204 [-h-]`).
 
 ### 6.3 The settings dialog
 
@@ -717,12 +903,29 @@ at a scratch folder gets scratch state with it.
 
 ```
 <state>\                                 ADSTATE
-  <package>\                             deluxe (the FILES\… tree), ad10, ad32, tt, simpsons,
+  <package>\                             deluxe (the FILES\… tree), ad10, ad32, tt, simpsons, swse, startrek,
                                          or legacy-<fnv32 of the module dir, 8 hex> for anything else
     WINDOWS\                             upper layer of the guest's C:\WINDOWS (both lanes of a package share it)
     <MODDIR>\                            upper layer of the guest's C:\AFTERDRK = the module dir
-                                         (AD40, CLASSIC, AD10TH, AD32, TWISTED, SIMPSONS, …)
+                                         (AD40, CLASSIC, AD10TH, AD32, TWISTED, SIMPSONS, …);
+                                         for swse, SAVER: the upper layer of C:\SAVER
 ```
+
+Star Wars Screen Entertainment's modules keep their settings in
+`swse\WINDOWS\SWSE.INI` (one section per module, written by their
+**Configure...** dialogs and by Storyboards, which remembers where it
+stopped), and Scrolling Text its edit box in `swse\WINDOWS\SWTXEDBX.TXT`.
+Deleting `<state>\swse` restores the disc's defaults, which stay in the
+package's `WINDOWS\SWSE.INI` (§7.3).
+
+Star Trek: The Screen Saver's modules keep what they write in
+`startrek\WINDOWS\AD_PREFS.INI`: Communications' `[Communications]
+MessageText` (its **Edit Custom...** button), Sounder's `[Sounder]
+SoundPath` (its **Sounds..** button) and AD_SND 1.0's `[Sound] Mute`,
+written at each load of a module that wants sound. The lane's profile
+seeds for that file (`[After Dark] Path`, `[Sound] SoundDriver`) are never
+written there (`PACKAGES.md` §7.3); deleting `<state>\startrek` restores
+the defaults.
 
 One package is one 1996 machine: Deluxe's AD4 and Classic modules share
 `WIN.INI`, `MODULES.INI`, `AFTERDRK.INI` as they did on one Windows 95
@@ -733,9 +936,10 @@ install, while each package's modules never see another package's state
 
 | Guest | Lower (read-only) | Upper (writable) |
 |---|---|---|
-| `C:\WINDOWS` | the lane's synthetic files (WIN.INI `[Berkeley Systems]`, the ne16 `MODULES.INI` seeds, PROGMAN.INI and `.GRP` files; ne16 also `LunData.dat`, the module dir's `LUNDATA.DAT`, which the installers copied to WINDOWS: without it Lunatic Fringe says "Configuration File Not Accessible") | `<state>\<pkg>\WINDOWS` |
+| `C:\WINDOWS` | the lane's synthetic files (WIN.INI `[Berkeley Systems]`, the ne16 `MODULES.INI` seeds, PROGMAN.INI and `.GRP` files; ne16 also `LunData.dat`, the module dir's `LUNDATA.DAT`, which the installers copied to WINDOWS: without it Lunatic Fringe says "Configuration File Not Accessible"); ne16, when the package has one, its `WINDOWS` folder (`swse`: `SWSE.INI`), and for an Intermission module the profile seeds of `SYSTEM.INI`, `SWSE.INI` and `ANTSW.INI` (`PACKAGES.md` §7.5), for an After Dark 2.0 module those of `AD_PREFS.INI` (`PACKAGES.md` §7.3) | `<state>\<pkg>\WINDOWS` |
 | `C:\WINDOWS\SYSTEM` (ne16) | the engine dir | none (read-only, as today) |
 | `C:\AFTERDRK`, `C:\AFTERD~1` (ne16) | the module dir | `<state>\<pkg>\<MODDIR>` (one upper for both names) |
+| `C:\SAVER` (ne16, an Intermission module, instead of `C:\AFTERDRK`) | the module dir | `<state>\swse\SAVER` |
 | `C:\PICTURES` (pe32) | module dir `PICTURES` | none |
 | `H:\<L>\…` | the host's `<L>:\…`, read-only | none |
 
@@ -781,7 +985,11 @@ Read-only. For ne16 the path handed to the guest is the 8.3 short form
 mapping is deterministic and reversible, so a folder chosen in configure
 mode (and stored in the module's INI) resolves the same in every later run.
 Guest paths already inside a mount keep their mount form (a picture under
-`C:\PICTURES` stays there).
+`C:\PICTURES` stays there). A Win16 folder list reaches `H:` as its drive
+`[-h-]` (§6.2): Star Trek's Sounder then plays the `.WAV` files of a folder
+the user picked there, in every later run. Such a list reaches only folders
+whose short path fits DOS's current directory (at most 63 characters after
+`H:\`); file dialogs are not limited, since they hand over full paths.
 
 ---
 
@@ -796,16 +1004,45 @@ What remains:
 * **Capture (`.scr`, `/s` only).** Before any saver window is created,
   for each monitor: `BitBlt(SRCCOPY | CAPTUREBLT)` of the monitor's rectangle
   from the screen DC into a 32-bpp DIB, then `StretchBlt` with `HALFTONE` to
-  that window's emulated size (`ADSCREENW`×`ADSCREENH`), then written as a
-  binary P6 (maxval 255) to
-  `%TEMP%\LongAfterDark-seed-<pid>-<window index>.ppm`, created with
+  the emulated size (`ADSCREENW`×`ADSCREENH`) of the window's first host,
+  then written as a binary P6 (maxval 255). That size depends on the first
+  module, which is not known yet (a rotation's is drawn later), so the
+  window gets one picture for each screen its first module may have
+  (`releases.h` `first_module_screens`, since the seventh release; each
+  kind of module, `first_module_abis`, before), all from the one `BitBlt`
+  (`geometry.h` `plan_seed_shots`):
+  * an After Dark module that follows the display: the whole monitor at
+    the window's After Dark size, in
+    `%TEMP%\LongAfterDark-seed-<pid>-<window index>.ppm`;
+  * a module with a 640×480 screen of its own, an Intermission module by
+    its ABI or a Star Trek one by its catalog `screen` (that module alone,
+    a rotation holding one, or Random while the host's answer may add
+    them): the part of the monitor its 640×480 frame will cover
+    (`geometry.h` `seed_source`: the letterboxed 4:3 frame), shrunk to
+    640×480, in
+    `%TEMP%\LongAfterDark-seed-<pid>-<window index>-640x480.ppm`, one
+    picture for both kinds. A screen of another size would get its own,
+    `…-<window index>-<W>x<H>.ppm`. Whatever the catalog holds (a
+    hand-edited one may give every module a `screen` of its own, each a P6
+    of up to 48 MB), a window gets three pictures at most (`geometry.h`
+    `plan_seed_shots`): the one that follows the display, and two of
+    modules' own screens, 640×480 first, then the smallest; a first module
+    whose screen got none starts on black, and the pictures are written one
+    at a time.
+
+  A window that can only start with such a module (it alone, or Star Wars
+  Screen Entertainment or Star Trek: The Screen Saver the only release
+  imported) gets just the second. Where the two pictures are the same (a
+  4:3 monitor at 480 lines, both kinds possible) the second is not written:
+  the 640×480 module's entry uses the first file. Each file is created with
   `FILE_FLAG_DELETE_ON_CLOSE | FILE_ATTRIBUTE_TEMPORARY`, share
   read + delete, and **kept open** by the `.scr` for its lifetime, so the
   file disappears when the saver ends, however it ends.
 * **Hand-over.** Only a window's **first** host of the session gets
-  `ADSEEDIMG=<that file>`. Respawns and rotations start black (the original
-  randomizer blanked between modules, and a restarted module never saw the
-  desktop again). A monitor added later by a relayout gets no seed.
+  `ADSEEDIMG=<that file>`, the one taken at its emulated size. Respawns
+  and rotations start black (the original randomizer blanked between
+  modules, and a restarted module never saw the desktop again). A monitor
+  added later by a relayout gets no seed.
 * **Host.** `Display::seed` opens the file with
   `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` (required to open a
   delete-on-close file). A P6 of exactly the screen size is used 1:1 (no
@@ -950,6 +1187,12 @@ bool read_status(const void* view, AdwHostStatusV1* out);   // seqlock reader, u
 
 The `.scr` includes `status.h` from core (header-only reader) rather than
 duplicating the layout.
+
+Since the seventh release: `Command::Kind::numlock` (`NUMLOCK <0|1>`) is an
+input line as `key`, `caps` and `mouse` are (`is_input_line`),
+`InputState` has `bool numlock`, and `Env` has `numlock_at_start`
+(`ADNUMLOCK`), applied before `Lane::init` as `caps_at_start` is.
+`LaneStatus::wake` also carries an After Dark 2.0 module's result 5.
 
 Shared VFS and profile store (`host/win32`, owned by L32; land early,
 the ne16 lane uses them):
