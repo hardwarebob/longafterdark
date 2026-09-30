@@ -13,6 +13,17 @@
 # system-wide. Run from Git Bash. Set AD_SEED_DIR to a directory that already
 # holds llvm-mingw-*.zip / ninja-win.zip to skip downloads.
 #
+# On Linux (a cross build for Windows; it also needs curl, git, cmake, unzip
+# and xz) everything host-specific has a folder of its own, so a checkout
+# shared with Windows (WSL, a dual boot, a container's bind mount) keeps both
+# hosts' builds, and neither replaces the other's:
+#   third_party/toolchains/llvm-mingw-<ver>-<LLVM_MINGW_LINUX_BUILD>/   the release's Linux build
+#   third_party/toolchains/ninja-linux/ninja
+#   third_party/win/local-linux/{include,lib}   the same static zlib + phosg,
+#                                              built there (build-linux-*)
+# (AD_SEED_DIR: its llvm-mingw-*.tar.xz / ninja-linux.zip); the zlib and
+# phosg sources are shared.
+#
 # Safe to run again at any time, and it repairs what it finds:
 #   - a zip is used only when its sha256 is the pinned one (a download cut
 #     short, or any other file of that name, is fetched again); downloads go
@@ -24,46 +35,54 @@
 #     marked when it is whole, else unpacked again;
 #   - zlib and phosg are rebuilt from scratch whenever their pinned revisions
 #     or the toolchain differ from the ones recorded in
-#     third_party/win/local/.bootstrap-deps.
+#     third_party/win/local/.bootstrap-deps (local-linux/ on Linux).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # NAME=value lines; tolerate a CRLF checkout.
 eval "$(tr -d '\r' < "$ROOT/tools/versions" | grep -E '^[A-Z0-9_]+=[^ ]*$')"
-UNAME_S="$(uname -s)"
-if [ "$UNAME_S" = "Linux" ]; then
-  IS_LINUX=1
-  for v in LLVM_MINGW_VER LLVM_MINGW_LINUX_SHA256 NINJA_VER NINJA_LINUX_SHA256 ZLIB_REV PHOSG_REV; do
-    [ -n "${!v:-}" ] || { echo "bootstrap: $v is not set in tools/versions" >&2; exit 1; }
-  done
-  LLVM_ARCHIVE="llvm-mingw-$LLVM_MINGW_VER-ucrt-ubuntu-22.04-x86_64.tar.xz"
-  LLVM_ARCHIVE_SHA="$LLVM_MINGW_LINUX_SHA256"
-  LLVM_INNER="llvm-mingw-$LLVM_MINGW_VER-ucrt-ubuntu-22.04-x86_64"
-  NINJA_ARCHIVE="ninja-linux.zip"
-  NINJA_ARCHIVE_SHA="$NINJA_LINUX_SHA256"
-  EXE_SUFFIX=""
-else
-  IS_LINUX=0
-  for v in LLVM_MINGW_VER LLVM_MINGW_SHA256 NINJA_VER NINJA_SHA256 ZLIB_REV PHOSG_REV; do
-    [ -n "${!v:-}" ] || { echo "bootstrap: $v is not set in tools/versions" >&2; exit 1; }
-  done
-  LLVM_ARCHIVE="llvm-mingw-$LLVM_MINGW_VER-ucrt-x86_64.zip"
-  LLVM_ARCHIVE_SHA="$LLVM_MINGW_SHA256"
-  LLVM_INNER="llvm-mingw-$LLVM_MINGW_VER-ucrt-x86_64"
-  NINJA_ARCHIVE="ninja-win.zip"
-  NINJA_ARCHIVE_SHA="$NINJA_SHA256"
-  EXE_SUFFIX=".exe"
-fi
+die() { echo "bootstrap: $*" >&2; exit 1; }
 
 TP="$ROOT/third_party"
 TC="$TP/toolchains"
 WD="$TP/win"
+
+# Each host's own archives, unpacked into folders of their own: the
+# release's archive and its folder share one name (the archive's top folder).
+if [ "$(uname -s)" = "Linux" ]; then
+  IS_LINUX=1
+  for v in LLVM_MINGW_VER LLVM_MINGW_LINUX_BUILD LLVM_MINGW_LINUX_SHA256 NINJA_VER NINJA_LINUX_SHA256 ZLIB_REV PHOSG_REV; do
+    [ -n "${!v:-}" ] || die "$v is not set in tools/versions"
+  done
+  for c in curl git cmake unzip tar xz sha256sum; do
+    command -v "$c" >/dev/null 2>&1 ||
+      die "$c is needed (Debian, Ubuntu: sudo apt install curl git cmake unzip xz-utils)"
+  done
+  LLVM_BUILD="$LLVM_MINGW_LINUX_BUILD"
+  LLVM_ARCHIVE_EXT=".tar.xz"
+  LLVM_ARCHIVE_SHA="$LLVM_MINGW_LINUX_SHA256"
+  NINJA_ARCHIVE="ninja-linux.zip"
+  NINJA_ARCHIVE_SHA="$NINJA_LINUX_SHA256"
+  NINJA_DIR="$TC/ninja-linux"
+  EXE_SUFFIX=""
+else
+  IS_LINUX=0
+  for v in LLVM_MINGW_VER LLVM_MINGW_SHA256 NINJA_VER NINJA_SHA256 ZLIB_REV PHOSG_REV; do
+    [ -n "${!v:-}" ] || die "$v is not set in tools/versions"
+  done
+  LLVM_BUILD="ucrt-x86_64"
+  LLVM_ARCHIVE_EXT=".zip"
+  LLVM_ARCHIVE_SHA="$LLVM_MINGW_SHA256"
+  NINJA_ARCHIVE="ninja-win.zip"
+  NINJA_ARCHIVE_SHA="$NINJA_SHA256"
+  NINJA_DIR="$TC/ninja"
+  EXE_SUFFIX=".exe"
+fi
 mkdir -p "$TC" "$WD"
 
-LLVM_NAME="llvm-mingw-$LLVM_MINGW_VER-ucrt-x86_64"
+LLVM_NAME="llvm-mingw-$LLVM_MINGW_VER-$LLVM_BUILD"
+LLVM_ARCHIVE="$LLVM_NAME$LLVM_ARCHIVE_EXT"
 LLVM_DIR="$TC/$LLVM_NAME"
-
-die() { echo "bootstrap: $*" >&2; exit 1; }
 sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
 
 fetch() {  # fetch <name> <url> <dest-dir> <sha256>: <dest-dir>/<name>, verified
@@ -147,40 +166,45 @@ install_unpacked() {  # install_unpacked <archive> <sha256> <final dir> [<folder
 }
 
 if ! complete "$LLVM_DIR" "$LLVM_ARCHIVE_SHA" &&
-   ! adopt_if_whole "$TC/$LLVM_ARCHIVE" "$LLVM_ARCHIVE_SHA" "$LLVM_DIR" "$LLVM_INNER"; then
+   ! adopt_if_whole "$TC/$LLVM_ARCHIVE" "$LLVM_ARCHIVE_SHA" "$LLVM_DIR" "$LLVM_NAME"; then
   fetch "$LLVM_ARCHIVE" "https://github.com/mstorsjo/llvm-mingw/releases/download/$LLVM_MINGW_VER/$LLVM_ARCHIVE" "$TC" \
     "$LLVM_ARCHIVE_SHA"
   echo "bootstrap: unpacking $LLVM_ARCHIVE"
-  install_unpacked "$TC/$LLVM_ARCHIVE" "$LLVM_ARCHIVE_SHA" "$LLVM_DIR" "$LLVM_INNER"
+  install_unpacked "$TC/$LLVM_ARCHIVE" "$LLVM_ARCHIVE_SHA" "$LLVM_DIR" "$LLVM_NAME"
 fi
 
-if ! complete "$TC/ninja" "$NINJA_ARCHIVE_SHA" && ! adopt_if_whole "$TC/$NINJA_ARCHIVE" "$NINJA_ARCHIVE_SHA" "$TC/ninja"; then
+if ! complete "$NINJA_DIR" "$NINJA_ARCHIVE_SHA" &&
+   ! adopt_if_whole "$TC/$NINJA_ARCHIVE" "$NINJA_ARCHIVE_SHA" "$NINJA_DIR"; then
+  # shellcheck disable=SC2153  # NINJA_VER is tools/versions' (the eval above)
   fetch "$NINJA_ARCHIVE" "https://github.com/ninja-build/ninja/releases/download/$NINJA_VER/$NINJA_ARCHIVE" "$TC" \
     "$NINJA_ARCHIVE_SHA"
-  mkdir -p "$TC/ninja.unpack-$$"
-  unzip -q -o "$TC/$NINJA_ARCHIVE" -d "$TC/ninja.unpack-$$"
-  chmod +x "$TC/ninja.unpack-$$/ninja"* 2>/dev/null || true
-  echo "$NINJA_ARCHIVE_SHA" > "$TC/ninja.unpack-$$/.bootstrap-complete"
-  rm -rf "$TC/ninja"
-  mv "$TC/ninja.unpack-$$" "$TC/ninja"
+  install_unpacked "$TC/$NINJA_ARCHIVE" "$NINJA_ARCHIVE_SHA" "$NINJA_DIR"
 fi
+# unzip keeps the mode the zip records; make sure of it.
+if [ "$IS_LINUX" -eq 1 ]; then chmod +x "$NINJA_DIR/ninja"; fi
 
 [ -x "$LLVM_DIR/bin/clang++$EXE_SUFFIX" ] || die "$LLVM_DIR/bin/clang++$EXE_SUFFIX is missing after unpacking"
-[ -x "$TC/ninja/ninja$EXE_SUFFIX" ] || die "$TC/ninja/ninja$EXE_SUFFIX is missing after unpacking"
-for other in "$TC"/llvm-mingw-*-ucrt-x86_64; do
+[ -x "$NINJA_DIR/ninja$EXE_SUFFIX" ] || die "$NINJA_DIR/ninja$EXE_SUFFIX is missing after unpacking"
+for other in "$TC"/llvm-mingw-*-"$LLVM_BUILD"; do
   if [ -d "$other" ] && [ "$other" != "$LLVM_DIR" ]; then
     echo "bootstrap: note: $(basename "$other") is no longer used (the build takes $LLVM_NAME); it can be deleted"
   fi
 done
 
+# zlib and phosg are built for Windows on either host, but a Linux host
+# installs them (and builds them) in folders of its own: their CMake files
+# record the host's absolute paths, so neither host may use, or replace, the
+# other's. cmake/llvm-mingw.cmake looks in local-linux first on Linux.
 if [ "$IS_LINUX" -eq 1 ]; then
-  export PATH="$LLVM_DIR/bin:$TC/ninja:$PATH"
-  LOCAL="$WD/local"
+  export PATH="$LLVM_DIR/bin:$NINJA_DIR:$PATH"
+  LOCAL="$WD/local-linux"
   LOCAL_M="$LOCAL"
+  DEPS_BUILD="$WD/build-linux"
 else
-  export PATH="$LLVM_DIR/bin:$TC/ninja:/c/Program Files/CMake/bin:$PATH"
+  export PATH="$LLVM_DIR/bin:$NINJA_DIR:/c/Program Files/CMake/bin:$PATH"
   LOCAL="$WD/local"
   LOCAL_M="$(cygpath -m "$LOCAL")"
+  DEPS_BUILD="$WD/build"
 fi
 DEPS_STAMP="$LOCAL/.bootstrap-deps"
 DEPS_WANT="llvm-mingw=$LLVM_MINGW_VER zlib=$ZLIB_REV phosg=$PHOSG_REV"
@@ -197,29 +221,29 @@ if [ "$(cat "$DEPS_STAMP" 2>/dev/null)" != "$DEPS_WANT" ] || [ ! -f "$LOCAL/lib/
    [ ! -f "$LOCAL/lib/libphosg.a" ]; then
   echo "bootstrap: building zlib and phosg ($DEPS_WANT)"
   # From scratch: no stale objects, headers or libraries of other revisions.
-  rm -rf "$WD/build-zlib" "$WD/build-phosg" "$LOCAL"
+  rm -rf "$DEPS_BUILD-zlib" "$DEPS_BUILD-phosg" "$LOCAL"
 
   clone_at https://github.com/madler/zlib "$WD/zlib" "$ZLIB_REV"
-  cmake -S "$WD/zlib" -B "$WD/build-zlib" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  cmake -S "$WD/zlib" -B "$DEPS_BUILD-zlib" -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_SYSTEM_NAME=Windows \
     -DCMAKE_C_COMPILER="$LLVM_DIR/bin/x86_64-w64-mingw32-clang$EXE_SUFFIX" \
     -DCMAKE_RC_COMPILER="$LLVM_DIR/bin/x86_64-w64-mingw32-windres$EXE_SUFFIX" \
     -DCMAKE_INSTALL_PREFIX="$LOCAL_M" \
     -DZLIB_BUILD_TESTING=OFF -DZLIB_BUILD_SHARED=OFF >/dev/null
-  cmake --build "$WD/build-zlib" >/dev/null
-  cmake --install "$WD/build-zlib" >/dev/null
+  cmake --build "$DEPS_BUILD-zlib" >/dev/null
+  cmake --install "$DEPS_BUILD-zlib" >/dev/null
   cp "$LOCAL/lib/libzs.a" "$LOCAL/lib/libz.a"
 
   clone_at https://github.com/fuzziqersoftware/phosg "$WD/phosg" "$PHOSG_REV"
-  cmake -S "$WD/phosg" -B "$WD/build-phosg" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  cmake -S "$WD/phosg" -B "$DEPS_BUILD-phosg" -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_SYSTEM_NAME=Windows \
     -DCMAKE_C_COMPILER="$LLVM_DIR/bin/x86_64-w64-mingw32-clang$EXE_SUFFIX" \
     -DCMAKE_CXX_COMPILER="$LLVM_DIR/bin/x86_64-w64-mingw32-clang++$EXE_SUFFIX" \
     -DCMAKE_RC_COMPILER="$LLVM_DIR/bin/x86_64-w64-mingw32-windres$EXE_SUFFIX" \
     -DCMAKE_INSTALL_PREFIX="$LOCAL_M" -DCMAKE_PREFIX_PATH="$LOCAL_M" >/dev/null
   # Build everything: phosg's install rules also copy its small CLI tools.
-  cmake --build "$WD/build-phosg" >/dev/null
-  cmake --install "$WD/build-phosg" >/dev/null
+  cmake --build "$DEPS_BUILD-phosg" >/dev/null
+  cmake --install "$DEPS_BUILD-phosg" >/dev/null
 
   echo "$DEPS_WANT" > "$DEPS_STAMP"
 fi
