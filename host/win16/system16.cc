@@ -1,7 +1,9 @@
 // The small system DLLs: MMSYSTEM (the multimedia clock here; its sound half
 // — sndPlaySound, waveOut, midiOut/aux, mixer, MCI — is sound16.cc), WIN87EM
 // (the FP emulator's control entry — the CPU has an x87), COMMDLG / KEYBOARD
-// / SHELL / TOOLHELP (API_SURFACE.md §2), and register_all16().
+// / SHELL / TOOLHELP (API_SURFACE.md §2), WING's one corrected signature, and
+// register_all16(). The common dialogs (GetOpenFileName, ChooseFont) answer
+// "cancelled" in the saver; configure mode makes them real (dialogs16.cc).
 //
 // Sound (sound16.hh, AUDIO.md §8): without the host audio engine the lane has
 // one wave-out device that plays nothing. AD_SND.DLL (ABI.md §3.6)
@@ -24,6 +26,7 @@
 #include "win16/input16.hh"
 #include "win16/modules16.hh"
 #include "win16/shim_families16.hh"
+#include "win16/sound16.hh"
 
 namespace adw::win16 {
 
@@ -34,6 +37,39 @@ void register_system16(Runtime16& rt) {
   const char* M = "MMSYSTEM";
   r.impl(M, "mmsystemGetVersion", [](Call16& c) { c.ret(0x030A); });
   r.impl(M, "timeGetTime", [](Call16& c) { c.ret32(c.rt.time_ms()); });
+  // Multimedia timer events, engine or no engine (sound16.hh timer16_set):
+  // Windows 95's timer services, 1 ms to 65535 ms (the 16-bit TIMECAPS; Wine's
+  // winmm, MMSYSTIME_MININTERVAL/MAXINTERVAL), a callback per period at the
+  // first delivery point at or after it. MEMMIDI sequences SWSE's songs from
+  // one: timeBeginPeriod(4), timeSetEvent(4, 4, MIDITIMERPROC, song,
+  // TIME_PERIODIC) (1:021a, 1:0236), timeKillEvent + timeEndPeriod at the end.
+  constexpr uint16_t kTimerrNoCanDo = 97, kTimerrStruct = 129;  // TIMERR_NOCANDO, TIMERR_STRUCT
+  constexpr uint16_t kTimePeriodic = 0x0001;                    // fuEvent: TIME_ONESHOT 0, TIME_PERIODIC 1
+  // timeGetDevCaps(lpTimeCaps, wSize): TIMECAPS {wPeriodMin, wPeriodMax}.
+  r.impl(M, "timeGetDevCaps", [](Call16& c) {
+    uint32_t p = c.ptr();
+    uint16_t size = c.w();
+    if (!p || size < 4) return c.ret(kTimerrStruct);
+    c.rt.wr16(p, 1);
+    c.rt.wr16(p + 2, 0xFFFF);
+    c.ret(0);
+  });
+  // The resolution only sets how closely a real timer kept to its periods; the
+  // delivery points here are what they are. Out of range: TIMERR_NOCANDO.
+  for (const char* n : {"timeBeginPeriod", "timeEndPeriod"}) {
+    r.impl(M, n, [](Call16& c) { c.ret(c.w() == 0 ? kTimerrNoCanDo : 0); });
+  }
+  // timeSetEvent(wDelay, wResolution, lpFunction, dwUser, wFlags): the event's id, 0 on failure.
+  r.impl(M, "timeSetEvent", [](Call16& c) {
+    uint16_t delay = c.w();
+    c.w();  // wResolution
+    uint32_t proc = c.ptr(), user = c.l();
+    uint16_t flags = c.w();
+    Module16* m = c.rt.modules().containing(uint16_t(proc >> 16));
+    uint16_t ds = m && m->dgroup ? m->dgroup : caller_ds(c);
+    c.ret(timer16_set(c.rt, delay, proc, user, (flags & kTimePeriodic) != 0, ds));
+  });
+  r.impl(M, "timeKillEvent", [](Call16& c) { c.ret(timer16_kill(c.rt, c.w()) ? 0 : kTimerrNoCanDo); });
   // The sound half: sound16.cc (sndPlaySound, waveOut, midiOut, aux, mixer, MCI).
   register_sound16(rt);
 
@@ -77,7 +113,13 @@ void register_system16(Runtime16& rt) {
   });
 
   // ---- COMMDLG, KEYBOARD, SHELL ----
+  // The common dialogs answer "cancelled" in the saver; configure mode makes
+  // them real (dialogs16.cc).
   r.impl("COMMDLG", "GetOpenFileName", [](Call16& c) { c.ret(0); });
+  r.impl("COMMDLG", "ChooseFont", [](Call16& c) {
+    c.ptr();
+    c.ret(0);
+  });
   r.impl("COMMDLG", "CommDlgExtendedError", [](Call16& c) { c.ret32(0); });
   r.impl("COMMDLG", "GetFileTitle", [](Call16& c) {
     std::string path = c.rt.read_str(c.ptr());
@@ -156,6 +198,15 @@ void register_system16(Runtime16& rt) {
   r.impl("SHELL", "RegSetValue", [](Call16& c) { c.ret32(0); });
   r.impl("SHELL", "DragQueryFile", [](Call16& c) { c.ret(0); });
   r.impl("SHELL", "DragFinish", [](Call16&) {});
+
+  // ---- WING ----
+  // WinGCreateHalftoneBrush(HDC, COLORREF, WING_DITHER_TYPE) takes 8 argument
+  // bytes, not the interface table's 6 (research/win/spec, Wine's wing.spec):
+  // WING.DLL's entry reads [bp+6] (the dither type), [bp+8] (the COLORREF)
+  // and [bp+0Ch] (the HDC) and returns with retf 8 (4:0A60..4:0C7F). Nothing of WinG is implemented —
+  // the Star Wars seeds keep SWSE on its GDI path (dos16.hh
+  // seed_intermission) — but a call must pop what the caller pushed.
+  r.add("WING", 1008, "WinGCreateHalftoneBrush", Conv16::pascal_, true, 8);
 }
 
 void register_all16(Runtime16& rt) {

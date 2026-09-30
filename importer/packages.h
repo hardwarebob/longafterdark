@@ -1,21 +1,30 @@
-// The package registry (PACKAGES.md §2): every After Dark release the
-// importer knows, compiled in. Registry order is the catalog's module order
-// and the precedence order for display-name disambiguation (§6); the
-// catalog's packages list goes by `released` instead.
+// The package registry (PACKAGES.md §2): every release the importer knows,
+// compiled in: six After Dark releases and Star Wars Screen Entertainment,
+// LucasArts' Intermission-based screen savers. Registry order is the
+// catalog's module order and the precedence order for display-name
+// disambiguation (§6); the catalog's packages list goes by `released`
+// instead.
 //
-//   deluxe    After Dark 4.0 Deluxe          tree    -> <win>\FILES\{AD40,CLASSIC,ENGINE,AFI}
-//   ad10      After Dark 10th Anniversary    tree    -> <win>\packages\ad10\{AD10TH,ENGINE,AFI}
-//   ad32      After Dark 3.2                 ad3zip  -> <win>\packages\ad32\{AD32,ENGINE}
-//   tt        Totally Twisted After Dark     ad3zip  -> <win>\packages\tt\{TWISTED,ENGINE}
-//   simpsons  The Simpsons Screen Saver      ad3zip  -> <win>\packages\simpsons\{SIMPSONS,ENGINE}
+//   deluxe    After Dark 4.0 Deluxe            tree          -> <win>\FILES\{AD40,CLASSIC,ENGINE,AFI}
+//   ad10      After Dark 10th Anniversary      tree          -> <win>\packages\ad10\{AD10TH,ENGINE,AFI}
+//   ad32      After Dark 3.2                   ad3zip        -> <win>\packages\ad32\{AD32,ENGINE}
+//   tt        Totally Twisted After Dark       ad3zip        -> <win>\packages\tt\{TWISTED,ENGINE}
+//   simpsons  The Simpsons Screen Saver        ad3zip        -> <win>\packages\simpsons\{SIMPSONS,ENGINE}
+//   swse      Star Wars Screen Entertainment   intermission  -> <win>\packages\swse\{SAVER,ENGINE,WINDOWS}
+//   startrek  Star Trek: The Screen Saver      ad2kwaj       -> <win>\packages\startrek\{AFTERDRK,ENGINE}
 //
-// Each entry carries what identifies the release (known image md5s,
-// fingerprints), how to extract it (the recipe and its parameters), what an
-// import must contain (`required`), the install-time fix-ups, catalog name
-// overrides, the manifest (path, size, md5 of every installed file —
-// never After Dark bytes) that a folder source is verified against, the
-// Internet Archive copies `--download` fetches, and where its box cover
-// comes from.
+// Each entry carries what identifies the release (known image md5s — of one
+// image, or of every install disk of a set — and fingerprints), how to
+// extract it (the recipe and its parameters), what an import must contain
+// (`required`), the install-time fix-ups, catalog name overrides, the
+// manifest (path, size, md5 of every installed file — never bytes of the
+// release) that a folder source is verified against, the Internet Archive
+// copies `--download` fetches, and where its box cover comes from.
+//
+// A package root holds its module folders and ENGINE (never a module
+// folder). An optional WINDOWS folder holds the files the original installer
+// put in C:\WINDOWS (swse: SWSE.INI); it is never a module folder either,
+// and the 16-bit lane lays it under the guest's C:\WINDOWS.
 #pragma once
 
 #include <cstdint>
@@ -41,6 +50,11 @@ struct KnownImage {
   uint64_t size;
   const char* medium;     // human-readable
   const char* volume_id;  // "" when the medium has none
+  // 0: the whole release on this one image. n: install disk n of a set that
+  // is the release only together (PACKAGES.md §3): an import is identified by
+  // the set's md5s, and verified "image", when every disk 1..N of the package
+  // is given exactly once (from either of two copies of a disk alike).
+  int disk = 0;
 };
 
 // An install-time copy (§4.3): `create` is made as a copy of `copy_of`, both
@@ -51,13 +65,49 @@ struct Fixup {
 };
 
 // A catalog moduleName replacement (§6), keyed by the module's path relative
-// to the package root ("AD10TH/TOAST2K.AD").
+// to the package root ("AD10TH/TOAST2K.AD"); for Intermission modules the
+// name itself ("SAVER/VADER.IMX": the one SAVERINIT returns, which no
+// resource holds).
 struct NameOverride {
   const char* module;
   const char* name;
 };
 
-enum class Recipe { tree, ad3zip };
+// tree: plain files copied from the disc's FILES dir. ad3zip: the AD 3.x
+// InstallShield installs (encrypted PKZIP), their placement baked in.
+// intermission: Presage's installer for Intermission products (multi-volume
+// ARJ archives and SZDD-compressed loose files, INSTALL.DAT read only to
+// identify the release), its placement baked in too. ad2kwaj: the After Dark
+// 2.0 Microsoft Setup installs (KWAJ-compressed files on the install floppies,
+// SETUP.LST read only to identify the release), their placement baked in from
+// the installer's script (no INF or MS Test interpreter).
+enum class Recipe { tree, ad3zip, intermission, ad2kwaj };
+// "tree", "ad3zip", "intermission" or "ad2kwaj" (import.json's package.recipe).
+const char* recipe_name(Recipe r);
+
+// How a loose file is stored on the install medium: as it is, compressed by
+// Microsoft COMPRESS 'A' (SZDD, szdd.h) or by the Microsoft Setup Toolkit's
+// COMPRESS (KWAJ method 3, kwaj.h); a compressed one is expanded on the way.
+enum class Codec { plain, szdd, kwaj };
+
+// A file the intermission and ad2kwaj recipes install from outside any
+// archive, from the install dir: `from` as the source lists it, `to`
+// relative to the package root. The installer gave a compressed file its
+// installed name (INSTALL.DAT, or ST_NSTLL.INF), so it is never installed
+// under its own.
+struct LooseFile {
+  const char* from;
+  const char* to;
+  Codec codec;
+};
+
+// A further file of a copy made of several (another install disk's image).
+struct DownloadPart {
+  const char* url;
+  const wchar_t* file_name;
+  uint64_t size;
+  const char* md5;
+};
 
 // A copy of the package on the Internet Archive that `adimport --download`
 // fetches (verified 2026-09-26: research/win/pkg/sources/sources.json).
@@ -75,7 +125,14 @@ struct Download {
   // original medium exists online); read as a folder and verified file by
   // file against the manifest (verified: files).
   const char* kind;
+  // An "image" copy of a release on several install disks: the images of
+  // the other disks (the first one's is the fields above). The copy is used
+  // only when every part is fetched and verifies; the images are then read
+  // as one, as several --image are.
+  std::span<const DownloadPart> more_images = {};
 };
+// Every part of a copy together, in bytes (what the lists show).
+uint64_t download_size(const Download& d);
 
 // A rectangle of a decoded picture, in its pixels (after EXIF orientation);
 // w == 0: no crop.
@@ -125,6 +182,10 @@ struct Package {
   // ad3zip: the module folder, the MODMISC.ZIP member that identifies the
   // package, the AFI.ZIP member installed as <module dir>\FOLDER.AFI, and
   // the archives that must be present (so a split-floppy source is complete).
+  // intermission: the module folder and the archives (every volume: every
+  // install disk) too. ad2kwaj: the module folder, and every install disk's
+  // tag file (the Setup script's [Source Media Descriptions]; disk 1's is
+  // the fingerprint's), which must all be present.
   const char* module_dir;
   const char* engine_dll;
   const char* folder_afi;
@@ -140,6 +201,25 @@ struct Package {
   // releases oldest first, so the settings dialog's cover strip and its list groups
   // read as a timeline. Empty sorts last, keeping the registry's order.
   const char* released = "";
+  // intermission: the INSTALL.DAT [data] shortname that names the package
+  // (the fingerprint, with required_archives[0] beside INSTALL.DAT), and the
+  // files taken from outside the archives, under their installed names.
+  // ad2kwaj: every file it installs is a loose file.
+  const char* install_name = nullptr;
+  std::span<const LooseFile> loose_files = {};
+  // ad2kwaj: the SETUP.LST [Params] WndTitle that names the package (the
+  // fingerprint, with required_archives[0] beside SETUP.LST), in Windows-1252
+  // as the file holds it.
+  const char* setup_title = nullptr;
+  // The fixed screen every module of the package is shown at, "WxH"
+  // ("640x480": Star Trek: The Screen Saver, several of whose modules compose
+  // a fixed scene for it), which the catalog gives each of its entries as
+  // "screen" (the front-end then gives the module that screen whatever the
+  // Resolution setting); nullptr: the modules fit any screen.
+  const char* screen = nullptr;
+  // How the catalog reads its Classic modules' About texts (catalog.h).
+  enum class About { as_is, ad20 };
+  About about = About::as_is;
 
   bool is_deluxe() const;
 };

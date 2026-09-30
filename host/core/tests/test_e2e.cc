@@ -1035,7 +1035,7 @@ TEST(lane_detection_exit_codes) {
   } cases[] = {
       {{pe}, ADW_HAVE_LANE_PE32 ? 1 : 3, ADW_HAVE_LANE_PE32 ? "lane init failed" : "was built without the pe32 lane"},
       {{ne}, ADW_HAVE_LANE_NE16 ? 1 : 3, ADW_HAVE_LANE_NE16 ? "lane init failed" : "was built without the ne16 lane"},
-      {{junk}, 2, "not an After Dark module"},
+      {{junk}, 2, "not a module this host can run"},
       {{temp_dir() + "adw_e2e_missing.ad"}, 2, "cannot open"},
       {{}, 2, "usage"},
       {{pe, "--test-pattern"}, 2, "--test-pattern takes no module"},
@@ -1100,6 +1100,31 @@ TEST(status_log_lines) {
   };
   if (lines != want) fprintf(stderr, "  stderr: %s\n", c.err().c_str());
   CHECK(lines == want);
+}
+
+TEST(numlock_line_and_env) {
+  // NUMLOCK is an input line of its own (numbered, applied; not interactive
+  // for the test pattern, which knows nothing of it); ADNUMLOCK is logged at
+  // start, and nothing is refused.
+  Child c;
+  ChildOptions o;
+  o.args = {"--test-pattern"};
+  o.env = {{"ADSTREAM", "1"}, {"ADSCREENW", "64"}, {"ADSCREENH", "48"}, {"ADTESTINTERACTIVE", "1"},
+           {"ADSTATUSLOG", "1"}, {"ADNUMLOCK", "1"}};
+  CHECK(c.start(o));
+  CHECK(c.send("GO\nKEY 144 1\nNUMLOCK 0\nGO\nKEY 144 0\nGO\nQUIT\n"));
+  for (int i = 0; i < 3; i++) CHECK(c.read_frame().has_value());
+  CHECK_EQ(c.wait_exit(), 0);
+  std::vector<std::string> lines = status_lines(c.err());
+  std::vector<std::string> want = {
+      "STATUS 0 flags=0x20 applied=0 eaten=0 src=0",
+      "STATUS 2 flags=0x20 applied=2 eaten=0 src=0",
+      "STATUS 3 flags=0x20 applied=3 eaten=0 src=0",
+  };
+  if (lines != want) fprintf(stderr, "  stderr: %s\n", c.err().c_str());
+  CHECK(lines == want);
+  CHECK(c.err().find(", num lock on") != std::string::npos);
+  CHECK(c.err().find("unrecognized") == std::string::npos);
 }
 
 TEST(status_record_through_inherited_handle) {
@@ -1174,10 +1199,18 @@ TEST(capabilities_line) {
   // configure lists only linked lanes.
   for (const char* l : {"pe32", "ne16"})
     if (kv["configure"].find(l) != std::string::npos) CHECK(lanes.find(l) != std::string::npos);
+  // abis: the union of the linked lanes' module ABIs, in lane order (pe32
+  // runs After Dark's; ne16 After Dark's and Intermission's).
+  CHECK(kv.count("abis"));
+  std::string abis = (ADW_HAVE_LANE_PE32 || ADW_HAVE_LANE_NE16) ? "afterdark" : "";
+  if (ADW_HAVE_LANE_NE16) abis += ",intermission";
+  CHECK_EQ(kv["abis"], abis);
+  CHECK(out.find(" abis=") > out.find("configure="));  // after configure=, before the core features
   CHECK_EQ(kv["status"], std::string("1"));
   CHECK_EQ(kv["state"], std::string("1"));
   CHECK_EQ(kv["seed"], std::string("1"));
   CHECK_EQ(kv["audio"], std::string("1"));
+  CHECK_EQ(kv["numlock"], std::string("1"));  // the NUMLOCK line and ADNUMLOCK are understood
   CHECK(out.find('\n') == std::string::npos);  // one line
 
   Child extra;
@@ -1395,6 +1428,16 @@ static int run_assets_mode() {
   if (!pe.empty()) runs.push_back({pe.front(), bool(ADW_HAVE_LANE_PE32)});
   if (!ne.empty()) runs.push_back({ne.front(), bool(ADW_HAVE_LANE_NE16)});
   runs.push_back({"FILES/AD40/TOASTERS.AD", bool(ADW_HAVE_LANE_PE32)});
+  // Star Wars Screen Entertainment's Intermission modules, when imported, are
+  // NE too: the ne16 lane's (which tells the two protocols apart by exports).
+  auto imx = list(win + "\\packages\\swse\\SAVER", L"*.IMX");
+  if (!imx.empty()) fprintf(stderr, "assets: %zu Intermission modules\n", imx.size());
+  for (auto& p : imx) {
+    ModuleProbe m = probe_module(p);
+    if (m.kind != LaneKind::ne16) fprintf(stderr, "  %s: %s (%s)\n", p.c_str(), lane_kind_name(m.kind), m.detail.c_str());
+    CHECK(m.kind == LaneKind::ne16);
+  }
+  if (!imx.empty()) runs.push_back({"packages/swse/SAVER/VADER.IMX", bool(ADW_HAVE_LANE_NE16)});
   for (auto& run : runs) {
     Child c;
     ChildOptions o;

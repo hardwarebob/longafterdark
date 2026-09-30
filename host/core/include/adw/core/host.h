@@ -53,7 +53,7 @@ uint32_t status_lane_id(const Lane& lane);
 
 // adhostwin --configure's driver (INTERACTION.md §6.1), after argument
 // parsing and lane selection: checks can_configure(), builds a LaneContext
-// (ADCVSET and ADCAPS in the input state), runs Lane::configure() with its
+// (ADCVSET, ADCAPS and ADNUMLOCK in the input state), runs Lane::configure() with its
 // exceptions contained, and returns the process exit code (0 shown, 4
 // nothing, 5 unsupported, 1 failed) with the one JSON line to print in
 // *json_line (no newline).

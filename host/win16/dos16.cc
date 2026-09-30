@@ -268,6 +268,19 @@ win32::IniStore& profiles16(Runtime16& rt) {
   return rt.state<Profiles16>().store;
 }
 
+int dos_chdir(Runtime16& rt, const std::string& path, bool select_drive) {
+  win32::Vfs& vfs = rt.vfs();
+  std::string full = path.empty() ? std::string() : vfs.full_path(path);
+  const char* why = path.empty()                                     ? "an empty path"
+                    : path.find_first_of("*?") != std::string::npos ? "a wildcard"
+                    : full.size() > kMaxCurDir                      ? "longer than DOS's current directory"
+                    : !vfs.is_dir(full)                             ? "not a directory"
+                                                                    : nullptr;
+  if (!why && (select_drive ? vfs.set_cwd(full) : vfs.set_drive_cwd(full))) return 0;
+  trace("dos", "chdir %s refused: %s", full.empty() ? path.c_str() : full.c_str(), why ? why : "not a directory");
+  return -int(doserr::kPathNotFound);
+}
+
 void dos_write_console(Runtime16& rt, const std::string& text) {
   DosFiles& d = rt.state<DosFiles>();
   for (char c : text) {
@@ -344,11 +357,12 @@ void dos_int21(Runtime16& rt) {
     case 0x0B:  // check stdin: nothing
       r.w_al(0);
       break;
-    case 0x0E:  // select disk: number of logical drives
-      r.w_al(5);
+    case 0x0E:  // select disk DL (0 = A:) when the guest's disk has it; AL = the drive letters, A: to H:
+      if (r.r_dl() < 26) rt.vfs().set_drive(char('A' + r.r_dl()));
+      r.w_al(kLastDrive);
       break;
-    case 0x19:  // current disk: C:
-      r.w_al(2);
+    case 0x19:  // current disk (0 = A:): the current directory's
+      r.w_al(uint8_t(rt.vfs().cwd()[0] - 'A'));
       break;
     case 0x1A:
       st.dta = ds_dx();
@@ -419,9 +433,10 @@ void dos_int21(Runtime16& rt) {
       r.w_cx(512);
       r.w_dx(0xFFFF);
       break;
-    case 0x3B: {  // chdir
-      if (rt.vfs().set_cwd(rt.read_str(ds_dx()))) ok();
-      else fail(doserr::kPathNotFound);
+    case 0x3B: {  // chdir: its drive's current directory (the current drive stays)
+      int e = dos_chdir(rt, rt.read_str(ds_dx()), /*select_drive=*/false);
+      if (e < 0) fail(uint16_t(-e));
+      else ok();
       break;
     }
     case 0x39:  // mkdir
@@ -545,10 +560,17 @@ void dos_int21(Runtime16& rt) {
       }
       break;
     }
-    case 0x47: {  // current directory of drive DL, without "C:\"
-      std::string cwd = rt.vfs().cwd();
-      std::string rel = cwd.size() > 3 ? cwd.substr(3) : "";
-      rt.write_str(farp(seg(rt, SegReg::DS), r.r_si()), rel, 64);
+    case 0x47: {  // current directory of drive DL (0: the current drive, 1: A:), without "X:\"
+      win32::Vfs& vfs = rt.vfs();
+      char letter = r.r_dl() ? char('A' + r.r_dl() - 1) : vfs.cwd()[0];
+      std::string dir = r.r_dl() <= 26 ? vfs.drive_cwd(letter) : std::string();
+      // Whole, never cut: dos_chdir kept it within DOS's 64 bytes.
+      if (dir.size() < 3 || dir.size() > kMaxCurDir || !vfs.is_dir(dir.substr(0, 3))) {
+        fail(doserr::kInvalidDrive);
+        break;
+      }
+      std::string rel = dir.substr(3);
+      rt.write_str(farp(seg(rt, SegReg::DS), r.r_si()), rel, rel.size() + 1);
       r.w_ax(0x0100);
       ok();
       break;
@@ -728,6 +750,12 @@ void multiplex_int2f(Runtime16& rt) {
       break;
     case 0x1686:  // DPMI: in protected mode
       r.w_ax(0);
+      break;
+    case 0x1684:  // a VxD's API entry point (BX = its id): none here, ES:DI = 0:0 —
+      // what Windows answered for a VxD that is not loaded. INTRMLIB's LibEntry
+      // keeps three of them (INTRMLIB 6:0092..6:00F5) for its sound engines.
+      rt.cpu().set_segment_null(SegReg::ES);
+      r.w_di(0);
       break;
     default:
       break;  // not installed: AL unchanged
@@ -976,6 +1004,32 @@ void seed_modules_ini(Runtime16& rt) {
   ini.add_seed(path, "Ray", "RaySceneFile", ray);
   ini.add_seed(path, "Slide Show", "CatalogName", "BITMAPS");
   ini.add_seed(path, "Logo Section", "LogoFile", ad + "\\BITMAPS\\ADLOGO.BMP");
+}
+
+void seed_intermission(Runtime16& rt, const IntermissionSeeds& seeds) {
+  const Runtime16Options& o = rt.options();
+  win32::IniStore& ini = profiles16(rt);
+  const char* kDisplayDriver = "pnpdrvr.drv";  // Windows 95's Plug and Play display driver
+  ini.add_seed(o.windows_dir + "\\SYSTEM.INI", "boot", "display.drv", kDisplayDriver);
+  if (seeds.swse_gdi) {
+    std::string swse = o.windows_dir + "\\SWSE.INI";
+    ini.add_seed(swse, "technology", "display.drv", kDisplayDriver);
+    ini.add_seed(swse, "technology", "WinGFound", "1");
+    ini.add_seed(swse, "technology", "DibBlit", "GDI");
+  }
+  std::string antsw = o.windows_dir + "\\ANTSW.INI";
+  ini.add_seed(antsw, "Intermission", "Volume", std::to_string(std::clamp(seeds.volume, 0, 100)));
+  ini.add_seed(antsw, "Intermission", "Saver Path", seeds.saver_path.empty() ? o.guest_dir : seeds.saver_path);
+}
+
+void seed_after_dark2(Runtime16& rt) {
+  const Runtime16Options& o = rt.options();
+  win32::IniStore& ini = profiles16(rt);
+  std::string prefs = o.windows_dir + "\\AD_PREFS.INI";
+  // The installer's own spelling of the directory: with its backslash (the
+  // modules append ST_RES\ and SOUNDS\ to it, AD_SND the driver's name).
+  ini.add_seed(prefs, "After Dark", "Path", o.guest_dir + "\\");
+  ini.add_seed(prefs, "Sound", "SoundDriver", "AD_MME.DRV");
 }
 
 std::string progman_group_file(const std::string& name) {

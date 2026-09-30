@@ -147,14 +147,15 @@ std::vector<fs::path> pick_source(HWND owner, bool folder) {
   if (!env(L"AD_IMPORT_TEST_PICK").empty()) return test_pick();
   std::vector<fs::path> out;
   if (folder) {
-    out = run_open_dialog(owner, true, false, L"Choose the After Dark CD drive, or a folder holding a copy of the disc or floppies",
+    out = run_open_dialog(owner, true, false, L"Choose the CD drive, or a folder holding a copy of the disc or floppies",
                           nullptr, 0);
   } else {
     COMDLG_FILTERSPEC types[] = {
-        {L"Disc and floppy images, install ZIPs (*.iso; *.bin; *.img; *.ima; *.vfd; *.flp; *.zip)",
+        {L"Disc and floppy images, and ZIPs of them or of install files (*.iso; *.bin; *.img; *.ima; *.vfd; *.flp; "
+         L"*.zip)",
          L"*.iso;*.bin;*.img;*.ima;*.vfd;*.flp;*.zip"},
         {L"All files", L"*.*"}};
-    out = run_open_dialog(owner, false, true, L"Choose an image of an After Dark CD or floppy disk (both disks of a set)",
+    out = run_open_dialog(owner, false, true, L"Choose an image of a CD or floppy disk (every disk of a set)",
                           types, 2);
   }
   std::sort(out.begin(), out.end());   // disk 1 before disk 2 when the names say so
@@ -234,8 +235,8 @@ void SourcesPage::build() {
   }
   from_label_ = add_text(L"Import from", Face::body_strong, Ink::text, body, true);
   card_image_ = add_button(kIdImage,
-                           L"A disc image…\nAn ISO image of an After Dark CD, or a floppy image (.img); select both "
-                           L"disks of a two-disk set.",
+                           L"A disc image…\nAn ISO image of a CD, or floppy images (.img), zipped or not; select every "
+                           L"disk of a set.",
                            ui::ButtonRole::card, L'', body);
   card_folder_ = add_button(kIdFolder, L"A drive or folder…\nThe CD drive, or a folder holding a copy of the disc or floppies.",
                             ui::ButtonRole::card, L'', body);
@@ -373,7 +374,7 @@ void SourcesPage::command(int id, int, HWND) {
       if (p.empty()) return;
       std::string why;
       if (!identify_folder(p.front(), &why)) {
-        show_caution(L"That is not a known After Dark disc. " + p.front().wstring() + L": " + to_wide(why) +
+        show_caution(L"That is not a disc Long After Dark knows. " + p.front().wstring() + L": " + to_wide(why) +
                      L". Choose the CD drive itself (for example E:\\) or a copy of the disc or floppies.");
         return;
       }
@@ -515,7 +516,7 @@ void ProgressPage::build() {
       job_.covers_job ? phase_instruction(Progress::Phase::cover, "")
       : job_.source.kind == Source::Kind::download
           ? phase_instruction(Progress::Phase::download, first ? first->title : "", 0, std::max<size_t>(job_.all.size(), 1))
-          : L"Importing After Dark";
+          : L"Importing";
   phase_ = add_text(instruction, Face::body_strong, Ink::text);
   bar_ = make_progress(hwnd_, &t_);
   amount_ = add_text(L"Starting\u2026", Face::body, Ink::text2, nullptr, true);

@@ -27,16 +27,26 @@ std::wstring count(size_t n, const wchar_t* one, const wchar_t* many) {
 }
 
 std::wstring download_kind(const Download& d) {
-  return std::string_view(d.kind) == "zip" ? L"Install files (ZIP)" : L"CD image";
+  if (std::string_view(d.kind) == "zip") return L"Install files (ZIP)";
+  // A release on several install floppies: an image of each.
+  if (!d.more_images.empty()) return std::to_wstring(1 + d.more_images.size()) + L" floppy disk images";
+  return L"CD image";
 }
 
-// A download of `p` already complete in `dir` (by size: hashing 400 MB to
-// draw a list would take seconds; the import checks the md5 anyway).
+// A download of `p` already complete in `dir`: every file of one of its
+// copies (by size: hashing 400 MB to draw a list would take seconds; the
+// import checks the md5 anyway).
 bool already_downloaded(const Package& p, const fs::path& dir) {
   if (dir.empty()) return false;
   std::error_code ec;
+  auto have = [&](const wchar_t* name, uint64_t size) {
+    return fs::is_regular_file(dir / name, ec) && fs::file_size(dir / name, ec) == size;
+  };
   for (const Download& d : p.downloads)
-    if (fs::is_regular_file(dir / d.file_name, ec) && fs::file_size(dir / d.file_name, ec) == d.size) return true;
+    if (have(d.file_name, d.size) &&
+        std::all_of(d.more_images.begin(), d.more_images.end(),
+                    [&](const DownloadPart& q) { return have(q.file_name, q.size); }))
+      return true;
   return false;
 }
 
@@ -50,7 +60,7 @@ std::wstring installed_list(const std::vector<std::string>& titles) {
 
 std::wstring verified_words(const std::string& verified, const std::string& package) {
   if (verified == "image") {
-    // The Simpsons came on two floppies, not a disc.
+    // The Simpsons and Star Trek came on floppies, not a disc.
     const Package* p = package.empty() ? nullptr : find_package(package);
     const bool floppy = p && !p->images.empty() && std::string_view(p->images[0].medium).find("floppy") != std::string_view::npos;
     return floppy ? L"verified against the original disks" : L"verified against the original disc";
@@ -64,7 +74,7 @@ std::wstring verified_words(const std::string& verified, const std::string& pack
 // ---- progress -----------------------------------------------------------------------
 
 std::wstring phase_instruction(Progress::Phase p, const std::string& package, size_t step, size_t steps) {
-  std::wstring what = package.empty() ? L"the After Dark files" : to_wide(package);
+  std::wstring what = package.empty() ? L"the files" : to_wide(package);
   std::wstring s;
   switch (p) {
     case Progress::Phase::download:
@@ -156,11 +166,11 @@ std::vector<DownloadRow> download_rows(const fs::path& assets, const std::string
     r.id = p.id;
     r.title = to_wide(p.title);
     r.installed = st.installed;
-    r.size = d.size;
+    r.size = download_size(d);
     std::wstring state = st.installed ? L"Imported" + (st.verified.empty() ? L"" : L" · " + verified_words(st.verified, p.id))
                                       : L"Not imported yet";
     if (already_downloaded(p, download_dir)) state += L" · already downloaded";
-    r.text = r.title + L"\n" + download_kind(d) + L" · " + to_wide(mb(d.size)) + L"\n" + state;
+    r.text = r.title + L"\n" + download_kind(d) + L" · " + to_wide(mb(r.size)) + L"\n" + state;
     r.cover = cover_info(r.id, root, registry);
     rows.push_back(std::move(r));
   }
@@ -189,8 +199,8 @@ std::wstring download_card_text(const std::string& package, std::span<const Pack
   for (const Package& p : registry_or_builtin(registry)) {
     if (p.downloads.empty() || (!package.empty() && package != p.id)) continue;
     downloadable++;
-    lo = std::min(lo, p.downloads.front().size);
-    hi = std::max(hi, p.downloads.front().size);
+    lo = std::min(lo, download_size(p.downloads.front()));
+    hi = std::max(hi, download_size(p.downloads.front()));
   }
   if (!downloadable) return L"";
   std::wstring sizes = lo == hi ? L"About " + to_wide(mb(lo)) : L"From " + to_wide(mb(lo)) + L" to " + to_wide(mb(hi)) + L" per release";
@@ -202,7 +212,7 @@ std::wstring download_card_text(const std::string& package, std::span<const Pack
 std::wstring failure_heading(const ImportResult& r) {
   return r.status == Status::network         ? L"The download failed"
          : r.status == Status::verify_failed ? L"The files did not verify"
-         : r.status == Status::source_invalid ? L"That source is not a known After Dark disc, or it is damaged"
+         : r.status == Status::source_invalid ? L"That source is not a disc Long After Dark knows, or it is damaged"
          : r.status == Status::cancelled      ? L"The import was cancelled"
                                               : L"The import failed";
 }

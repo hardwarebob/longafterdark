@@ -1,34 +1,61 @@
-// The four real package images end to end (opt-in: AD_E2E_PKG=1; exit 77 =
+// The six real package sources end to end (opt-in: AD_E2E_PKG=1; exit 77 =
 // skipped). PACKAGES.md §9.
 //
 //   test_import_pkg_real <adimport.exe> <scratch> [<image dir>]
 //
-// The images are looked for in AD_SOURCE_ISO_DIR, else the third argument
-// (<repo>/source_iso), and identified by size and md5, never by file name.
-//   1. Each image into a fresh root through adimport.exe: exit 0, verified
-//      "image", nothing missing, every file matches the package manifest, the
-//      installed files are exactly the manifest (the §4 layout and counts),
-//      the invariants hold, and the catalog has 46 / 44 / 13 / 15 modules in
-//      the right lanes.
-//   1b. The 10th Anniversary and Totally Twisted images mounted by Windows,
-//      imported --from the drive: the same files as from the image (skipped
-//      when mounting is refused).
-//   2. All four plus Deluxe (imported --from the installed assets, which are
-//      only read) in one root: 202 modules, display names unique per lane,
-//      sameAs consistent, and every Deluxe entry's existing fields equal to
-//      the installed catalog's.
+// The images are looked for in AD_SOURCE_ISO_DIR (a ';'-separated list of
+// folders), else the third argument (<repo>/source_iso), and in the folders
+// directly in each (test_util.h image_dirs: <repo>/source_iso/Implemented
+// too); they are identified by size and md5, never by file name. Star Trek:
+// The Screen Saver's two install disks are two loose images, or the ZIP they
+// came in (test_util.h find_disk_set).
+//   1. Each package's image(s) into a fresh root through adimport.exe: exit
+//      0, verified "image", nothing missing, every file matches the package
+//      manifest, the installed files are exactly the manifest (the §4 layout
+//      and counts), the invariants hold (the intermission and ad2kwaj
+//      recipes' own), and the catalog has 46 / 44 / 13 / 15 / 14 / 16 modules
+//      in the right lanes (swse: Intermission IMX entries with their registry
+//      names and one button; startrek: Classic entries with their fixed
+//      screen, trimmed names, the Planetary Atlas override and After Dark
+//      2.0's About rules).
+//   1b. The 10th Anniversary, Totally Twisted and Star Wars Screen
+//      Entertainment CDs mounted by Windows, imported --from the drive: the
+//      same files as from the image (skipped when mounting is refused, or for
+//      an image Windows cannot mount).
+//   1c. Star Wars Screen Entertainment's INSTALL.DAT, read from its image: the
+//      registry's loose files agree with the installer's lines, and every
+//      other line the installer could run is an archive or a file the recipe
+//      never reads (I5).
+//   1d. Star Trek: The Screen Saver's ST_NSTLL.IN_, KWAJ-expanded from disk
+//      1: every row of the registry's table is an INF line with the same
+//      disk, installed name and size, placed by its section; the disk tag
+//      files are the INF's; every other line is a file the recipe never reads.
+//   1e. Its two disks in a ZIP under code page 437 names (bit 11 clear, as
+//      Explorer or 7-Zip on an English Windows writes a name that fits it),
+//      twice: the known disk set, verified "image", the files of step 1, and
+//      an import.json that is UTF-8 with the names decoded, also when the
+//      names differ only in a letter outside ASCII.
+//   2. All six plus Deluxe (imported --from the installed assets, which are
+//      only read: AD_ASSETS_DIR picks them, e.g.
+//      <repo>/build/win-pkg-setup/assets, else the data folder's) in one root:
+//      232 modules, display names unique per lane, sameAs consistent, and
+//      every Deluxe entry's existing fields equal to the installed catalog's.
 //   3. Re-importing each package into that root changes nothing else.
 // Nothing is written outside <scratch>.
 #include <phosg/JSON.hh>
 
 #include <map>
 #include <set>
+#include <tuple>
 
 #include "importer.h"
+#include "kwaj.h"
 #include "md5.h"
 #include "names.h"
 #include "run_process.h"
+#include "source.h"
 #include "test_util.h"
+#include "zip_builder.h"
 
 using namespace adw::import;
 namespace fs = std::filesystem;
@@ -59,6 +86,8 @@ const std::map<std::string, Expect> kExpect = {
     {"ad32", {89, {{"AD32", 84}, {"ENGINE", 5}}, 44, 0}},
     {"tt", {26, {{"TWISTED", 21}, {"ENGINE", 5}}, 13, 0}},
     {"simpsons", {30, {{"SIMPSONS", 25}, {"ENGINE", 5}}, 15, 0}},
+    {"swse", {29, {{"SAVER", 26}, {"ENGINE", 2}, {"WINDOWS", 1}}, 14, 0}},
+    {"startrek", {27, {{"AFTERDRK", 25}, {"ENGINE", 2}}, 16, 0}},
 };
 
 Tree snapshot(const fs::path& dir, bool without_record = false) {
@@ -68,13 +97,18 @@ Tree snapshot(const fs::path& dir, bool without_record = false) {
   return t;
 }
 
-void check_package_root(const fs::path& win, const Package& p) {
+fs::path root_of(const fs::path& win, const Package& p) {
   fs::path root = win;
   for (std::string_view r = p.root; !r.empty();) {
     size_t j = r.find('/');
     root /= to_wide(r.substr(0, j));
     r = j == std::string_view::npos ? std::string_view() : r.substr(j + 1);
   }
+  return root;
+}
+
+void check_package_root(const fs::path& win, const Package& p) {
+  const fs::path root = root_of(win, p);
   const Expect& e = kExpect.at(p.id);
   // The import record.
   phosg::JSON j = load(root / L"import.json");
@@ -83,6 +117,7 @@ void check_package_root(const fs::path& win, const Package& p) {
   CHECK(j.at("missingKnown").as_list().empty());
   CHECK_EQ(size_t(j.get_int("fileCount")), e.files);
   CHECK_EQ(j.at("source").get_bool("imageMd5Known"), true);
+  CHECK_EQ(j.at("package").get_string("recipe"), std::string(recipe_name(p.recipe)));
   for (auto& f : j.at("files").as_list()) CHECK_EQ(f->get_string("known"), std::string("match"));
   // Installed files == the manifest, byte for byte (by md5).
   std::map<std::string, const KnownFile*> manifest;
@@ -105,32 +140,395 @@ void check_package_root(const fs::path& win, const Package& p) {
   }
   CHECK_EQ(seen, e.files);
   CHECK(per_dir == e.per_dir);
-  // §4.2: I1 and I3 (the importer checked all of them; these are cheap to re-check).
-  for (auto& [dir, n] : e.per_dir) {
-    if (dir == "ENGINE" || dir == "AFI") continue;
+  // §4.2: I1 and I3 (the importer checked all of them; these are cheap to
+  // re-check), the intermission and ad2kwaj recipes' own for their packages.
+  const bool imx = p.recipe == Recipe::intermission, ad2 = p.recipe == Recipe::ad2kwaj;
+  for (const char* dir : p.module_dirs) {
+    if (std::string_view(dir) == "ENGINE") continue;
     for (const char* never : {"AD_SND.DLL", "OLDMOD16.DLL", "OLDMOD32.DLL", "ADTASK.DLL", "ADW30.EXE"})
       CHECK(!fs::exists(root / to_wide(dir) / to_wide(never)));
+    if (imx) {
+      CHECK(!fs::exists(root / to_wide(dir) / L"INTERMIS.EXE"));
+      std::error_code ec;
+      for (auto& f : fs::directory_iterator(root / to_wide(dir), ec))
+        CHECK(!ends_with_i(to_utf8(f.path().filename().wstring()), ".IMQ"));
+    }
+    if (ad2) {
+      CHECK(!fs::exists(root / to_wide(dir) / L"AD.EXE"));
+      // The sound database where After Dark 2.0's AD_MOD opens it.
+      CHECK(fs::exists(root / to_wide(dir) / L"ST_RES" / L"ST_SND.DLL"));
+    }
   }
-  CHECK(fs::exists(root / L"ENGINE" / L"AD_SND.DLL"));
-  CHECK((fs::exists(root / L"ENGINE" / L"OLDMOD16.DLL") && fs::exists(root / L"ENGINE" / L"AFTERDAR.SCR")) ||
-        fs::exists(root / L"ENGINE" / L"ADTASK.DLL"));
+  if (imx) {
+    CHECK(fs::exists(root / L"ENGINE" / L"IMIMXPLY.IMQ"));
+    CHECK(fs::exists(root / L"WINDOWS" / L"SWSE.INI"));
+    for (const char* n : {"OLDMOD16.DLL", "ADTASK.DLL", "AD_SND.DLL"}) CHECK(!fs::exists(root / L"ENGINE" / to_wide(n)));
+  } else if (ad2) {
+    CHECK(fs::exists(root / L"ENGINE" / L"AD_SND.DLL"));
+    for (const char* n : {"OLDMOD16.DLL", "ADTASK.DLL", "AFTERDAR.SCR"}) CHECK(!fs::exists(root / L"ENGINE" / to_wide(n)));
+    CHECK(!fs::exists(root / L"WINDOWS"));  // the lane's seeds are its settings
+  } else {
+    CHECK(fs::exists(root / L"ENGINE" / L"AD_SND.DLL"));
+    CHECK((fs::exists(root / L"ENGINE" / L"OLDMOD16.DLL") && fs::exists(root / L"ENGINE" / L"AFTERDAR.SCR")) ||
+          fs::exists(root / L"ENGINE" / L"ADTASK.DLL"));
+  }
   std::string text = test::read_text(root / L"import.json");
   CHECK(text.find("SERIAL") == std::string::npos && text.find("CEREAL") == std::string::npos);
+  CHECK(text.find("README.TXT") == std::string::npos && text.find("WING.DL_") == std::string::npos);
+  if (ad2)  // what After Dark 2.0's installer copied that the recipe never reads
+    for (const char* never : {"AD_PREFS", "AD_MPT", "SPALETTE", "AD_LIB", "AD_SB", "ST_NSTLL", "AD_MESG", "SETUP.EXE"})
+      CHECK(text.find(never) == std::string::npos);
 }
 
 void check_catalog_of(const phosg::JSON& cat, const Package& p) {
   const Expect& e = kExpect.at(p.id);
-  size_t n = 0, pe = 0;
+  const bool imx = p.recipe == Recipe::intermission, ad2 = p.recipe == Recipe::ad2kwaj;
+  size_t n = 0, pe = 0, controls = 0;
   for (auto& m : cat.at("modules").as_list()) {
     if (m->get_string("package") != p.id) continue;
     n++;
     pe += m->get_string("lane") == "pe32";
     CHECK(m->get_string("id").rfind(std::string(p.id) + ".", 0) == 0);
     CHECK(m->get_string("path").rfind(std::string(p.root) + "/", 0) == 0);
+    CHECK_EQ(m->contains("abi"), imx);
+    CHECK_EQ(m->contains("screen"), ad2);
+    if (ad2) {
+      // After Dark 2.0 modules: Classic entries with the release's fixed
+      // 640x480 screen; the names trimmed (15 had a leading space),
+      // PLANETS.AD's overridden; the registrant stand-in and hand-wrapped
+      // breaks gone.
+      CHECK_EQ(m->get_string("lane"), std::string("ne16"));
+      CHECK_EQ(m->get_string("entry"), std::string("MODULE"));
+      CHECK_EQ(m->get_string("screen"), std::string("640x480"));
+      const std::string name = m->get_string("displayName"), about = m->get_string("about");
+      CHECK(!name.empty() && name.front() != ' ' && name == m->get_string("moduleName"));
+      CHECK(about.find("Authorized User") == std::string::npos);
+      // No sentence wrapped by hand is left (" \n" before a lower-case
+      // letter); " \n" before a capital or an empty line stays.
+      bool wrapped = false;
+      for (size_t at = about.find(" \n"); at != std::string::npos; at = about.find(" \n", at + 1))
+        wrapped = wrapped || (at + 2 < about.size() && about[at + 2] >= 'a' && about[at + 2] <= 'z');
+      CHECK(!wrapped);
+      CHECK(!m->contains("sameAs"));  // no file is another release's
+      const std::string id = m->get_string("id");
+      if (id == "startrek.planets") CHECK_EQ(name, std::string("Planetary Atlas"));
+      if (id == "startrek.braincel") CHECK(about.find("turn off your computer.") != std::string::npos);
+      const auto& needs = m->at("needs").as_list();
+      CHECK_EQ(needs.size(), size_t(id == "startrek.sounder" ? 1 : 2));
+      const auto& ctl = m->at("controls").as_list();
+      controls += ctl.size();
+      for (auto& c : ctl)
+        if (c->get_string("type") == "button")
+          CHECK((id == "startrek.comms" && c->get_int("index") == 3 && c->get_string("name") == "Edit Custom...") ||
+                (id == "startrek.sounder" && c->get_int("index") == 2 && c->get_string("name") == "Sounds.."));
+      continue;
+    }
+    if (!imx) continue;
+    // An Intermission module: its entry, its one button, its registry name.
+    CHECK_EQ(m->get_string("lane"), std::string("ne16"));
+    CHECK_EQ(m->get_string("abi"), std::string("intermission"));
+    CHECK_EQ(m->get_string("entry"), std::string("SAVERDRAW"));
+    CHECK_EQ(m->get_string("about"), std::string());
+    const auto& controls = m->at("controls").as_list();
+    CHECK_EQ(controls.size(), size_t(1));
+    if (controls.size() == 1) {
+      CHECK_EQ(controls[0]->get_string("name"), std::string("Configure..."));
+      CHECK_EQ(controls[0]->get_string("type"), std::string("button"));
+    }
+    std::string rel = m->get_string("path").substr(std::string(p.root).size() + 1), name;
+    for (const NameOverride& o : p.name_overrides)
+      if (iequals(o.module, rel)) name = o.name;
+    CHECK(!name.empty());
+    CHECK_EQ(m->get_string("moduleName"), name);
+    CHECK_EQ(m->get_string("displayName"), name);  // no name of the 202 others collides
+    for (auto& need : m->at("needs").as_list()) {
+      const std::string d = need->as_string();
+      CHECK(d == "INTRMLIB" || d == "READJPG" || d == "STRESS" || d == "SWSE");
+    }
   }
   fprintf(stderr, "  catalog: %s %zu modules (%zu pe32, %zu ne16)\n", p.id, n, pe, n - pe);
   CHECK_EQ(n, e.modules);
   CHECK_EQ(pe, e.pe32);
+  if (ad2) CHECK_EQ(controls, size_t(40));
+}
+
+// Star Wars Screen Entertainment's installer script, read from its image,
+// against the recipe: every loose file is the installer's line for it (its
+// source, its destination, compressed or not; General MIDI the chosen set),
+// and every other line is an archive or a file the recipe never reads.
+void check_install_dat(const fs::path& image) {
+  const Package& p = *find_package("swse");
+  auto src = open_image(image);
+  auto node = src->find("INSTALL.DAT");
+  CHECK(node.has_value());
+  if (!node) return;
+  const std::vector<uint8_t> bytes = src->read_all(*node, 64 * 1024);
+  std::string text(bytes.begin(), bytes.end());
+  struct Line {
+    int number;
+    std::string src, dst;
+    int check = -1;  // CHECK=n; -1 = unconditional
+  };
+  std::vector<Line> lines;
+  bool install = false;
+  auto trim = [](std::string v) {
+    while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.erase(0, 1);
+    while (!v.empty() && (v.back() == ' ' || v.back() == '\t' || v.back() == '\r')) v.pop_back();
+    return v;
+  };
+  for (size_t i = 0; i < text.size();) {
+    size_t eol = text.find('\n', i);
+    std::string line = trim(text.substr(i, eol == std::string::npos ? std::string::npos : eol - i));
+    i = eol == std::string::npos ? text.size() : eol + 1;
+    if (line.empty()) continue;
+    if (line.front() == '[') {
+      install = iequals(line, "[install]");
+      continue;
+    }
+    size_t eq = line.find('=');
+    if (!install || eq == std::string::npos) continue;
+    std::string key = trim(line.substr(0, eq));
+    if (key.empty() || key.find_first_not_of("0123456789") != std::string::npos) continue;  // maxLineNum
+    std::vector<std::string> f;
+    std::string rest = line.substr(eq + 1);
+    for (size_t a = 0; a <= rest.size();) {
+      size_t b = rest.find(',', a);
+      if (b == std::string::npos) b = rest.size();
+      f.push_back(trim(rest.substr(a, b - a)));
+      a = b + 1;
+    }
+    if (f.size() < 4) continue;
+    Line l{std::stoi(key), ascii_upper(f[1]), ascii_upper(f[2])};
+    for (size_t k = 4; k < f.size(); k++)
+      if (ascii_upper(f[k]).rfind("CHECK=", 0) == 0 && f[k].size() > 6) l.check = std::stoi(f[k].substr(6));
+    lines.push_back(l);
+  }
+  fprintf(stderr, "  INSTALL.DAT: %zu install lines\n", lines.size());
+  CHECK(lines.size() > 30);
+  auto installed_as = [&](const std::string& dst) {
+    if (dst.rfind("(WIN)\\", 0) == 0) return "WINDOWS/" + dst.substr(6);
+    if (dst.rfind("(SYS)\\", 0) == 0) return "ENGINE/" + dst.substr(6);
+    return std::string(p.module_dir) + "/" + dst;
+  };
+  // Every loose file is one of the installer's lines.
+  for (const LooseFile& lf : p.loose_files) {
+    const Line* l = nullptr;
+    for (const Line& x : lines)
+      if (x.src == ascii_upper(lf.from) && (x.check == -1 || x.check == 24 || x.check == 100)) l = &x;
+    CHECK(l != nullptr);
+    if (!l) continue;
+    fprintf(stderr, "  line %2d %-13s -> %-16s as %s\n", l->number, l->src.c_str(), l->dst.c_str(), lf.to);
+    CHECK_EQ(installed_as(l->dst), ascii_upper(lf.to));
+    CHECK_EQ(lf.codec == Codec::szdd, ends_with_i(l->src, "_"));
+    CHECK(lf.codec != Codec::kwaj);
+    if (ends_with_i(l->src, ".MI_")) CHECK_EQ(l->check, 24);  // the General MIDI set
+  }
+  // Every other line: an archive (every disk), or never read.
+  static const std::set<std::string> kNeverRead = {"README.TXT", "INSTDETL.DAT", "INSTALL.EXE", "SVGA.EXE",
+                                                   "SYSINI.DAT", "ANTHOOK.386",  "DVA.386",     "DVA.38_",
+                                                   "IMCPL.CPL",  "SWSESET.EXE",  "DIB.DR_",     "WING.DL_",
+                                                   "WING32.DL_", "WINGDE.DL_",   "WINGDIB.DR_", "WINGPAL.WN_"};
+  for (const Line& l : lines) {
+    bool loose = false;
+    for (const LooseFile& lf : p.loose_files) loose = loose || l.src == ascii_upper(lf.from);
+    bool archive = false;
+    for (const char* a : p.required_archives) archive = archive || l.src == a;
+    if (l.dst == "(DST)") {
+      CHECK(archive);
+    } else if (loose) {
+      // One MIDI name per set: only CHECK=24's source is a loose file.
+      if (ends_with_i(l.src, ".MI_")) CHECK_EQ(l.check, 24);
+    } else if (ends_with_i(l.src, ".MI_")) {
+      CHECK(l.check >= 20 && l.check <= 23);  // an FM/OPL set, never read
+    } else if (!kNeverRead.count(l.src)) {
+      test::g_failures++;
+      fprintf(stderr, "  line %d installs %s, which the recipe neither takes nor lists as never read\n", l.number,
+              l.src.c_str());
+    }
+  }
+}
+
+// Star Trek: The Screen Saver's Setup script, ST_NSTLL.INF (KWAJ-compressed as
+// ST_NSTLL.IN_ on disk 1), against the registry's table: every row is an INF
+// line with the same disk, installed name and size (field 15), placed where
+// its section installs it, flattened as the recipe does (the installer's
+// C:\WINDOWS DLLs beside the modules, AD_SND.DLL and AD.EXE in ENGINE); the
+// disk tag files are the INF's; every other line installs a file the recipe
+// never reads. `images`: both disks' images, or the ZIP of them.
+void check_inf(const std::vector<fs::path>& images) {
+  const Package& p = *find_package("startrek");
+  // Each disk on its own, by the md5 that makes it disk 1 or 2.
+  std::map<int, std::unique_ptr<SourceFs>> disks;
+  auto add = [&](std::unique_ptr<SourceFs> fs, const std::string& md5) {
+    for (const KnownImage& k : p.images)
+      if (md5 == k.md5) disks[k.disk] = std::move(fs);
+  };
+  for (const fs::path& image : images) {
+    auto zipped = floppy_images_in_zip(image);
+    if (zipped.empty()) {
+      add(open_image(image), md5_file_hex(image));
+      continue;
+    }
+    for (auto& z : zipped) add(open_fat_image(z.bytes, z.name), md5_hex(z.bytes->data(), z.bytes->size()));
+  }
+  CHECK(disks.size() == 2 && disks.count(1) && disks.count(2));
+  if (disks.size() != 2 || !disks.count(1)) return;
+  auto on_disk = [&](const std::string& name) {
+    for (auto& [n, fs] : disks)
+      if (fs->find(name)) return n;
+    return 0;
+  };
+  auto inf_node = disks[1]->find("ST_NSTLL.IN_");
+  CHECK(inf_node.has_value());
+  if (!inf_node) return;
+  const std::vector<uint8_t> packed = disks[1]->read_all(*inf_node, 1 << 20);
+  std::string text;
+  kwaj_expand(packed, "ST_NSTLL.IN_", 1 << 20, [&](const uint8_t* d, size_t n) { text.append((const char*)d, n); });
+  struct Line {
+    std::string section, name;  // the installed name, upper case
+    int disk = 0;
+    uint64_t size = 0;
+  };
+  std::vector<Line> lines;
+  std::vector<std::string> tags;
+  std::string section;
+  auto trim = [](std::string v) {
+    while (!v.empty() && (v.front() == ' ' || v.front() == '\t' || v.front() == '"')) v.erase(0, 1);
+    while (!v.empty() && (v.back() == ' ' || v.back() == '\t' || v.back() == '\r' || v.back() == '"')) v.pop_back();
+    return v;
+  };
+  for (size_t i = 0; i < text.size();) {
+    size_t eol = text.find('\n', i);
+    std::string line = trim(text.substr(i, eol == std::string::npos ? std::string::npos : eol - i));
+    i = eol == std::string::npos ? text.size() : eol + 1;
+    if (line.empty()) continue;
+    if (line.front() == '[') {
+      section = line.substr(1, line.find(']') - 1);
+      continue;
+    }
+    std::vector<std::string> f;
+    std::string rest = line.substr(line.find('=') == std::string::npos ? 0 : line.find('=') + 1);
+    for (size_t a = 0; a <= rest.size();) {
+      size_t b = rest.find(',', a);
+      if (b == std::string::npos) b = rest.size();
+      f.push_back(trim(rest.substr(a, b - a)));
+      a = b + 1;
+    }
+    if (section == "Source Media Descriptions") {
+      if (f.size() >= 3) tags.push_back(ascii_upper(f[2]));
+      continue;
+    }
+    if (section == "Default File Settings" || f.size() < 16) continue;
+    lines.push_back({section, ascii_upper(f[1]), std::stoi(f[0]), std::stoull(f[15])});
+  }
+  fprintf(stderr, "  ST_NSTLL.INF: %zu file lines, source media %zu\n", lines.size(), tags.size());
+  CHECK_EQ(lines.size(), size_t(61));  // every file of both disks but the INF itself
+  CHECK((tags == std::vector<std::string>(p.required_archives.begin(), p.required_archives.end())));
+  for (size_t k = 0; k < tags.size(); k++) CHECK_EQ(on_disk(tags[k]), int(k + 1));
+  // COMPRESS's name for an installed name: the extension's last character
+  // made '_' (appended to a shorter extension).
+  auto compressed = [](const std::string& name) {
+    const size_t dot = name.rfind('.');
+    return name.size() - dot - 1 < 3 ? name + "_" : name.substr(0, name.size() - 1) + "_";
+  };
+  std::map<std::string, const KnownFile*> manifest;
+  for (const KnownFile& k : p.manifest) manifest[k.path] = &k;
+  std::set<std::string> taken;
+  for (const LooseFile& lf : p.loose_files) {
+    const std::string to = lf.to, name = to.substr(to.rfind('/') + 1);
+    const Line* l = nullptr;
+    for (const Line& x : lines)
+      if (x.name == name) l = &x;
+    CHECK(l != nullptr);
+    if (!l) continue;
+    taken.insert(name);
+    fprintf(stderr, "  [%s] %-13s disk %d, %7llu bytes -> %s\n", l->section.c_str(), l->name.c_str(), l->disk,
+            (unsigned long long)l->size, to.c_str());
+    CHECK(lf.codec == Codec::kwaj);
+    CHECK_EQ(std::string(lf.from), compressed(name));
+    CHECK_EQ(on_disk(lf.from), l->disk);
+    auto m = manifest.find(std::string(p.root) + "/" + to);
+    CHECK(m != manifest.end() && m->second->size == l->size);
+    std::string want;
+    if (l->section == "ADModules") want = "AFTERDRK/" + name;
+    else if (l->section == "ADExecutables") want = name == "AD.EXE" ? "ENGINE/AD.EXE" : "AFTERDRK/" + name;
+    else if (l->section == "ResFiles" || l->section == "Sounds") want = "AFTERDRK/ST_RES/" + name;
+    else if (l->section == "Noises") want = "AFTERDRK/SOUNDS/" + name;
+    else if (l->section == "WinDirectoryFiles") want = name == "AD_SND.DLL" ? "ENGINE/AD_SND.DLL" : "AFTERDRK/" + name;
+    CHECK_EQ(want, to);
+  }
+  // Everything else the installer could copy, never read by the recipe (I5).
+  static const std::set<std::string> kNeverRead = {
+      "ADINIT.EXE",   "AD_AILAN.DLL", "AD_MPT.DRV",   "AD_NVLNW.DLL", "AFTERDRK.NSS", "AD_LIB.DLL",   "AD_SB.DRV",
+      "AD_NET.EXE",   "NWCORE.DLL",   "NWCONN.DLL",   "NWMISC.DLL",   "AD_WRAP.COM",  "SPALETTE.DLL", "AD.HLP",
+      "AD_MESG.ADS",  "AD_PREFS.INI", "SPLASH1.BMP",  "BMPRSRC.DLL",  "AD_NSTLL.INI", "AD.386",       "SETUP.LST",
+      "MSDETECT.INC", "MSUILSTF.DLL", "VER.DLL",      "AD_NSTLL.MST", "MSSHLSTF.DLL", "MSCUISTF.DLL", "SETUPAPI.INC",
+      "MSDETSTF.DLL", "AD_NSTLL.DLL", "SETUP.EXE",    "MSINSSTF.DLL", "MSCOMSTF.DLL", "_MSTEST.EXE"};
+  for (const Line& l : lines)
+    if (!taken.count(l.name) && !kNeverRead.count(l.name)) {
+      test::g_failures++;
+      fprintf(stderr, "  [%s] %s: neither in the table nor listed as never read\n", l.section.c_str(), l.name.c_str());
+    }
+  CHECK_EQ(taken.size(), p.loose_files.size());
+}
+
+// Star Trek: The Screen Saver's two disk images in disk order, from the loose
+// images or the ZIP they came in (by the md5 that makes each disk 1 or 2).
+std::vector<std::vector<uint8_t>> startrek_disks(const std::vector<fs::path>& images) {
+  const Package& p = *find_package("startrek");
+  std::map<int, std::vector<uint8_t>> by_disk;
+  auto add = [&](const std::vector<uint8_t>& bytes) {
+    const std::string md5 = md5_hex(bytes.data(), bytes.size());
+    for (const KnownImage& k : p.images)
+      if (md5 == k.md5) by_disk[k.disk] = bytes;
+  };
+  for (const fs::path& image : images) {
+    auto zipped = floppy_images_in_zip(image);
+    if (zipped.empty()) add(test::read_bytes(image));
+    for (auto& z : zipped) add(*z.bytes);
+  }
+  std::vector<std::vector<uint8_t>> out;
+  for (auto& [disk, bytes] : by_disk) out.push_back(std::move(bytes));
+  return out;
+}
+
+// The two disks in a ZIP under code page 437 names, as Explorer or 7-Zip on
+// an English Windows zips them when a name fits it (general-purpose bit 11
+// clear): the known disk set, verified "image", the files of the images' own
+// import, and an import.json that is UTF-8 with the names decoded; two names
+// that differ only in a letter outside ASCII (u-umlaut, o-umlaut) are two
+// names.
+void check_cp437_zips(const std::wstring& exe, const fs::path& scratch, const std::vector<fs::path>& images) {
+  const std::vector<std::vector<uint8_t>> disks = startrek_disks(images);
+  CHECK_EQ(disks.size(), size_t(2));
+  if (disks.size() != 2) return;
+  const Tree want = snapshot(scratch / L"alone-startrek" / L"win" / L"packages" / L"startrek", true);
+  auto ends_with = [](const std::string& s, const std::string& tail) {
+    return s.size() >= tail.size() && s.compare(s.size() - tail.size(), tail.size(), tail) == 0;
+  };
+  for (const auto& [tag, one, two] : std::vector<std::tuple<std::wstring, std::string, std::string>>{
+           {L"cp437", "DISK\x81\x94" "1.IMG", "DISK\x81\x94" "2.IMG"}, {L"cp437-pair", "TREK\x81.IMG", "TREK\x94.IMG"}}) {
+    test::ZipBuilder z;
+    z.password = "";
+    z.add(one, disks[0], /*deflate=*/false, /*encrypt=*/false);
+    z.add(two, disks[1], /*deflate=*/false, /*encrypt=*/false);
+    const fs::path zip = scratch / (L"startrek-" + tag + L".zip"), root = scratch / (L"zip-" + tag);
+    test::write_bytes(zip, z.build());
+    const int code = adimport(exe, {L"--no-cover-download", L"--image", zip.wstring(), L"--dest", root.wstring()},
+                              ("Star Trek's disks in a ZIP, code page 437 names: " + to_utf8(tag)).c_str());
+    CHECK_EQ(code, 0);
+    if (code) continue;
+    const fs::path pkg = root / L"win" / L"packages" / L"startrek";
+    const std::string text = test::read_text(pkg / L"import.json");
+    CHECK(test::strict_utf8(text));
+    phosg::JSON j = phosg::JSON::parse(text);
+    CHECK_EQ(j.get_string("verified"), std::string("image"));
+    CHECK_EQ(j.at("source").get_bool("imageMd5Known"), true);
+    const auto& parts = j.at("source").at("parts").as_list();
+    CHECK(parts.size() == 2 && ends_with(parts[0]->get_string("path"), "!" + oem437_to_utf8(one)) &&
+          ends_with(parts[1]->get_string("path"), "!" + oem437_to_utf8(two)));
+    CHECK(snapshot(pkg, true) == want);
+  }
 }
 
 }  // namespace
@@ -138,7 +536,7 @@ void check_catalog_of(const phosg::JSON& cat, const Package& p) {
 int main(int argc, char** argv) {
   const char* on = getenv("AD_E2E_PKG");
   if (!on || std::string(on) != "1") {
-    fprintf(stderr, "import.pkg_real: skipped (set AD_E2E_PKG=1 to import the four real package images)\n");
+    fprintf(stderr, "import.pkg_real: skipped (set AD_E2E_PKG=1 to import the six real package sources)\n");
     return 77;
   }
   if (argc < 3) {
@@ -151,37 +549,59 @@ int main(int argc, char** argv) {
   const fs::path installed_root = test::installed_assets_root();
   fs::path scratch = test::scratch(argc - 1, argv + 1, "adw-import-pkg-real");
   test::sandbox_data_root(scratch / L"localappdata");
-  fs::path images_dir = argc > 3 ? fs::path(argv[3]) : fs::path();
-  if (const wchar_t* e = _wgetenv(L"AD_SOURCE_ISO_DIR"); e && *e) images_dir = e;
-  images_dir = fs::absolute(images_dir).make_preferred();  // Mount-DiskImage needs an absolute path
+  std::vector<fs::path> dirs;
+  for (const fs::path& d : test::image_dirs(argc > 3 ? fs::path(argv[3]) : fs::path()))
+    dirs.push_back(fs::absolute(d).make_preferred());  // Mount-DiskImage needs an absolute path
 
   // ---- find the images by size and md5 --------------------------------------------------
-  std::map<std::string, fs::path> image_of;
-  std::error_code ec;
-  for (auto& f : fs::directory_iterator(images_dir, ec)) {
-    if (!f.is_regular_file()) continue;
-    uint64_t size = f.file_size();
-    for (const Package& p : builtin_packages()) {
-      if (p.is_deluxe()) continue;
-      for (const KnownImage& k : p.images)
-        if (k.size == size && md5_file_hex(f.path()) == k.md5) image_of[p.id] = f.path();
+  // One image per package; every install disk's (or the ZIP of them) for a
+  // release on several.
+  std::map<std::string, std::vector<fs::path>> images_of;
+  for (const Package& p : builtin_packages()) {
+    if (p.is_deluxe()) continue;
+    std::vector<fs::path> set = test::find_disk_set(dirs, p);
+    if (!set.empty()) {
+      images_of[p.id] = set;
+      continue;
+    }
+    for (const KnownImage& k : p.images) {
+      if (k.disk) continue;
+      fs::path f = test::find_image(dirs, k.size, k.md5);
+      if (!f.empty()) {
+        images_of[p.id] = {f};
+        break;
+      }
     }
   }
-  for (const Package& p : builtin_packages())
-    if (!p.is_deluxe())
-      fprintf(stderr, "%-9s %s\n", p.id,
-              image_of.count(p.id) ? to_utf8(image_of[p.id].wstring()).c_str() : "(image not found)");
-  if (image_of.size() != 4) {
-    fprintf(stderr, "SKIP: needs all four package images in %s\n", to_utf8(images_dir.wstring()).c_str());
+  for (const Package& p : builtin_packages()) {
+    if (p.is_deluxe()) continue;
+    std::string where;
+    for (const fs::path& f : images_of[p.id]) where += (where.empty() ? "" : " + ") + to_utf8(f.wstring());
+    fprintf(stderr, "%-9s %s\n", p.id, where.empty() ? "(image not found)" : where.c_str());
+    if (where.empty()) images_of.erase(p.id);
+  }
+  if (images_of.size() != 6) {
+    std::string where;
+    for (const fs::path& d : dirs) where += (where.empty() ? "" : "; ") + to_utf8(d.wstring());
+    fprintf(stderr, "SKIP: needs all six package sources in %s\n", where.c_str());
     return 77;
   }
+  // "--image <each image>" for a package.
+  auto image_args = [&](const std::string& id) {
+    std::vector<std::wstring> a;
+    for (const fs::path& f : images_of[id]) a.insert(a.end(), {L"--image", f.wstring()});
+    return a;
+  };
+  auto with = [](std::vector<std::wstring> a, const std::vector<std::wstring>& b) {
+    a.insert(a.end(), b.begin(), b.end());
+    return a;
+  };
 
-  // ---- 1. each image alone ----------------------------------------------------------------
+  // ---- 1. each package alone ----------------------------------------------------------------
   for (const Package& p : builtin_packages()) {
     if (p.is_deluxe()) continue;
     fs::path root = scratch / (L"alone-" + to_wide(p.id));
-    int code = adimport(exe, {L"--no-cover-download", L"--image", image_of[p.id].wstring(), L"--dest", root.wstring()},
-                        p.title);
+    int code = adimport(exe, with(with({L"--no-cover-download"}, image_args(p.id)), {L"--dest", root.wstring()}), p.title);
     CHECK_EQ(code, 0);
     if (code) continue;
     fs::path win = root / L"win";
@@ -193,11 +613,10 @@ int main(int argc, char** argv) {
     check_catalog_of(cat, p);
     // A second import of the same image into the same root: the same files.
     Tree before = snapshot(win / L"packages" / to_wide(p.id), true);
-    CHECK_EQ(
-        adimport(exe,
-                 {L"--no-cover-download", L"--image", image_of[p.id].wstring(), L"--dest", root.wstring(), L"--quiet"},
-                 "again"),
-        0);
+    CHECK_EQ(adimport(exe,
+                      with(with({L"--no-cover-download"}, image_args(p.id)), {L"--dest", root.wstring(), L"--quiet"}),
+                      "again"),
+             0);
     CHECK(snapshot(win / L"packages" / to_wide(p.id), true) == before);
   }
 
@@ -206,8 +625,13 @@ int main(int argc, char** argv) {
   // 2k.ad"); a CD drive root is read as the disc, so the result must be the
   // image import's, file for file. Mounting may be refused by policy; that
   // skips this step rather than failing it.
-  for (const char* id : {"ad10", "tt"}) {
-    const fs::path& iso = image_of[id];
+  for (const char* id : {"ad10", "tt", "swse"}) {
+    const fs::path& iso = images_of[id].front();
+    if (!ends_with_i(to_utf8(iso.extension().wstring()), ".iso")) {
+      fprintf(stderr, "---- %s mounted: %s is no .iso Windows can mount; step skipped\n", id,
+              to_utf8(iso.filename().wstring()).c_str());
+      continue;
+    }
     std::wstring q = L"'" + iso.wstring() + L"'";
     std::wstring ps = L"$i = Get-DiskImage -ImagePath " + q + L"; $was = $i.Attached; "
                       L"if (-not $was) { $i = Mount-DiskImage -ImagePath " + q + L" -PassThru }; $l = $null; "
@@ -240,35 +664,51 @@ int main(int argc, char** argv) {
     CHECK_EQ(load(root / L"win" / L"catalog-win.json").at("modules").as_list().size(), kExpect.at(id).modules);
   }
 
-  // ---- 2. all five in one root ------------------------------------------------------------------
+  // ---- 1c. Star Wars Screen Entertainment's installer script against the recipe ---------------------
+  check_install_dat(images_of["swse"].front());
+
+  // ---- 1d. Star Trek: The Screen Saver's Setup script against the recipe ------------------------
+  check_inf(images_of["startrek"]);
+
+  // ---- 1e. Star Trek: The Screen Saver's disks in a ZIP under code page 437 names ---------------
+  check_cp437_zips(exe, scratch, images_of["startrek"]);
+
+  // ---- 2. all six in one root ------------------------------------------------------------------
   fs::path installed = installed_root.empty() ? fs::path() : win_assets_dir(installed_root);
   if (installed.empty() || !fs::is_directory(installed / L"FILES" / L"AD40") ||
       !fs::exists(installed / L"catalog-win.json")) {
     fprintf(stderr, "no installed Deluxe assets at %s; the combined check is skipped\n", to_utf8(installed.wstring()).c_str());
     return test::finish("import.pkg_real");
   }
+  fprintf(stderr, "Deluxe from %s (read only)\n", to_utf8(installed.wstring()).c_str());
   fs::path all = scratch / L"all";
   // The installed Deluxe tree is a folder source: read, never written.
   CHECK_EQ(adimport(exe, {L"--no-cover-download", L"--from", installed.wstring(), L"--dest", all.wstring()},
                     "Deluxe from the installed assets"),
            0);
-  for (const char* id : {"simpsons", "tt", "ad32", "ad10"})
-    CHECK_EQ(
-        adimport(exe,
-                 {L"--no-cover-download", L"--image", image_of[id].wstring(), L"--dest", all.wstring(), L"--quiet"},
-                 id),
-        0);
+  for (const char* id : {"simpsons", "startrek", "tt", "ad32", "swse", "ad10"})
+    CHECK_EQ(adimport(exe, with(with({L"--no-cover-download"}, image_args(id)), {L"--dest", all.wstring(), L"--quiet"}),
+                      id),
+             0);
   fs::path win = all / L"win";
   phosg::JSON cat = load(win / L"catalog-win.json");
   const auto& mods = cat.at("modules").as_list();
   fprintf(stderr, "combined catalog: %zu modules\n", mods.size());
-  CHECK_EQ(mods.size(), size_t(202));
-  CHECK_EQ(cat.at("packages").as_list().size(), size_t(5));
+  CHECK_EQ(mods.size(), size_t(232));
+  CHECK_EQ(cat.at("packages").as_list().size(), size_t(7));
   for (const Package& p : builtin_packages())
     if (!p.is_deluxe()) {
       check_package_root(win, p);
       check_catalog_of(cat, p);
     }
+  // The packages list: oldest release first (Star Trek: The Screen Saver,
+  // 1992-11); swse ties with the Simpsons (1994-08) and follows it, as in the
+  // registry.
+  {
+    std::vector<std::string> order;
+    for (auto& pk : cat.at("packages").as_list()) order.push_back(pk->get_string("id"));
+    CHECK((order == std::vector<std::string>{"startrek", "simpsons", "swse", "ad32", "tt", "deluxe", "ad10"}));
+  }
   // Display names unique per lane; sameAs names an earlier entry with the same md5.
   std::set<std::string> names;
   std::map<std::string, std::string> md5_of;
@@ -287,6 +727,7 @@ int main(int argc, char** argv) {
     md5_of[m->get_string("id")] = m->get_string("md5");
   }
   fprintf(stderr, "  %zu entries point at an identical earlier module (sameAs)\n", same);
+  CHECK_EQ(same, size_t(73));
   // Deluxe's entries: every existing field as the installed catalog has it.
   // The installed catalog may cover other releases too (any the user has
   // imported); only its Deluxe entries are the reference here (a catalog
@@ -318,17 +759,15 @@ int main(int argc, char** argv) {
       if (rel.rfind("packages/" + id + "/", 0) != 0 && rel != "catalog-win.json") t[rel] = d;
     return t;
   };
-  for (const char* id : {"ad10", "ad32", "tt", "simpsons"}) {
+  for (const char* id : {"ad10", "ad32", "tt", "simpsons", "swse", "startrek"}) {
     Tree others = everything_but(id);
     Tree mine = snapshot(win / L"packages" / to_wide(id), true);
-    CHECK_EQ(
-        adimport(exe,
-                 {L"--no-cover-download", L"--image", image_of[id].wstring(), L"--dest", all.wstring(), L"--quiet"},
-                 (std::string("re-import ") + id).c_str()),
-        0);
+    CHECK_EQ(adimport(exe, with(with({L"--no-cover-download"}, image_args(id)), {L"--dest", all.wstring(), L"--quiet"}),
+                      (std::string("re-import ") + id).c_str()),
+             0);
     CHECK(everything_but(id) == others);
     CHECK(snapshot(win / L"packages" / to_wide(id), true) == mine);
   }
-  CHECK_EQ(load(win / L"catalog-win.json").at("modules").as_list().size(), size_t(202));
+  CHECK_EQ(load(win / L"catalog-win.json").at("modules").as_list().size(), size_t(232));
   return test::finish("import.pkg_real");
 }

@@ -5,14 +5,20 @@ disassembly of the binaries in `<assets>/win/FILES` (the PC side of the After
 Dark 4.0 Deluxe CD). It complements `DESIGN.md` (architecture) and
 `API_SURFACE.md` (every imported function, counted and classified).
 
-Every fact, count and address below was verified on those Deluxe binaries.
-The other releases the host runs (After Dark 10th Anniversary, After Dark
-3.2, Totally Twisted and The Simpsons) reach their modules through the same
-two entry points (§2.2, §3.4). What differs for them (their own engine
-builds, the AD 3.x host they shipped with, and the native AD3 bridge that
-stands in for OLDMOD16 where a disc has none) is in `PACKAGES.md` §7. Input,
-module buttons and the modules' saved state are in `INTERACTION.md`; how
-every module makes sound, and how the host plays it, is in `AUDIO.md`.
+Every fact, count and address below was verified on those Deluxe binaries,
+except in §3.8 and §3.9. The other After Dark releases the host runs (After
+Dark 10th Anniversary, After Dark 3.2, Totally Twisted, The Simpsons and,
+since the seventh release, Star Trek: The Screen Saver) reach their modules
+through the same two entry points (§2.2, §3.4). What differs for them
+(their own engine builds, the AD 3.x host they shipped with, and the
+native AD3 bridge that stands in for OLDMOD16 where a disc has none) is in
+`PACKAGES.md` §7; Star Trek: The Screen Saver's host was After Dark 2.0's
+`AD.EXE`, recovered from its own floppies (§3.9). The sixth release,
+LucasArts' Star Wars Screen Entertainment, is not After Dark: its modules
+are Delrina's Intermission modules, with their own protocol, recovered the
+same way from that disc's binaries (§3.8). Input, module buttons and the
+modules' saved state are in `INTERACTION.md`; how every module makes sound,
+and how the host plays it, is in `AUDIO.md`.
 
 **Status marks.** Every fact is marked **VERIFIED** — with the address in our
 binaries that shows it — or **UNVERIFIED-LEAD** (from third-party notes in
@@ -59,7 +65,27 @@ no NE entry point: our NE loader must call its exported `DLLENTRYPOINT`
 (reason 1) after loading it, or its two blocks are never allocated (§3.2). Only 12 of the
 Deluxe disc's 61 Classic modules use `ADXPL300.DLL`; the rest draw with plain Win16 GDI.
 The 16-bit lane additionally needs INT 21h/1Ah, selector `0x40`, VGA port
-reads, x87 and 386 operand-size prefixes (§3.6).
+reads, x87 and 386 operand-size prefixes (§3.6). After Dark 2.0's modules
+(Star Trek: The Screen Saver) take the same entry, messages and blocks from
+their own host, `AD.EXE` 2.0b, which differs from OLDMOD16 in a few fields,
+its sound library's volume pair and its result 5, a wake (§3.9).
+
+**Intermission IMX modules (ne16; Star Wars Screen Entertainment)** — do
+what `INTERMIS.EXE` did (§3.8): load Intermission's IMX reader
+`IMIMXPLY.IMQ` as real code, as OLDMOD16 is, and call its
+`DWORD FAR PASCAL SAVERMAIN(IMINFO FAR *info, WORD msg)` with one zeroed
+0x67-byte record: `10 LOAD → 7 QUERY → 1 START → 0 DRAW… (5 REPAINT on a
+real repaint) → 2 STOP → 11 FREE`, every drawing call between `GetDC` +
+`SaveDC` and `RestoreDC(-1)` + `ReleaseDC` of the saver window's own DC.
+INTERMIS's Configure button was `10 → 8 → 11`; our host sends
+`10 → 7 → 8 → 11`, adding the QUERY that INTRMLIB's enumeration had sent
+before the control panel offered the button (`INTERACTION.md` §6.1). The
+reader loads the module and calls its `SAVERINIT`/`SAVERDRAW`/
+`SAVERDLGPROC`. No timer paces the calls and no input reaches the module:
+the modules poll for it themselves (§3.8.4). Every module starts only when
+STRESS.DLL can open ten handles on a temporary file (§3.8.7), and with the
+GDI technology its support DLL draws through Windows 3.1's DIB driver,
+`CreateDC("DIB", …)` (§3.8.6).
 
 **Both lanes** — every clock read must advance virtual time: engines and
 modules busy-wait and calibrate CPU speed on the clock inside a single call
@@ -762,7 +788,7 @@ prologue (`CLASSIC/RAIN.AD 1:003e..1:0055`: `[bp+0xa]`=msg, `[bp+8]`=hdc,
 | 2 | DRAWFRAME | host, once per loop (`ModuleMessage3216(2)`) | host `0x401fd0` |
 | 3 | CLOSE | UNLOADADMODULE16 | `1:0e5e` |
 | 5 | MODULESELECTED | first, at load / button / visibility | `1:0ff2` |
-| 6 | (ABOUT per SDK) | nobody we have | UNVERIFIED-LEAD |
+| 6 | ABOUT | none of the Deluxe disc's hosts; After Dark 2.0's `AD.EXE` does (§3.9) | `AD.EXE 13:07c4`; handled by the After Dark 2.0 modules (`TRIBBLE.AD`'s table `5:05e9`) |
 | 7–10 | BUTTON (control 0–3) | BUTTONPUSHED16 | `1:0b01` |
 | 12 | PREINITIALIZE | after MODULESELECTED | `1:107b` |
 
@@ -888,6 +914,463 @@ point, §3.2) → `SETADPALETTE16` ×4 → `LOADADMODULE16` → per frame
 `MODULEMESSAGE16(2)` → `UNLOADADMODULE16` → `DLLENTRYPOINT(0, …)`. Pass
 `ctrl4` as four WORDs.
 
+### 3.8 Intermission IMX modules — VERIFIED
+
+Star Wars Screen Entertainment (LucasArts, 1994; developed by Presage
+Software) runs on **Delrina's Intermission** 4.0 (© Ant Software, Anthony
+Andersen), not on After Dark. Its 14 modules are 16-bit NE DLLs (`*.IMX`)
+that Intermission drives through a reader plug-in, `IMIMXPLY.IMQ`, much as
+AFTERDAR.SCR drove Classic modules through OLDMOD16. Everything in this
+section was verified on that CD's binaries (`source_iso/AfterDarkStarWars.iso`,
+md5 `bfa63c1bce15dcbea965dfd7c2ed44e8`), by the same method as the rest of
+this file: `research/win/nedis.py` listings, with the disc's private DLL
+ordinals resolved to names, in `research/win/pkg/swse/dis/` (gitignored), and
+the survey reports beside them (`research/win/pkg/swse/survey/`:
+`intermission_protocol.md`, `imx_modules.md`, `host_integration.md`,
+`api_census.md`). Addresses are `seg:off` in the file named; `[0xNNNN]` is a
+DGROUP variable. How the ne16 lane runs these modules is `PACKAGES.md` §7.5.
+
+#### 3.8.1 The binaries
+
+| File | What it is | Role | Evidence |
+|---|---|---|---|
+| `INTERMIS.EXE` | NE **application** (flags `0x030A`), module `INTERMIS`, 7 code segments | The engine: settings, idle timer, blanking window, frame loop, control panel. **Replaced by our host** (the Win16 runtime runs libraries only) | exports `SAVERWNDPROC` `6:0eee`, `TIMERFUNC` `1:140c`, `CPANEL` `2:078e` |
+| `INTRMLIB.DLL` | NE DLL "Intermission Screen Saver Library", 83 exports | Module list (`FINDALLMODULES` `1:1e06`, `LOADSAVER` `1:1fc0`, `FREESAVER` `1:21b2`), idle detection and input hook, palettes, sound. **Runs as real code**, loaded as the modules' import: its LibMain registers the dialog control classes (`ANT3DBOX`, `ANT3DCHECK`, `ANT3DSCROLL`, …) and the modules call `INTRAND`, `CENTERDLG`, `DOCTLCOLOR`. The host stands in for INTERMIS and calls none of its engine exports; for a module whose QUERY asks for an engine palette (§3.8.4; none of the 14 does) it makes that palette itself, as `CANISTART(1)` did (`PACKAGES.md` §7.5) | LibMain `1:0010..1:02d5` |
+| `ANTSW.DLL` | NE DLL, Ant Software's common library | The control window procedures and helpers; imported by INTRMLIB. Real code | |
+| `IMIMXPLY.IMQ` | NE DLL, the "IMX Player" reader, 3,936 bytes | Exports `SAVERMAIN` (ordinal 2, `2:002a`); loads an `.IMX` and drives it (§3.8.2). **Runs as real code**, the analogue of OLDMOD16. Eight more readers (`IMAD_PLY` for After Dark modules, FLC/FLI, SCR, …) are for other formats and never needed | |
+| `*.IMX` (14) | NE DLLs, Borland C++ 1991 | The modules (§3.8.5) | |
+| `SWSE.DLL` | NE DLL "SWSE Common Function DLL (C) 1994 Presage Software Development, Inc.", 248 exports | The modules' framework: canvases, palettes, sound, MIDI, titles, the credits box. Loads `swsfx.dll`, `MEMMIDI.DLL` and (probe only) `WING.DLL` by name | |
+| `READJPG.DLL`, `STRESS.DLL`, `SWSFX.DLL`, `MEMMIDI.DLL` | NE DLLs | The JPEG reader; the Windows 3.1 SDK's STRESS (§3.8.7); the sound-effect bank (module name `sw_sfx`, 118 `WAVE` resources); Sonic Foundry's in-memory MIDI player | |
+| `AD_SND.DLL` | NE DLL "Intermission AD Sound Support" (© 1992 Ant Software) | Berkeley's `ADW*` sound API on INTRMLIB's sound calls, for After Dark modules run through `IMAD_PLY.IMQ`. Nothing an IMX loads imports it, and on a search path it would break our After Dark bridge ("AD_SND.DLL lacks an entry point"), so the importer never installs it (`PACKAGES.md` §4.3) | a run of the host before this release (`host_integration.md` §1.6) |
+
+#### 3.8.2 `SAVERMAIN`, the reader entry
+
+`DWORD FAR PASCAL SaverMain(IMINFO FAR *lpInfo, WORD wMsg)` — **VERIFIED
+`IMIMXPLY.IMQ 2:002a`**, exported by name in the **non-resident** names
+table (as are the modules' exports, §3.8.5: a table walk of the NE files).
+
+* **Resolution.** INTRMLIB asks `GetProcAddress(hReader, "saverMain")`, in
+  mixed case (DGROUP `0x820`, `INTRMLIB 1:2044`, `1:21d3`), so name lookup
+  must be case-insensitive, as for OLDMOD16 → AD_SND (§3.6).
+* **Arguments.** Pascal: the far pointer first, then the message
+  (`INTRMLIB 1:2060..1:2064` `push es; push di; push 0xa; lcall [bp-6]`;
+  `INTERMIS 6:05f9..6:0608`). In the callee `[bp+6]` = `wMsg`,
+  `[bp+8]`/`[bp+0xa]` = the pointer; `retf 6` (`2:0039`, `2:0550`).
+* **Result** in DX:AX: 1 for every handled message (`2:0543`), 0 when a
+  load fails (`2:04a4`) or a configure finds no dialog procedure, the
+  dialog's HWND (DX = 0) for 9 (`2:036c`). Messages up to 11 go through a jump table at `2:004c`
+  (`2:003c..2:0041`); anything else returns 1.
+
+| Msg | Name (ours) | Sent by INTERMIS | What IMIMXPLY does |
+|---:|---|---|---|
+| 0 | DRAW | every idle pass with an empty queue (`1:0926`) | `saverdraw(+4, +6, hLib, +8, 0)` (`2:0064..2:0088`) |
+| 1 | START | the first idle pass after the window is shown (`1:08d4..1:08f6`) | with flag `0x4000`: `saverdraw(…, 3)`; then `saverdraw(…, 1)` (`2:0090`) |
+| 2 | STOP | at the wake (`WM_USER+2`, `6:17c2`) and before a module switch; **skipped while START has not been sent** (`6:1871`) | `saverdraw(…, 2)`; with flag `0x4000` then `saverdraw(…, 4)` (`2:00f0`) |
+| 3, 4 | — | never | nothing, 1 |
+| 5 | REPAINT | a later `WM_PAINT` (`6:150c..6:1568`), after a focus loss | `saverdraw(…, 2)` then `saverdraw(…, 1)`: a **full restart** (`2:014c..2:01a0`) |
+| 6 | PALETTE | never, by this INTERMIS | `palette((BYTE)+0x54)` when exported (`2:01a4`) |
+| 7 | QUERY | before every blank or switch (`6:0608`, `6:066a`), and INTRMLIB's enumeration | below (`2:01d4..2:02a3`) |
+| 8 | CONFIGURE | the control panel's Configure (`2:1d57`), with `+4` = its dialog | `DialogBox(hLib, "DIALOGBOX", +4, saverdlgproc)`; 0 without a `saverdlgproc` (`2:02e0..2:031b`) |
+| 9 | PANEL | the panel preview ("Unfold") | `saverinit(&999)`, then `CreateDialog(hLib, "DIALOGBOX", +4, saverdlgproc2)` → HWND (`2:031e..2:036e`) |
+| 10 | LOAD | INTRMLIB `LOADSAVER` (`1:2064`) | below (`2:0372..2:04f4`) |
+| 11 | FREE | INTRMLIB `LOADSAVER` after a failed 10 (`1:2077`), `FREESAVER` (`1:21e1`) | `FreeLibrary(module)`, free the block (`2:04f6..2:053e`) |
+| 12–15 | RAISE, MCINOTIFY, PAUSE, RESUME | focus loss of an input-taking saver, `MM_MCINOTIFY`, Caps Lock | nothing, 1 |
+
+**Message 10, load** (`IMIMXPLY 2:0372..2:04f4`), in this order:
+
+```
+if (+0x63 == NULL) return 1;                       // a reader-only load            2:0378
+name = the file part of +0x63;
+if (name starts with "IMXX_", any case) return 0;  // another product's extension   2:03c7..2:0404
+blk = GlobalLock(GlobalAlloc(GMEM_MOVEABLE|GMEM_ZEROINIT, 0x16)); +0x55 = blk;      2:040a..2:0426
+blk.hLib = LoadLibrary(+0x63);          if (!blk.hLib) return 0;                    2:0433..2:0448
+if (GetProcAddress(hLib, "setcurrsaver")) return 0;                                 2:044d..2:045c
+blk.saverinit = GetProcAddress(hLib, "saverinit");   if (!) return 0;
+blk.saverdraw = GetProcAddress(hLib, "saverdraw");   if (!) return 0;               2:045e..2:04a2
+blk.dlgproc   = GetProcAddress(hLib, "saverdlgproc");
+blk.dlgproc2  = GetProcAddress(hLib, "saverdlgproc2");
+blk.palette   = GetProcAddress(hLib, "palette");                                    2:04aa..2:04f0
+return 1;
+```
+
+The 0x16-byte block holds far pointers: `+0x00 hLib`, `+0x02 saverdraw`,
+`+0x06 saverinit`, `+0x0A palette`, `+0x0E saverdlgproc`,
+`+0x12 saverdlgproc2`. Only 0 counts as a failed `LoadLibrary`; a failed 10
+leaves the block, and the 11 that follows frees it and calls `FreeLibrary`
+on whatever `hLib` holds, so `FreeLibrary` of a value below 32 must be
+harmless. Messages 0/1/2/5 do not check that a module is loaded.
+
+**Message 7, query, with a path** (`2:01d4..2:02a3`): flag bit `0x04` set iff
+`saverdlgproc2` exists, byte 1 `= (byte1 & 0xF3) | 0x10`; `w = palette(0)`
+when exported (0x100 → 0xFE, stored at `+0x54`), else 0; `name =
+saverinit(&w)`; a name longer than 40 characters is cut **in the module's
+own string** (`2:025a..2:0269`) and copied to `+0x14`; `w` less 200 when
+≥ 200, then less 100 when ≥ 100, goes to `+0x53`. Without a path it
+describes the reader itself (`"IMX"` into `+0x5B` and `+0x14`,
+`2:02a6..2:02dc`).
+
+#### 3.8.3 The `IMINFO` record (0x67 bytes)
+
+INTRMLIB allocates one per file of the saver directory, readers and modules
+alike, in `GlobalAlloc(GMEM_MOVEABLE|GMEM_ZEROINIT)` chunks with the entry
+size `imul …, 0x67` (`INTRMLIB 1:1a3d`, `1:1b27`). The fields the reader and
+INTERMIS use:
+
+| Off | Type | Meaning | Evidence |
+|---|---|---|---|
+| `+0x00` | DWORD | flags (below) | defaults `INTRMLIB 1:2274..1:22b5`; query `IMIMXPLY 2:01e7..2:0213` |
+| `+0x04` | HWND | the blanking window for 0/1/2/5/7/9; the dialog's owner for 8 | `INTERMIS 6:054b`; `IMIMXPLY 2:006a`, `2:0307` |
+| `+0x06` | HDC | the blanking window's DC for this call | `INTERMIS 1:08ba`; `IMIMXPLY 2:006e` |
+| `+0x08` | HPALETTE | the engine palette (0 unless `+0x53` asked for one) | `INTERMIS 1:08d0`; `IMIMXPLY 2:007f` |
+| `+0x0A` | HINSTANCE | the reader's | `INTRMLIB 1:205c`, `1:2183` |
+| `+0x0C` | RECT | the paint rectangle for 5 (IMIMXPLY does not read it) | `INTERMIS 6:0b35..6:0b3e` |
+| `+0x14` | char[41] | display name, at most 40 characters | `IMIMXPLY 2:0276..2:027e` |
+| `+0x44` | char[13+] | file name (`VADER.IMX`) | `INTRMLIB 1:1c23..1:1c35` |
+| `+0x53` | BYTE | palette type the module wants: 0 none, 1 CLUT, 2 HSV, 3 PRIM | `IMIMXPLY 2:029f`; `INTERMIS 6:0692..6:06bc` |
+| `+0x54` | BYTE | `palette(0)`'s answer | `IMIMXPLY 2:0244` |
+| `+0x55` | far ptr | the reader's per-module block (IMIMXPLY: 0x16 bytes, above) | `IMIMXPLY 2:0422` |
+| `+0x59` | WORD | reader index; −1 for a reader | `INTRMLIB 1:1c47` |
+| `+0x63` | far ptr | the module file's full path (a 260-byte block of INTRMLIB's) | `INTRMLIB 1:213d..1:2193`; `IMIMXPLY 2:0378`, `2:0433` |
+
+Flags: `0x0004` the module has a panel (`saverdlgproc2`); `0x0070` the DC
+mode, 0 for every IMX module (the engine brackets each call, §3.8.4);
+`0x0200` enabled; `0x1000` a runnable saver; `0x2000` the saver takes input
+(capture and input redirection) — **never set for an IMX module**;
+`0x4000` the panel preview, in which IMIMXPLY adds `saverdraw` codes 3 and
+4 around START and STOP. Every SWSE module ends at `0x0000120C` when
+enabled. INTRMLIB keeps two records per blank (the reader's and the
+module's) and moves `+0x55` between them (`1:208c..1:21a7`); IMIMXPLY reads
+neither `+0x44` nor `+0x59`, so one zeroed record serves.
+
+#### 3.8.4 A blank, as INTERMIS drove it
+
+1. **Window.** Class `"adsux"` (`4:00c9`): `CS_OWNDC|CS_DBLCLKS|CS_HREDRAW|
+   CS_VREDRAW` (`0x002B`, `4:007e..4:009e`), no background brush (`4:00c3`,
+   so the desktop stays until the module draws), an invisible cursor
+   (`4:00b5..4:00c0`); `WS_POPUP` at 0,0, `HORZRES` × `VERTRES`
+   (`1:1806..1:1830`), `HWND_TOPMOST` on Windows 3.1 and later
+   (`1:187d..1:18a9`). The engine first makes the saver directory the
+   current drive and directory (`1:17d4..1:17fe`).
+2. **In `WM_CREATE`**, still hidden: `LOADSAVER` → **10** (`6:056c`), then
+   **7** (`6:066a`); a failed 7 frees the module and picks another
+   (`6:06ec`). `+0x53` would select an engine palette: `IMCOPYPALETTE`
+   (`6:0692..6:06cc`) copies the one INTRMLIB's `CANISTART(1)` made at
+   INTERMIS's start-up from its `CLUT`, `HSV` or `PRIM` resource, on an
+   `RC_PALETTE` display only (`INTRMLIB 1:07bb..1:091d`; without it
+   `IMCOPYPALETTE` returns 0, `1:06de`). Every SWSE module returns 0 there,
+   so `+0x08` is always 0.
+3. **Show**; the first `WM_PAINT` sends nothing (`6:1495..6:1509`).
+4. **Frames.** The main loop is `PeekMessage(PM_NOREMOVE)`: whenever the
+   queue is empty it makes one pass, one `SAVERMAIN` call, and peeks again;
+   a pending message is taken with `GetMessage` and dispatched
+   (`1:09cf..1:09e3`, `1:09da..1:0a64`). **No timer drives the frames, and
+   nothing limits their rate**: the modules pace themselves. The first pass
+   sends **1**, every later one **0**.
+5. **Each pass that draws** (0, 1, 2, 5), in DC mode 0 (`1:0787..1:09ca`):
+
+   ```
+   hdc = GetDC(hwnd); SaveDC(hdc)
+   if (palette) { old = SelectPalette(hdc, palette, FALSE); RealizePalette(hdc); }
+   +0x06 = hdc; +0x08 = palette; SAVERMAIN(info, msg)
+   if (old) SelectPalette(hdc, old, FALSE)
+   RestoreDC(hdc, -1); ReleaseDC(hwnd, hdc)
+   ```
+
+   So nothing a module selects into the DC survives to the next call
+   (the modules reselect their palettes every time).
+6. **Later `WM_PAINT`s** send **5** with the paint rectangle at `+0x0C` —
+   which restarts an IMX module (§3.8.2), so a host sends it only for a
+   real repaint.
+7. **Wake** (`WM_USER+2`, `6:17c2`): **2**, unless START was never sent;
+   then `FREESAVER` → **11**, `FreeLibrary` of the module and the reader
+   (`6:031c`); the window goes.
+
+Configure, from the control panel (`2:1cb2..2:1d7d`): `LOADSAVER` → **10**,
+`+4` = the panel's dialog, **8** (the module's modal dialog runs inside the
+call), `FREESAVER` → **11**. **No 7.**
+
+What a module sees per blank, in order: `LoadLibrary` (its LibMain),
+`palette(0)` (BLUPRINT, CANTINA), `saverinit(&w)`, then after the window
+shows `saverdraw(h, dc, hLib, 0, 1)`, `saverdraw(…, 0)` as fast as the loop
+runs, `saverdraw(…, 2)` then `saverdraw(…, 1)` on a repaint,
+`saverdraw(…, 2)` at the end, `FreeLibrary`.
+
+**Input.** A module never receives input: without flag `0x2000` there is
+no capture and nothing is redirected to it. INTRMLIB's `WH_GETMESSAGE` hook
+(`SAVERFILTERFUNC 1:09bc`) notes activity, filtered by `[Intermission]
+Wakeup Options` of `ANTSW.INI` (default `mbk`: moves after five mouse-move
+messages, buttons, keys other than Ctrl), and the 600 ms `TIMERFUNC` ends
+the blank. The modules poll for themselves, through SWSE.DLL:
+`USERABORT` (`1:773a`: `GetCursorPos` against the start position,
+`GetAsyncKeyState(VK_LBUTTON/VK_RBUTTON) & 0x8001`, `GetInputState`, per
+the same Wakeup Options) and `SKIPMODULE` (`1:75e1`: Shift held, and only
+when keys do not wake). When `USERABORT` sees input it calls
+**`FORCETOWAKE`** (`1:76cd`), which posts fake input to **its own task's
+queue** — `PostAppMessage(GetCurrentTask(), …)` of `WM_MOUSEMOVE(−1,0)`,
+`WM_LBUTTONDOWN`/`UP(−1,0)`, `WM_KEYDOWN`/`UP(VK_SHIFT)` — for INTERMIS's
+hook to see. It touches no engine state. Our host does not treat those
+posts as a wake, and posts no key message to an IMX module's queue (a key
+the saver does not wake on would otherwise reach `GetInputState` and stop
+the module's start): the saver's own rules decide (`INTERACTION.md` §5.2).
+
+#### 3.8.5 The module contract
+
+Every module exports `WEP` (1), `SAVERINIT` (2), `SAVERDRAW` (3),
+`SAVERDLGPROC` (4), `LIBMAIN` (5) and `SAVERDLGPROC2` (6); BLUPRINT and
+CANTINA also `PALETTE` (7). All but `WEP` (and `_JPEGCallback` in the JPEG
+modules) are in the **non-resident** names table, in upper case, while
+IMIMXPLY asks for them in lower case.
+
+| Export | Prototype (PASCAL far) | Evidence |
+|---|---|---|
+| `SAVERINIT` | `LPSTR saverinit(WORD FAR *pw)`: `if (*pw == 999) testFlag = 1; *pw = 0; return MAKELP(DS, 0x50);` | `VADER 1:029e..1:02c8`, `retf 4`; the same in all 14, except that SWTEXT sets no test flag there |
+| `SAVERDRAW` | `void saverdraw(HWND, HDC, HINSTANCE hSelf, HPALETTE, WORD code)`; codes 0 step, 1 start, 2 stop, 3 start in test mode, 4 stop test mode, through a five-entry table | `VADER 1:0746`, table `1:0883`, `retf 0xa`; no module reads `hSelf` or the palette |
+| `SAVERDLGPROC` | the modal dialog procedure of the template `"DIALOGBOX"` | `VADER 1:03ad..1:06e5` |
+| `SAVERDLGPROC2` | the same template as a modeless panel; `IDCANCEL` posts `0x475` to its parent and destroys it | `VADER 1:06e8..1:0743` |
+| `PALETTE` | `WORD palette(WORD suspend)`: stores it; while non-zero, `SAVERDRAW` returns at once | `BLUPRINT 1:074b`, `CANTINA 1:08e3` |
+| `SETCURRSAVER` | must **not** exist: IMIMXPLY refuses such a module | none of the 14 |
+
+* **Names.** `SAVERINIT`'s string is the module's name and also its
+  section of `SWSE.INI`: Space Battles, Character Biographies, Blueprints,
+  Cantina, Hyperspace, Imperial Clock, Jawas, Poster Art, Rebel Clock,
+  Lightsaber Duel, Storyboards, Scrolling Text, Death Star Trench, Darth
+  Vader. No resource holds a name, a version or an About text.
+* **Settings.** `LIBMAIN` reads the module's keys with
+  `GetPrivateProfileString(<name>, key, "", …, "SWSE.INI")` and `atoi`, so a
+  missing key reads 0 (`VADER 1:0310`, `1:0331`); the dialog's OK writes
+  them back with `WritePrivateProfileString` (`VADER 1:02cb`, `1:02e5`). The
+  bare file name puts `SWSE.INI` in the Windows directory, where the
+  installer put the defaults. The modules read their settings when they
+  are loaded, so a change shows at the next load.
+* **The dialog.** `"DIALOGBOX"` is not a string-named resource: each
+  module's `NAMETABLE` maps it to `DIALOG 1` (type 5, id `0x8001`). Its
+  controls use INTRMLIB's `ANT3DBOX`, `ANT3DCHECK`, `ANT3DSCROLL`,
+  `ANT3DTEXT` and `ANT3DONEORMORE` classes, whose procedures are in ANTSW,
+  plus an animated credits box in static `0x1109` that SWSE draws with its
+  canvases on a 55 ms timer (`CREATECREDITSBOX 1:7dcd`). Scrolling Text's
+  dialog also has **Select Text File** (`GetOpenFileName`) and **Select
+  Font** (`COMMDLG.ChooseFont`).
+* **Two families.** Seven *canvas* modules (BATTLES, HYPERSPC, ICLOCK,
+  JAWAS, RCLOCK, SABRDUEL, TRENCH) start with `SWSE.STANDARDSTARTUP` and draw
+  into SWSE canvases (§3.8.6); seven *DC/JPEG* modules (BIOS, BLUPRINT,
+  CANTINA, POSTERS, STORYBRD, SWTEXT, VADER) use memory DCs, DDBs and
+  READJPG's DIBs through `StretchDIBits`.
+* **Starting.** Every start (`SAVERDRAW(1)`) first needs
+  `STRESS.GETFREEFILEHANDLES() ≥ 10` (§3.8.7), and the canvas modules
+  `GetDeviceCaps(NUMCOLORS) ≥ 20`. A start that fails shows SWSE's default
+  screen (`DEFAULTSAVERINIT 1:7801`): "Memory or system resources are too
+  low for the selected module to run properly." (`ds:454`), or "A video
+  mode supporting 256 or more colors is required." Most modules start by
+  filling the screen black, and most show a title card first (VADER: "The
+  Dark Lord of the Sith approaches..."); JAWAS, and SABRDUEL unless its
+  Blank Background is set, draw over the desktop instead
+  (`SWSE.REMAPSCREENCOLORS 1:7abe`).
+* **Timing.** Some modules pace themselves by `GetTickCount` (BATTLES steps
+  at most every 54 ms, `1:0dbc..1:0ddf`), some step once per call (HYPERSPC's
+  stars, SWTEXT's scroll, TRENCH), the clocks read the DOS time, and the
+  text modules type and wipe for seconds inside one call, busy-waiting on
+  `GetTickCount` and polling `USERABORT`. So the speed of the per-call
+  modules is the host's call rate (how the ne16 lane sets it:
+  `PACKAGES.md` §7.5, "Pacing").
+* **Code.** 386 instructions throughout, x87 through OSFIXUPs (BIOS,
+  CANTINA, RCLOCK, READJPG), `__AHSHIFT` huge pointers, and **32-bit code in
+  a 16-bit DLL**: SWSE's code segments 2–5 and HYPERSPC's segment 2 set the
+  D bit of their own code descriptor with DPMI `int 31h` `000Bh`/`000Ch` on
+  first entry (`SWSE 2:0000..2:002a`) and run as USE32 from then on (the
+  canvas blitters). No self-modifying code, no port I/O.
+
+#### 3.8.6 SWSE's blit technology and the DIB driver
+
+`BOOL GETBLITTECHNOLOGY(HWND, LPCSTR ini)` (**VERIFIED `SWSE.DLL 1:4e1b`**,
+body `1:4e29..1:50c2`, `retf 6`; `STANDARDSTARTUP` calls it with
+`"SWSE.INI"`, `1:78cb..1:78d2`) returns 1 for WinG, 0 for GDI:
+
+* not an `RC_PALETTE` display → GDI (`1:4e2e..1:4e63`);
+* `SYSTEM.INI [boot] display.drv` (`1:4e95..1:4eb6`) equal (without case,
+  under 16 characters) to `SWSE.INI [technology] display.drv`, with
+  `WinGFound` non-zero and `DibBlit` = `GDI` → GDI **at once**, nothing
+  probed or written (`1:4ebc..1:4f3b`);
+* anything else → the WinG probe (`1:4f3e..1:50a4`): the window
+  subclassed with `DefWindowProc`, `OpenFile("WING.DLL", OF_EXIST)` and
+  `LoadLibrary`, a busy `PeekMessage` wait of 2.5 s (0.5 s once WinG was
+  found, `1:4fca..1:4fef`), `_ATTACHWING`/`_ISWINGACTIVE`, and the three keys
+  written back. Only the GDI answer is ever taken without a probe.
+
+`SWSESET.EXE`, the disc's GDI/WinG chooser, writes `DibBlit` (and
+`WinGFound=0` when the key is missing) but never `display.drv`
+(`SWSESET 1:623b`), so the shortcut needs one probe to have recorded
+`display.drv` and a non-zero `WinGFound`. Our host seeds what a probe
+followed by SWSESET's GDI choice leaves — `SYSTEM.INI [boot] display.drv`
+and `SWSE.INI [technology] display.drv`, `WinGFound=1`, `DibBlit=GDI`
+(profile seeds, never written out; `PACKAGES.md` §7.5) — and never installs
+WinG.
+
+With GDI, every "addressable canvas" is a packed 8-bit DIB drawn through
+**Windows 3.1's DIB driver**: `_GETCANVASDC` (`1:017a`) calls
+`CreateDC("DIB", NULL, NULL, lpPackedDIB)` (`1:01d7..1:01f6`), and creating
+the canvas fails without that DC (`1:0c63..1:0c73`). The packed DIB
+(`1:2052..1:2178`) is a bottom-up `BITMAPINFOHEADER`, a colour table of
+WORD indices 0..255 (a `DIB_PAL_COLORS` table) and the bits, e.g.
+`GlobalAlloc(0x2042, 0x4B428)` = 40 + 1024 + 640 × 480 for a full-screen
+canvas. SWSE draws into it with GDI (lines, text, regions, `SetROP2`,
+fills) and with its own USE32 blitters, and copies it to the window with
+`StretchDIBits(…, DIB_PAL_COLORS, …)`. Even the configure dialog's credits
+box uses canvases. `DIB.DRV` itself is never installed: the host implements
+the driver natively (`host/win16/README.md`, "The DIB driver").
+
+The palettes are identity copies built from the system palette's 20 static
+colours (`CREATEIDENTITYPALETTECOPY 1:42d2`); no module reaches
+`SetSystemPaletteUse(SYSPAL_NOSTATIC)`, `AnimatePalette` or `SetSysColors`.
+
+#### 3.8.7 STRESS's file-handle probe
+
+All 14 modules import `STRESS.8`, `GETFREEFILEHANDLES`, and refuse to start
+when it returns fewer than 10 (`cmp ax,0Ah` after the call: BATTLES
+`1:0b38`, BIOS `1:09f3`, BLUPRINT `1:08f5`, CANTINA `1:0a5d`, HYPERSPC
+`1:0bca`, ICLOCK `1:0661`, JAWAS `1:081c`, POSTERS `1:0a14`, RCLOCK
+`1:0617`, SABRDUEL `1:0645`, STORYBRD `1:09ba`, SWTEXT `1:0f4b`, TRENCH
+`1:0a4e`, VADER `1:08b7`). The routine (**VERIFIED `STRESS.DLL
+2:02b0..2:037a`**) calls `GetTempFileName(0, …, 0, buf)`, opens that file
+with `_lopen(buf, 0x40)` again and again until it fails, and at 256 handles
+calls `OutputDebugString("stress.dll: unable to obtain valid file handle
+count")` and executes **`int3`** (`2:030d..2:0317`); then it closes them
+all, deletes the file with `OpenFile(buf, OF_DELETE)` (`2:0364`) and
+returns the count. With `uUnique` = 0, Windows' `GetTempFileName` creates
+the file; a host whose `GetTempFileName` only formats the name makes every
+`_lopen` fail, the count 0 and every module show SWSE's "resources are too
+low" screen — what every module did on our host before this release. Ours
+creates the empty file (`host/win16/README.md`), and its DOS handle table
+(handles 5 to 254) keeps the count below the `int3`.
+
+#### 3.8.8 Sound and music (module side)
+
+`SWSE.INITSOUND` (`1:7016`) loads `swsfx.dll` by name and reads
+`[Intermission] Volume` of `ANTSW.INI` (default 50); 0 turns off effects
+**and** music, anything else sets `waveOutSetVolume` to `Volume × 595` per
+channel. `SOUNDPROC` (`1:71ee`) reads a `WAVE` resource of SWSFX through
+`AccessResource` + `_hread` and plays it with
+`sndPlaySound(SND_MEMORY|SND_ASYNC|SND_NODEFAULT [|SND_LOOP] [|SND_NOSTOP])`.
+Music: `PLAYMIDIFILE` (`1:6325`) opens `BATTLE.MID`, `CANTINA.MID`,
+`EMPIRE.MID` or `SWTHEME.MID` by bare name, loads it into
+`GlobalWire`/`GlobalPageLock`ed memory and hands it to MEMMIDI, which
+sequences it from a 4 ms periodic `timeSetEvent` callback issuing
+`midiOutShortMsg` to the MIDI Mapper (`MEMMIDI 1:0176`, `1:1222`). No module
+uses AD_SND or INTRMLIB's sound functions. How the host plays them is
+`AUDIO.md`.
+
+### 3.9 The After Dark 2.0 host (`AD.EXE` 2.0b) — VERIFIED
+
+Star Trek: The Screen Saver (Berkeley Systems, 1992; "After Dark, Version
+2.0b - The Star Trek Edition") shipped After Dark 2.0's own host, `AD.EXE`:
+an NE **application** ("After Dark Windows 2.0", 24 segments, importing only
+KERNEL, GDI, USER and KEYBOARD), which the Win16 runtime cannot run and the
+host replaces, as it replaces `AFTERDAR.SCR`. Its 16 modules are ordinary
+AD3 modules, exporting `MODULE`: 15 are Borland C++ modules of the
+`PortableModule` framework in `AD_MOD.DLL` (with `AD_RSRC.DLL`, a code
+library of 149 exports, not the resource-only `AD_RSRC.DLL` of AD 3.x and
+4.x), and Sounder is an MSVC module that imports only `AD_SND`. Everything in
+this section was verified on the release's own binaries, the pristine
+`AD.EXE` of its disk 2 (md5 `fb6448a8386a19d147b183b9fe13374f`; an installed
+copy carries its owner's name, `PACKAGES.md` §3): `research/win/nedis.py`
+listings in `research/win/pkg/startrek/lane/dis/` and
+`research/win/pkg/startrek/content/dis/`, and the lane survey's field-by-field
+comparison with OLDMOD16, `research/win/pkg/startrek/lane/abi_compare.json`
+(all gitignored). In the lane survey's research prototype the native AD3
+bridge (`PACKAGES.md` §7.4) and the real OLDMOD16 drew byte-identical streams
+for all 16 modules. How the ne16 lane runs them is `PACKAGES.md` §7.3.
+
+**The entry and the blocks.** The same PASCAL entry, `MODULE(msg, hdc,
+hADSystem)` (§3.4), found by name (`GetProcAddress(h, "Module")`,
+`13:1010`) and far-called as OLDMOD16 calls it. `AD_SYSTEM` is
+`GlobalAlloc(GMEM_MOVEABLE, 0x3C)` (`9:09ce`), filled as §3.3's but for:
+
+| Off | `AD.EXE` 2.0b | OLDMOD16 (§3.3) | Evidence |
+|---|---|---|---|
+| `+0x00` | 2 with `WF_ENHANCED`, 1 with `WF_STANDARD`, else 0 | 2 | `9:0a72..9:0a99` |
+| `+0x02` | the CPU, 0..4 from `GetWinFlags` | 3 or 4 | `9:0a18..9:0a6c` |
+| `+0x0A` | `max(BITSPIXEL, PLANES)` | `BITSPIXEL * PLANES` (the same 8 on the lane's display) | `9:0ad5..9:0afe` |
+| `+0x14` | **201** (`0xC9`) | **300** | `9:0b7a` |
+| `+0x16..+0x1C` | a rectangle, when one is set (`[0xbc]`) | 0 | `13:00ca..13:011a` |
+| `+0x28` | the multi-module mode, 0/1/2 (`AD_MOD.DLL` reads it, `9:04e6`) | 0 | `13:06bb..13:06eb` |
+| `+0x2A` | 1 at every blank start (`AD_MOD.DLL`'s `WantPalette` clears it) | `RC_PALETTE ? 1 : 0` (the same 1 on the lane's display) | `1:0bf4` |
+
+"BUTTHEAD" is at `+0x2C`, one character per WORD, written just before
+PREINITIALIZE (`13:09ac..13:09f2`). `AD_MODULE` is 0x22 bytes, one for each
+of eight multi-module records (`9:0bff`); OLDMOD16's 0x30-byte block is a
+superset. The modules write `iControlID` 1..4 and their instance at `+0x16`
+themselves at SELECTED. The release's one module that checks the version,
+Sounder, wants `+0x14` ≥ 200 and "B"/"H" at `+0x2C`/`+0x34`
+(`SOUNDER.AD 1:0095`, the check Hard Rain makes, §3.3), else it shows
+"Module requires After Dark (AD.EXE) v2.0 or later.", so the native
+bridge's 300 serves, and it keeps 300 for every module.
+
+**Messages**, numbered as §3.4. SELECTED 5 when a module is chosen
+(`13:05c2`); PREINITIALIZE 12 before blanking, its result ignored
+(`13:098b`); at the blank's start `adwSavePreviousVolume()` (`1:0c58`),
+then INITIALIZE 0 (`13:0000`) and, when that returned 0 or 10 or more,
+BLANK 1 (`13:02b9`); DRAWFRAME 2 on every idle pass (`13:0376`); at the
+wake CLOSE 3 (`13:046f`), then `adwRestorePreviousVolume()` (`1:08b2`);
+ABOUT 6 (`13:07c4`, with the region size at `AD_MODULE+0x02`/`+0x04` set
+to 0xFB × 0x110, `13:0815`), which no Deluxe host sends; BUTTON 7 + n
+(`13:08bd`).
+
+**Results** (the handler `13:0aca`, dispatching at `13:0c1f` through the
+table at `13:0c24`):
+
+| Result | `AD.EXE` 2.0b | The ne16 lane (`PACKAGES.md` §7.3) |
+|---|---|---|
+| 0, 2 | carry on | 0 carries on; 2 ends the run as the module's error, as AFTERDAR.SCR took it (§3.1) |
+| 3 | RESTART: INITIALIZE, then BLANK when that returned 0 or 10 or more (`13:0bcd`) | OLDMOD16's RESTART (§3.3). The release's modules handle their own restart inside `MODULE` (Final Exam re-creates its module object, `FINAL.AD 4:03a8`), so none returns 3 |
+| 5 | the module's wake: `PostMessage(main window, 0x7EE, 0, 0)`, the host's own wake message (`13:0be3`) | the module's wake: the status's `ADWS_WAKE` (`INTERACTION.md` §3.4, §5.2) |
+| 10–13 | a palette request: the palette is built in code (below) and selected | the bridge's palette request; with no palette, 7 |
+| 14 (`0x0E`) | toggles game mode (`[0x5412]`, `13:0bf7`), in which `AD_LIB.DLL`'s hook passes every key | toggles "wants events" (§3.1) |
+| 1, 4, 6–9, 15 | a message: 4 "Could not find module!", 6 "Insufficient memory to load module.", 8 "No modules selected to run!", 7 and 15 the module's own error text; 1, 7, 8 and 9 also close the module, and 1 hands over to `AD.EXE`'s built-in module | the module's error, ending the run |
+
+Only 0, `0x0E` and 5 occur in the release, and 5 only from Final Exam, when
+a mouse move ends its exam (`INTERACTION.md` §1.7).
+
+**Palettes.** After Dark 2.0 stores none: `AD_RSRC.DLL` 2.0b has no
+resources at all, and `AD.EXE`'s resource 5000/1, where ADTASK keeps its
+palettes, is 128 zero bytes. For results 10–13 the handler `13:2589`
+builds a 235-entry `LOGPALETTE` (version 0x300, `peFlags` 1) in code: 10 a
+hue sweep (`13:1eb6`: `h = 0x217 + 0x11D·i`, full saturation and value,
+through the HSV routine `13:1c1b`), 11 a 6×6×6 cube of the levels 255,
+204, 153, 102, 51 and 0 (DGROUP `0x2514`) followed by 19 greys (255, then
+12 upward in steps of 13; `13:2390`), 12 a grey ramp (`13:2265`), 13 seven
+ramps, six of 34 entries and a last one of 31 (`13:2002`); then
+`CreatePalette`, `SelectPalette` and `RealizePalette`, and `AD_MODULE+0x18`/
+`+0x1A` set (`13:2620`). Recomputed from the listing
+(`research/win/pkg/startrek/lane/tools/ad2pal.py`), the four are byte for
+byte ADTASK.DLL's 5000/1..4 and AFTERDAR.SCR's `AD_PALETTE` 102/104/101/103,
+so the mapping of §3.3 holds for After Dark 2.0 too. No module of the
+release makes a palette request (each builds its own palettes through
+`AD_RSRC.DLL`; 0 requests in every traced run), so the host computes none.
+
+**Sound: AD_SND 1.0.** The release's `AD_SND.DLL` ("AfterDark Sound DLL
+Module"; `adwSoundDllVer`, ordinal 32, answers "V1.0"; 44 entries, 33 of
+them named) exports five of the seven entries OLDMOD16 requires (§3.3),
+`adwSoundInit`, `adwSoundCleanup`, `adwSetVolume`, `adwSetSoundMute` and
+`adwStopSound`, with the argument sizes of AD_SND 3.x, but neither
+`adwGetSystemVolumes` nor `adwSetSystemVolumes`. Its volume pair is
+`adwSavePreviousVolume()` (ordinal 20, `1:11b6`) and
+`adwRestorePreviousVolume()` (ordinal 10, `1:1208`), which take no
+arguments, and which `AD.EXE` calls where OLDMOD16 calls the other pair
+(above). `AD.EXE` resolves 17 AD_SND names (DGROUP `0x0db5..0x0eaf`) and
+calls `adwSoundInit(hwnd, buf)` once, at start-up (`9:1493`). AD_SND 1.0
+plays through a plug-in sound driver that `AD_PREFS.INI` names
+(`AUDIO.md` §2.12). The native bridge takes this pair when the other is
+missing (`PACKAGES.md` §7.4).
+
+**What else was `AD.EXE`'s.** It loaded `AD_LIB.DLL`, whose journal hook
+woke the saver (its exemptions are `INTERACTION.md` §1.7), and ran its
+built-in Starry Night 2.0, Randomizer and MultiModule (its 1000 and 2000
+resources describe them; it exports no `MODULE`, so the catalog never
+lists them). The installer wrote the owner's name, company and serial
+number into three 128-byte slots of `AD.EXE` (resource type 3000, ids 1–3),
+which it showed after "Serial# %s registered to"; the modules' About texts
+end with the stand-in for that line, "Berkeley Systems Authorized User."
+(`PACKAGES.md` §6).
+
 ---
 
 ## 4. Surprises (all VERIFIED unless marked)
@@ -996,6 +1479,10 @@ All under `research/win/` (gitignored), run with `research/win/venv`
 | `api_surface.py` | renders `docs/API_SURFACE.md` |
 | `make_catalog.py` | catalog prototype → `catalog-win.json` |
 | `peutil.py` | read dwords/strings at a VA |
+| `pkg/swse/survey/proto/nedis_named.py`, `entrydis.py`, `ini_sites.py`, `api_ranges.py` | §3.8: `nedis.py` listings of Intermission's and Star Wars Screen Entertainment's binaries with the disc's private DLL ordinals named (`pkg/swse/dis/*.named.asm`); an export disassembled from its entry point (every module's `SAVERINIT`, …); the profile calls per site (section, key, default); the API calls per engine path |
+| `pkg/swse/survey/swdis.py`, `fsum.py` | §3.8: annotated listings of the 14 modules and their DLLs (`pkg/swse/dis/*.ann.asm`: sibling-DLL imports by name, string notes); a per-function call summary |
+| `pkg/startrek/tools/kwaj.py` | §3.9: the reference KWAJ expander (`PACKAGES.md` §8.8), which unpacks Star Trek: The Screen Saver's disks into `pkg/startrek/extracted/expanded/` for `nedis.py` (listings in `pkg/startrek/lane/dis/` and `pkg/startrek/content/dis/`) |
+| `pkg/startrek/lane/tools/ad2pal.py`, `neinv.py`, `impcheck.py` | §3.9: After Dark 2.0's four palettes recomputed from `AD.EXE`'s code and compared with ADTASK's and AFTERDAR.SCR's (`lane/ad2pal.json`); the release's NE imports and exports (`lane/neinv.json`); every import checked against the Win16 runtime's shims (`lane/impcheck.json`) |
 
 ---
 
@@ -1018,7 +1505,7 @@ All under `research/win/` (gitignored), run with `research/win/venv`
 | Settings in `AFTERDRK.INI`/`MODULES.INI` keys `Control0..3` | Partly: AD4 host uses the **registry** (`Control0..3` 0-based); the INIs hold engine/module-private prefs |
 | "Recreate `[Berkeley Systems] AD Data Files`/`AD Ini Files`" | VERIFIED (`AD_BuildFilePath`) |
 | AD3 `AD_SYSTEM` 0x2C bytes, `AD_MODULE` 0x22 bytes | OLDMOD16 allocates 0x3C / 0x30 and writes up to `+0x3A` / `+0x2E`; the extra words are "BUTTHEAD" |
-| AD3 messages INITIALIZE 0, BLANK 1, DRAWFRAME 2, CLOSE 3, MODULESELECTED 5, ABOUT 6, BUTTON 7–10, PREINITIALIZE 12 | VERIFIED except ABOUT (6) |
+| AD3 messages INITIALIZE 0, BLANK 1, DRAWFRAME 2, CLOSE 3, MODULESELECTED 5, ABOUT 6, BUTTON 7–10, PREINITIALIZE 12 | VERIFIED except ABOUT (6), which After Dark 2.0's `AD.EXE` was later found to send (§3.9) |
 
 ---
 
@@ -1037,6 +1524,29 @@ research/win/venv/Scripts/python research/win/spinwait.py      # needs the dis/ 
 `<FILES>` = `%LOCALAPPDATA%\LongAfterDark\assets\win\FILES` (or
 `AD_ASSETS_DIR\win\FILES`), where the importer puts the Deluxe disc. The tools only read the binaries; nothing is
 executed. Listings, JSON outputs and the catalog stay in `research/win/`.
+
+For §3.8, `<SW>` is the folder holding the file named: the research
+extraction `research/win/pkg/swse/extracted/arj` has them all, and an
+import puts `INTERMIS.EXE` and `IMIMXPLY.IMQ` in `packages\swse\ENGINE` and
+the rest in `packages\swse\SAVER`:
+
+```
+S=research/win/pkg/swse/survey
+research/win/venv/Scripts/python $S/proto/nedis_named.py <SW>/INTERMIS.EXE research/win/pkg/swse/dis/INTERMIS.EXE.named.asm
+research/win/venv/Scripts/python $S/proto/entrydis.py <SW>/VADER.IMX SAVERINIT,SAVERDRAW
+research/win/venv/Scripts/python $S/swdis.py <SW>/SWSE.DLL <SW>/VADER.IMX     # -> research/win/pkg/swse/dis/<FILE>.ann.asm
+```
+
+For §3.9, `<ST>` is the folder holding the expanded files: the research
+expansion `research/win/pkg/startrek/extracted/expanded/by_target_name` has
+them all, and an import puts `AD.EXE` and `AD_SND.DLL` in
+`packages\startrek\ENGINE` and the rest in `packages\startrek\AFTERDRK`:
+
+```
+research/win/venv/Scripts/python research/win/nedis.py <ST>/AD.EXE research/win/pkg/startrek/lane/dis/AD.EXE.asm
+research/win/venv/Scripts/python research/win/nedis.py <ST>/AD_SND.DLL research/win/pkg/startrek/lane/dis/AD_SND.DLL.asm
+research/win/venv/Scripts/python research/win/pkg/startrek/lane/tools/ad2pal.py     # -> research/win/pkg/startrek/lane/ad2pal.json
+```
 
 The review tools (§8) need no listings:
 
@@ -1082,9 +1592,10 @@ result mapping (`0x401f6f..0x40208e`) and palette requests (`1:0be0`,
 `1:0c6c`).
 
 Still **UNVERIFIED-LEAD** or inference after this review: AD3 message 6
-(ABOUT); whether the AD 3 control panel read a numeric default as a 0..100
-position; that the Win95 KERNEL itself called `DLLENTRYPOINT` for 4.0 DLLs
-(irrelevant once our loader calls it); that Win16 name lookup upper-cases
-(only case-insensitivity is required); the 18.2 ticks/s reading of the
-calibration constants; writers of `+0x008` bits 1/2 (none found statically);
-kind-2 `+0x34`.
+(ABOUT; since then seen sent by After Dark 2.0's `AD.EXE` and handled by
+its modules, §3.9); whether the AD 3 control panel read a numeric default
+as a 0..100 position; that the Win95 KERNEL itself called `DLLENTRYPOINT`
+for 4.0 DLLs (irrelevant once our loader calls it); that Win16 name lookup
+upper-cases (only case-insensitivity is required); the 18.2 ticks/s
+reading of the calibration constants; writers of `+0x008` bits 1/2 (none
+found statically); kind-2 `+0x34`.

@@ -234,7 +234,7 @@ AssetCounts count_assets(const Catalog& c, const std::vector<bool>& present) {
 }
 
 std::wstring assets_summary(const AssetCounts& a) {
-  if (a.total == 0) return L"After Dark isn’t imported yet";
+  if (a.total == 0) return L"Nothing imported yet";
   std::wstring t = std::to_wstring(a.total) + (a.total == 1 ? L" module" : L" modules");
   if (a.releases > 1) t += L" from " + std::to_wstring(a.releases) + L" releases";
   else if (!a.release.empty()) t += L" from " + widen(a.release);
@@ -244,9 +244,13 @@ std::wstring assets_summary(const AssetCounts& a) {
 }
 
 std::wstring welcome_text() {
-  return L"The screen saver runs the original After Dark modules from your own discs.\n\n"
-         L"Import them from any of your After Dark discs (five releases are supported), a disc image, or the "
-         L"Internet Archive download. They are copied to your computer once; nothing else is needed.";
+  // Seven releases, one of them not After Dark's: the product name stays
+  // "Long After Dark", the releases are named for what they are. (Star Trek:
+  // The Screen Saver is After Dark 2.0b, on floppies: "discs" covers them.)
+  return L"The screen saver runs the original modules of After Dark and Star Wars Screen Entertainment from your "
+         L"own discs.\n\n"
+         L"Import them from any of your discs (seven releases are supported), a disc image, or the Internet Archive "
+         L"download. They are copied to your computer once; nothing else is needed.";
 }
 
 // ---- string-slider stops ---------------------------------------------------------
@@ -338,6 +342,57 @@ int focus_px(int dpi) { return std::max(3, (int)std::lround(3.0 * dpi / 96.0)); 
 
 bool blank_label(const std::string& name) {
   return std::all_of(name.begin(), name.end(), [](char ch) { return ch == ' ' || ch == ':' || ch == '\t'; });
+}
+
+// ---- the module list's group headers ------------------------------------------------
+
+std::wstring ellipsize(const std::wstring& text, int room, const std::function<int(const std::wstring&)>& measure) {
+  if (measure(text) <= room) return text;
+  // The first n characters (never half a surrogate pair), without trailing
+  // spaces, and the ellipsis.
+  auto cut = [&](size_t n) {
+    if (n > 0 && n < text.size() && text[n - 1] >= 0xD800 && text[n - 1] <= 0xDBFF) --n;
+    std::wstring s = text.substr(0, n);
+    while (!s.empty() && s.back() == L' ') s.pop_back();
+    return s + L"…";
+  };
+  if (measure(cut(0)) > room) return L"";
+  // cut(lo) fits and cut(hi) doesn't (the whole text didn't, so neither
+  // does the whole text with an ellipsis): the longest start that fits.
+  size_t lo = 0, hi = text.size();
+  while (lo + 1 < hi) {
+    const size_t mid = lo + (hi - lo) / 2;
+    if (measure(cut(mid)) <= room) lo = mid;
+    else hi = mid;
+  }
+  return cut(lo);
+}
+
+GroupHeaderLayout layout_group_header(const GroupHeaderInput& in,
+                                      const std::function<int(const std::wstring&)>& measure_title) {
+  GroupHeaderLayout L;
+  // The count and the pill are placed first; the title has what is left.
+  int limit = in.right;
+  if (in.pill_w > 0) {
+    L.pill_x = in.pill_right - in.pill_w;
+    limit = std::min(limit, L.pill_x - in.gap);
+  }
+  const int room = limit - in.left - in.gap - in.count_w;
+  L.title = ellipsize(in.title, room, measure_title);
+  L.ellipsized = L.title != in.title;
+  L.title_w = L.title.empty() ? 0 : measure_title(L.title);
+  L.count_x = in.left + L.title_w + (L.title.empty() ? 0 : in.gap);
+  return L;
+}
+
+GroupHeaderInput group_header_frame(int list_w, int dpi, bool random, bool scrolls) {
+  GroupHeaderInput in;
+  // Each length rounded on its own, as the dialog's Theme::px does them.
+  in.left = dip(16, dpi) + (random ? dip(kListBoxDip, dpi) + dip(12, dpi) : 0);
+  in.right = list_w - dip(16, dpi);
+  in.gap = dip(8, dpi);
+  in.pill_right = list_w - dip(scrolls ? 12 : 4, dpi) - dip(8, dpi);
+  return in;
 }
 
 // ---- the box-cover strip ---------------------------------------------------------------
@@ -573,6 +628,26 @@ WindowLayout layout_window(const LayoutInput& in) {
   const double ax = x0 + 112 + 12;
   L.assets = s.rc(ax, H - kFooterH + 12, (right - 2 * bw - 8 - 24 - 120 - 24) - ax, kFooterH - 24);
   return L;
+}
+
+FooterCreditLayout layout_footer_credit(const WindowLayout& L, const FooterCreditInput& in) {
+  FooterCreditLayout C;
+  const int dpi = L.dpi;
+  const int gap = dip(kCreditGapDip, dpi), pad = dip(kLinkPad, dpi), box_h = dip(kCreditLinkHDip, dpi);
+  if (in.lead_w <= 0 || in.name_w <= 0 || in.line_h <= 0 || L.preview_button.empty()) return C;
+  const int text_w = in.lead_w + std::max(0, in.space_w) + in.name_w;
+  const int box_w = pad + text_w + pad;
+  const int left = in.assets_right + gap, right = L.preview_button.x - gap;
+  if (right - left < box_w) return C;
+  // Centred in the free space, and on the footer's buttons.
+  const int x = left + (right - left - box_w) / 2;
+  const int cy = L.preview_button.y + L.preview_button.h / 2;
+  const int ty = cy - in.line_h / 2;
+  C.shown = true;
+  C.box = Rc{x, cy - box_h / 2, box_w, box_h};
+  C.lead = Rc{x + pad, ty, in.lead_w, in.line_h};
+  C.name = Rc{x + pad + in.lead_w + std::max(0, in.space_w), ty, in.name_w, in.line_h};
+  return C;
 }
 
 PanelLayout layout_panel(const std::vector<Control>& controls, int width, int dpi, int note_h,

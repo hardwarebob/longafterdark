@@ -3,7 +3,11 @@
 // fixture and the generated catalog must both load) and strict about the
 // ones the saver cannot run without (id, path). The release fields
 // (`package`, `packageTitle`, `moduleName`, `sameAs`, the top-level `packages`
-// with each release's `cover`) are all optional (COVERS.md §1.10).
+// with each release's `cover`) are all optional (COVERS.md §1.10), and so are
+// `abi`, the module ABI when it is not After Dark's ("intermission" for Star
+// Wars Screen Entertainment's IMX modules; absent = "afterdark"), and
+// `screen`, the fixed screen of a module that composes a scene of that size
+// ("640x480" for Star Trek: The Screen Saver's; absent = none).
 //
 // Control shapes, as the generator (adimport, importer/catalog.h;
 // ABI.md §2.10)
@@ -20,7 +24,17 @@
 #include <string>
 #include <vector>
 
+#include "geometry.h"
+
 namespace adw::scr {
+
+// The module ABI a catalog entry without "abi" has, and the one every host
+// runs (a host whose --capabilities lists no "abis=" runs this one alone).
+inline constexpr char kAfterDarkAbi[] = "afterdark";
+// Star Wars Screen Entertainment's IMX modules (Delrina's Intermission
+// engine, lane ne16). Their emulated screen is their own 640x480
+// (geometry.h: module_screen).
+inline constexpr char kIntermissionAbi[] = "intermission";
 
 enum class ControlType { slider, checkbox, popup, button, unknown };
 
@@ -60,6 +74,20 @@ struct Module {
   std::string id;
   std::string display_name;
   std::string lane;                // "pe32" | "ne16"
+  // The module ABI, which a host must list (--capabilities abis=) to run it:
+  // "afterdark", or "intermission" (an IMX module; lane ne16). Never empty.
+  std::string abi = kAfterDarkAbi;
+  // The screen the catalog gives it ("screen": "WxH", PACKAGES.md §6): a
+  // module shown at a fixed size (Star Trek: The Screen Saver's, 640x480,
+  // some of which compose a fixed scene) gets that screen whatever the display and the
+  // Resolution setting, scaled to fit, as an Intermission module gets its
+  // 640x480 by its ABI (geometry.h: own_screen, module_screen). {0, 0} when
+  // the entry has none, or one this saver can't use: not "<w>x<h>" with 1 to
+  // 5 decimal digits either side of the x (or X; leading zeros count, so
+  // "000640x480" is none, and no axis can overflow), an axis outside
+  // 1..8192 or more than 4096x4096 pixels in all (no frame the stream parser
+  // reads back, frame_parser.h).
+  SizeI screen;
   std::string path;                // relative to <assets>\win, forward slashes
   std::string about;
   std::string credits;             // Classic modules: the credits line (AD4 ones carry theirs in `about`)

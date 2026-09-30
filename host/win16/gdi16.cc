@@ -7,17 +7,40 @@
 //     is sync()ed (brush/pen re-made for its palette, text colours keyed)
 //     before real GDI draws with it;
 //   * every Win16 surface holds hardware palette indices (Win16 has no DIB
-//     sections), so blits between them are plain real BitBlt/StretchBlt;
+//     sections), so blits between them are plain real BitBlt/StretchBlt —
+//     except a DIB driver DC's (CreateDC("DIB"), gdi16.hh) and a memory DC
+//     made compatible with one, whose pixel values are that DIB's own
+//     indices: colours reach them through Gdi16::dib_index (DIB.DRV's
+//     matching), and blits still copy values unchanged;
 //   * device-independent bits (SetDIBitsToDevice, StretchDIBits, SetDIBits,
 //     CreateDIBitmap) are translated to hardware indices first — through the
-//     DC's palette, as a Win95 palette device matched them — and handed to
-//     real GDI as an 8bpp DIB with the key table, so real GDI still does the
-//     geometry (clipping, mirroring, stretching, ROPs);
+//     DC's palette, as a Win95 palette device matched them; on a DC with DIB
+//     colour semantics as DIB.DRV translated between two colour tables — and
+//     handed to real GDI as an 8bpp DIB with the key table, so real GDI still
+//     does the geometry (clipping, mirroring, stretching, ROPs); into a
+//     monochrome bitmap (SetDIBits, CreateDIBitmap, and SetDIBitsToDevice or
+//     StretchDIBits on a memory DC holding one) real GDI gets the DIB's own
+//     colour table instead (real_bmi) and applies its own rule: 1 only for
+//     the table's entry nearest white (the first of equal ones), 0 for every
+//     other entry (with the key table only index 255 would be 1: Star Trek's
+//     masks came out black);
 //   * colours read back (GetPixel, GetDIBits, GetNearestColor) are converted
 //     from indices to what they mean.
 //
-// Known gaps, deliberately left (no module of the 202 in the five releases
-// needs more; API_SURFACE.md §2 GDI):
+// No module of the corpus draws DIB bits onto a DIB DC, or onto a memory DC
+// compatible with one, nor asks one for GetNearestColor (the 14 SWSE modules
+// traced): those branches are held by win16.unit's test_dib_translation, not
+// by any module's stream.
+//
+// Known gaps, deliberately left (no module of the 202 in the five releases,
+// nor Star Wars Screen Entertainment's 14, needs more; API_SURFACE.md §2 GDI):
+//   * the DIB driver takes 8-bit DIBs only (DIB.DRV also took 1 and 4 bits
+//     per pixel: refused and logged). On a DIB DC whose colour table is
+//     RGBQUADs (SWSE's canvases hold index tables) a DIB pattern brush keeps
+//     its indices, and DIB bits with an RGB table always go to their nearest
+//     entries; DIB.DRV matched the pattern's colours too, and kept the
+//     indices when the two tables were equal (it differs where a table
+//     repeats a colour).
 //   * EnumFonts calls nothing back (MESSAGE3 only).
 //   * GetDIBits writes 8- and 24-bit rows from 8-bit bitmaps and defers mono
 //     bitmaps to real GDI; 4-bit requests are refused. With DIB_PAL_COLORS it
@@ -108,12 +131,38 @@ bool read_dib(Runtime16& rt, uint32_t bmi, uint16_t usage, Dib16& d) {
   return d.w > 0 && d.height > 0 && d.w <= 16384 && d.height <= 16384;
 }
 
-// Colour index of a DIB → hardware index when drawn through `hdc`.
+// Colour index of a DIB → hardware index when drawn through `hdc` — or, on
+// a DC with DIB colour semantics (a DIB DC), → that DIB's pixel value.
 std::array<uint8_t, 256> dib_xlate(Gdi16& g, const Dib16& d, uint16_t usage, uint16_t hdc) {
   std::array<uint8_t, 256> x{};
   Display& disp = g.display();
   LogicalPalette* pal = g.dc_palette(hdc);
   size_t n = usage == DIB_PAL_COLORS ? d.pal.size() : d.colors.size();
+  if (Dc16* dc = g.dc(hdc); dc && dc->dib_header) {
+    // DIB.DRV's translation between two colour tables (1:0653): the identity
+    // when the destination has an index table (SWSE's canvases) or none, or
+    // the source's is an identity index table; else each source colour's
+    // nearest entry. A DIB_PAL_COLORS source's colours are its indices'
+    // entries in the DC's palette, as GDI gave a non-palette device RGBs.
+    bool src_identity = usage == DIB_PAL_COLORS;
+    for (size_t i = 0; i < d.pal.size() && src_identity; i++) src_identity = d.pal[i] == i;
+    bool identity = src_identity || g.dib_table(dc->dib_header).vga;
+    for (size_t i = 0; i < 256; i++) {
+      if (identity || i >= n) {
+        x[i] = uint8_t(identity ? i : 0);
+        continue;
+      }
+      COLORREF rgb;
+      if (usage == DIB_PAL_COLORS) {
+        size_t e = d.pal[i];
+        rgb = pal && e < pal->entries.size() ? RGB(pal->entries[e].peRed, pal->entries[e].peGreen, pal->entries[e].peBlue) : 0;
+      } else {
+        rgb = RGB(d.colors[i].rgbRed, d.colors[i].rgbGreen, d.colors[i].rgbBlue);
+      }
+      x[i] = uint8_t(g.dib_index(*dc, rgb));
+    }
+    return x;
+  }
   for (size_t i = 0; i < 256; i++) {
     if (i >= n) {
       x[i] = 0;
@@ -194,12 +243,14 @@ std::vector<uint8_t> dib_to_indices(Runtime16& rt, Gdi16& g, const Dib16& d, uin
   const uint8_t* src = rt.mem().at<uint8_t>(lin, size_t(d.stride) * lines);
   Display& disp = g.display();
   LogicalPalette* pal = g.dc_palette(hdc);
+  Dc16* dib_dc = g.dc(hdc);
+  if (dib_dc && !dib_dc->dib_header) dib_dc = nullptr;
   std::unordered_map<uint32_t, uint8_t> cache;
   auto deep = [&](uint8_t r, uint8_t gg, uint8_t b) {
     uint32_t k = RGB(r, gg, b);
     auto it = cache.find(k);
     if (it != cache.end()) return it->second;
-    uint8_t v = uint8_t(disp.device_index_for_rgb(k, pal));
+    uint8_t v = uint8_t(dib_dc ? g.dib_index(*dib_dc, k) : disp.device_index_for_rgb(k, pal));
     cache[k] = v;
     return v;
   };
@@ -253,6 +304,42 @@ KeyBmi key_bmi(const Dib16& d) {
   return b;
 }
 
+// The BITMAPINFO real GDI gets for a DIB's own bits into a monochrome target:
+// the DIB's colours (a DIB_PAL_COLORS table's entries as the DC's palette maps
+// them). Real GDI then sets to 1 only the pixels of the table's entry nearest
+// white (the first of equal ones) and every other entry to 0, however light
+// (beside a white, yellow and light grey are 0; test_mono_dib_targets). The
+// key table would not do: its entry i is the grey RGB(i, i, i), so only
+// hardware index 255 would be 1 (a white that the selected palette holds at
+// slot 24 would come out black).
+struct RealBmi {
+  BITMAPINFOHEADER h;
+  RGBQUAD c[256];
+};
+RealBmi real_bmi(Gdi16& g, const Dib16& d, uint16_t hdc) {
+  RealBmi bi{};
+  bi.h = d.h;
+  bi.h.biSize = sizeof(BITMAPINFOHEADER);
+  for (size_t i = 0; i < d.colors.size() && i < 256; i++) bi.c[i] = d.colors[i];
+  for (size_t i = 0; i < d.pal.size() && i < 256; i++) {
+    COLORREF c = g.index_rgb(g.display().map_index(0x01000000 | d.pal[i], g.dc_palette(hdc)));
+    bi.c[i] = RGBQUAD{GetBValue(c), GetGValue(c), GetRValue(c), 0};
+  }
+  return bi;
+}
+
+// A memory DC whose selected bitmap is monochrome (and an uncompressed DIB
+// for it): SetDIBitsToDevice and StretchDIBits hand real GDI the DIB's own
+// bits and colours there (real_bmi) instead of hardware indices. Star Trek's
+// AD_MOD.DLL makes its masks so: Scotty's Files' blueprints are 1-bpp DIBs,
+// white on black, stretched into monochrome bitmaps.
+bool mono_target(Gdi16& g, uint16_t hdc, const Dib16& d) {
+  Dc16* dc = g.dc(hdc);
+  if (!dc || dc->screen || dc->dib_device || dc->dib_header || d.h.biCompression != BI_RGB) return false;
+  Obj16* b = dc->s.bitmap ? g.get(dc->s.bitmap, G16::bitmap) : nullptr;
+  return b && b->bmp.bpp == 1;
+}
+
 // Writes translated DIB rows into an 8-bit device bitmap (SetDIBits, CreateDIBitmap).
 int set_bitmap_rows(Runtime16& rt, Gdi16& g, Obj16& bmp, uint16_t hdc, uint16_t start, uint16_t lines, uint32_t bits,
                     const Dib16& d, uint16_t usage) {
@@ -260,17 +347,7 @@ int set_bitmap_rows(Runtime16& rt, Gdi16& g, Obj16& bmp, uint16_t hdc, uint16_t 
     // A monochrome target: hand real GDI the DIB with real colours.
     std::vector<uint8_t> raw(size_t(d.stride) * lines);
     rt.read_bytes(bits, raw.data(), raw.size());
-    struct {
-      BITMAPINFOHEADER h;
-      RGBQUAD c[256];
-    } bi{};
-    bi.h = d.h;
-    bi.h.biSize = sizeof(BITMAPINFOHEADER);
-    for (size_t i = 0; i < d.colors.size() && i < 256; i++) bi.c[i] = d.colors[i];
-    for (size_t i = 0; i < d.pal.size() && i < 256; i++) {
-      COLORREF c = g.index_rgb(g.display().map_index(0x01000000 | d.pal[i], g.dc_palette(hdc)));
-      bi.c[i] = RGBQUAD{GetBValue(c), GetGValue(c), GetRValue(c), 0};
-    }
+    RealBmi bi = real_bmi(g, d, hdc);
     HDC screen = GetDC(nullptr);
     int r = SetDIBits(screen, static_cast<HBITMAP>(bmp.host), start, lines, raw.data(),
                       reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS);
@@ -342,18 +419,18 @@ HRGN region_of(Gdi16& g, uint16_t h) { return static_cast<HRGN>(g.get(h, G16::re
 
 }  // namespace
 
-uint16_t gdi16_bitmap_from_dib(Runtime16& rt, uint16_t hdc, uint32_t packed) {
+uint16_t gdi16_bitmap_from_dib(Runtime16& rt, uint16_t hdc, uint32_t packed, uint16_t usage) {
   Gdi16& g = gt(rt);
   Dib16 dib;
-  if (!read_dib(rt, packed, DIB_RGB_COLORS, dib)) return 0;
+  if (!read_dib(rt, packed, usage, dib)) return 0;
   uint32_t hsize = rt.rd32(packed);
-  size_t ncol = dib.colors.size();
   bool core = hsize == sizeof(BITMAPCOREHEADER);
-  uint32_t bits = packed + hsize + uint32_t(ncol * (core ? 3 : 4));
+  size_t ncol = usage == DIB_PAL_COLORS ? dib.pal.size() : dib.colors.size();
+  uint32_t bits = packed + hsize + uint32_t(ncol * (usage == DIB_PAL_COLORS ? 2 : core ? 3 : 4));
   if (dib.h.biCompression == BI_BITFIELDS && !core) bits += 12;
-  uint16_t hb = g.create_device_bitmap(dib.w, dib.height, dib.h.biBitCount == 1 && ncol == 2 ? 1 : 8);
+  uint16_t hb = g.create_device_bitmap(dib.w, dib.height, dib.h.biBitCount == 1 && ncol == 2 && usage != DIB_PAL_COLORS ? 1 : 8);
   Obj16* o = g.get(hb, G16::bitmap);
-  if (o) set_bitmap_rows(rt, g, *o, hdc, 0, uint16_t(dib.height), bits, dib, DIB_RGB_COLORS);
+  if (o) set_bitmap_rows(rt, g, *o, hdc, 0, uint16_t(dib.height), bits, dib, usage);
   return hb;
 }
 
@@ -364,15 +441,31 @@ void register_gdi16(Runtime16& rt) {
 
   // ---- DCs ----
   r.impl(G, "CreateCompatibleDC", [](Call16& c) {
-    c.w();
-    c.ret(gt(c).create_memory_dc());
+    uint16_t like = c.w();
+    Gdi16& g = gt(c);
+    uint16_t h = g.create_memory_dc();
+    // Compatible with a DIB DC: the DIB device's memory DC, whose pixel
+    // values mean that DIB's colour table too.
+    Dc16* src = g.dc(like);
+    if (Dc16* d = g.dc(h); d && src && src->dib_header) {
+      d->dib_header = src->dib_header;
+      g.sync(h);
+    }
+    c.ret(h);
   });
+  // CreateDC(driver, device, output, lpInitData): "DISPLAY", a screen DC;
+  // "DIB" (or "DIB.DRV"), the DIB driver over the packed DIB lpInitData
+  // points to (gdi16.hh). Any other driver: 0.
   r.impl(G, "CreateDC", [](Call16& c) {
     std::string driver = c.rt.read_str(c.ptr());
     c.ptr();
     c.ptr();
-    c.ptr();
-    c.ret(ieq16(driver, "DISPLAY") ? gt(c).create_screen_dc(0) : 0);
+    uint32_t init = c.ptr();
+    Gdi16& g = gt(c);
+    if (ieq16(driver, "DISPLAY")) return c.ret(g.create_screen_dc(0));
+    if (ieq16(driver, "DIB") || ieq16(driver, "DIB.DRV")) return c.ret(g.create_dib_dc(init));
+    trace("dib16", "CreateDC(\"%s\"): no such driver", driver.c_str());
+    c.ret(0);
   });
   r.impl(G, "CreateIC", [](Call16& c) {
     std::string driver = c.rt.read_str(c.ptr());
@@ -420,9 +513,12 @@ void register_gdi16(Runtime16& rt) {
     c.ret_bool(ok);
   });
   r.impl(G, "GetDeviceCaps", [](Call16& c) {
-    c.w();
+    uint16_t hdc = c.w();
     int16_t idx = c.sw();
-    c.ret(uint16_t(gt(c).display().device_caps(idx)));
+    Gdi16& g = gt(c);
+    Dc16* d = g.dc(hdc);
+    if (d && d->dib_device) return c.ret(uint16_t(g.dib_device_caps(*d, idx)));
+    c.ret(uint16_t(g.display().device_caps(idx)));
   });
 
   // ---- objects ----
@@ -519,12 +615,56 @@ void register_gdi16(Runtime16& rt) {
         }
         if (!g.get(bmp, G16::bitmap)) return c.ret(0);
         uint16_t h = g.create_brush(0, BS_PATTERN);
-        if (Obj16* o = g.get(h, G16::brush)) o->pattern = bmp;
+        if (Obj16* o = g.get(h, G16::brush)) {
+          o->pattern = bmp;
+          // The DIB's bitmap is the brush's own (BS_PATTERN's is the guest's).
+          if (lb.lbStyle == BS_DIBPATTERN) g.get(bmp)->pattern_of = h;
+        } else if (lb.lbStyle == BS_DIBPATTERN) {
+          g.destroy(bmp);  // no brush (the table is full): nor its bitmap
+        }
         return c.ret(h);
       }
       default:
         return c.ret(g.create_brush(lb.lbColor));
     }
+  });
+  // CreateHatchBrush(style, colour): HS_* over the DC's background (BIOS,
+  // BLUPRINT, CANTINA, POSTERS, STORYBRD hatch the panel behind their text).
+  r.impl(G, "CreateHatchBrush", [](Call16& c) {
+    int16_t style = c.sw();
+    uint32_t color = c.l();
+    c.ret(gt(c).create_brush(color, BS_HATCHED, std::clamp<int>(style, HS_HORIZONTAL, HS_DIAGCROSS)));
+  });
+  // CreateDIBPatternBrush(hPackedDIB, usage): a pattern brush from a packed
+  // DIB in a global block (DIB_RGB_COLORS: an RGBQUAD table; DIB_PAL_COLORS:
+  // WORD indices). The brush keeps a copy, so the block may go. On a DIB DC
+  // it paints the pattern's own indices (RCLOCK fills its clock's regions
+  // with three, between SetROP2(R2_MASKPEN) and R2_MERGEPEN, 1:0C93..1:0CF5);
+  // elsewhere its colours as the display matched them (CreateBrushIndirect's
+  // BS_DIBPATTERN), through a bitmap of its own that DeleteObject deletes
+  // with it. ANTSW's and INTRMLIB's LibEntry make theirs from bitmap
+  // resources. 0 when the block holds no DIB.
+  r.impl(G, "CreateDIBPatternBrush", [](Call16& c) {
+    uint16_t hdib = c.w(), usage = c.w();
+    Gdi16& g = gt(c);
+    uint32_t p = c.rt.global().lock(hdib);
+    if (!p) return c.ret(0);
+    uint32_t size = std::min<uint32_t>(c.rt.global().size(hdib), 0x10000 - (p & 0xFFFF));
+    std::vector<uint8_t> copy(size);
+    c.rt.read_bytes(p, copy.data(), copy.size());
+    uint16_t bmp = gdi16_bitmap_from_dib(c.rt, 0, p, usage == DIB_PAL_COLORS ? DIB_PAL_COLORS : DIB_RGB_COLORS);
+    c.rt.global().unlock(hdib);
+    if (!g.get(bmp, G16::bitmap)) return c.ret(0);
+    uint16_t h = g.create_brush(0, BS_PATTERN);
+    if (Obj16* o = g.get(h, G16::brush)) {
+      o->pattern = bmp;
+      g.get(bmp)->pattern_of = h;
+      o->dib_pattern = std::move(copy);
+      o->dib_usage = usage;
+    } else {
+      g.destroy(bmp);  // no brush (the table is full): nor its bitmap
+    }
+    c.ret(h);
   });
   // GetDCOrg(hdc): DX:AX = the DC's origin on the screen — (0, 0) for the
   // full-screen saver window's DC and memory DCs; a child window's corner for
@@ -828,7 +968,7 @@ void register_gdi16(Runtime16& rt) {
     COLORREF got = ::SetPixel(h, x, y, k);
     if (got == CLR_INVALID) return c.ret32(0xFFFFFFFF);
     Bitmap16* s = g.dc_surface(hdc);
-    c.ret32(s && s->bpp == 1 ? got : g.index_rgb(GetRValue(got)));
+    c.ret32(s && s->bpp == 1 ? got : g.surface_rgb(hdc, GetRValue(got)));
   });
   r.impl(G, "GetPixel", [](Call16& c) {
     uint16_t hdc = c.w();
@@ -840,7 +980,7 @@ void register_gdi16(Runtime16& rt) {
     COLORREF got = ::GetPixel(h, x, y);
     if (got == CLR_INVALID) return c.ret32(0xFFFFFFFF);
     Bitmap16* s = g.dc_surface(hdc);
-    c.ret32(s && s->bpp == 1 ? got : g.index_rgb(GetRValue(got)));
+    c.ret32(s && s->bpp == 1 ? got : g.surface_rgb(hdc, GetRValue(got)));
   });
   r.impl(G, "PatBlt", [](Call16& c) {
     uint16_t hdc = c.w();
@@ -1066,6 +1206,18 @@ void register_gdi16(Runtime16& rt) {
     g.sync_brush(hdc, saved);
     c.ret_bool(ok);
   });
+  // PaintRgn(hdc, hrgn): the region filled with the DC's own brush (ICLOCK
+  // paints a region in its display colour and another with BLACK_BRUSH every
+  // frame, 1:0D69 / 1:0DA4).
+  r.impl(G, "PaintRgn", [](Call16& c) {
+    uint16_t hdc = c.w(), h = c.w();
+    Gdi16& g = gt(c);
+    HDC d = g.host_dc(hdc);
+    HRGN rg = region_of(g, h);
+    if (!d || !rg) return c.ret(0);
+    g.sync(hdc);
+    c.ret_bool(::PaintRgn(d, rg));
+  });
   r.impl(G, "FrameRgn", [](Call16& c) {
     uint16_t hdc = c.w(), h = c.w(), hbr = c.w();
     int16_t w = c.sw(), hh = c.sw();
@@ -1139,10 +1291,20 @@ void register_gdi16(Runtime16& rt) {
     c.w();
     c.ret(uint16_t(gt(c).display().set_palette_use(c.w())));
   });
+  // GetSystemPaletteUse(hdc): SYSPAL_STATIC (1) unless SetSystemPaletteUse
+  // changed it. SWSE keeps NUMCOLORS static colours in its identity palettes
+  // only when it is static (1:4105, 1:4339), and RESTORESYSTEMPALETTE resets
+  // it when it is not (1:4707).
+  r.impl(G, "GetSystemPaletteUse", [](Call16& c) {
+    c.w();
+    c.ret(uint16_t(gt(c).display().palette_use()));
+  });
   r.impl(G, "GetNearestColor", [](Call16& c) {
     uint16_t hdc = c.w();
     uint32_t col = c.l();
     Gdi16& g = gt(c);
+    Dc16* d = g.dc(hdc);
+    if (d && d->dib_header) return c.ret32(g.surface_rgb(hdc, g.dib_index(*d, col)));
     c.ret32(g.index_rgb(g.display().map_index(col, g.dc_palette(hdc))));
   });
   // USER.282/283 in Win16.
@@ -1162,6 +1324,8 @@ void register_gdi16(Runtime16& rt) {
     Gdi16& g = gt(c);
     Dc16* d = g.dc(hdc);
     if (!d) return c.ret(0);
+    // The DIB driver is no palette device (no RC_PALETTE): nothing to realize.
+    if (d->dib_device) return c.ret(0);
     Obj16* p = g.get(d->s.palette, G16::palette);
     if (!p || p->stock) return c.ret(0);
     // A screen DC realizes into the hardware palette (foreground, as the
@@ -1185,6 +1349,16 @@ void register_gdi16(Runtime16& rt) {
     if (!d || !read_dib(c.rt, bmi, usage, dib)) return c.ret(0);
     int n = std::min<int>(lines, dib.height);
     c.rt.charge_pixels(int64_t(std::max<int>(cx, 0)) * std::max<int>(cy, 0));
+    if (mono_target(g, hdc, dib)) {
+      const uint8_t* raw = n > 0 && bits ? c.rt.mem().at<uint8_t>(c.rt.linear(bits, dib.stride * uint32_t(n)),
+                                                                  size_t(dib.stride) * size_t(n))
+                                         : nullptr;
+      RealBmi bi = real_bmi(g, dib, hdc);
+      g.sync(hdc);
+      return c.ret(uint16_t(::SetDIBitsToDevice(d, x, y, DWORD(std::max<int>(cx, 0)), DWORD(std::max<int>(cy, 0)), xs, ys,
+                                                start, UINT(raw ? n : 0), raw, reinterpret_cast<BITMAPINFO*>(&bi),
+                                                DIB_RGB_COLORS)));
+    }
     std::vector<uint8_t> idx = dib_to_indices(c.rt, g, dib, bits, n, usage, hdc);
     KeyBmi kb = key_bmi(dib);
     g.sync(hdc);
@@ -1206,6 +1380,15 @@ void register_gdi16(Runtime16& rt) {
     // either way (bottom-up: y from the bottom).
     int lo = std::min<int>(ys, ys + hs), hi = std::max<int>(ys, ys + hs);
     c.rt.charge_pixels(int64_t(std::abs(int(w))) * std::abs(int(h)));
+    if (mono_target(g, hdc, dib)) {
+      if (!bits) return c.ret(0);
+      const uint8_t* raw = c.rt.mem().at<uint8_t>(c.rt.linear(bits, dib.stride * uint32_t(dib.height)),
+                                                  size_t(dib.stride) * size_t(dib.height));
+      RealBmi bi = real_bmi(g, dib, hdc);
+      g.sync(hdc);
+      return c.ret(uint16_t(::StretchDIBits(d, x, y, w, h, xs, ys, ws, hs, raw, reinterpret_cast<BITMAPINFO*>(&bi),
+                                            DIB_RGB_COLORS, rop)));
+    }
     std::vector<uint8_t> idx = dib_to_indices(c.rt, g, dib, bits, dib.height, usage, hdc, lo - 1, hi + 1);
     if (tracing("dib16") && dib.h.biBitCount == 8 && dib.h.biCompression == BI_RGB) {
       // What the source rectangle holds, and what it becomes.
@@ -1354,6 +1537,30 @@ void register_gdi16(Runtime16& rt) {
   // ---- printing and escapes: no printer ----
   r.impl(G, "Escape", [](Call16& c) { c.ret32(0); });
   r.impl(G, "StartDoc", [](Call16& c) { c.ret(0xFFFF); });
+
+  // ---- arithmetic ----
+  r.impl(G, "MulDiv", [](Call16& c) {
+    int16_t a = c.sw(), b = c.sw(), d = c.sw();
+    c.ret(uint16_t(gdi16_muldiv(a, b, d)));
+  });
+}
+
+// MulDiv(a, b, c), Win16's (GDI.128): a*b with a 32-bit product, divided by
+// c and rounded to the nearest integer, halves away from zero (the sign
+// taken from a and b once c is made positive); -32768 when c is 0 or the
+// result leaves -32767..32767 ("-32768 if either an overflow occurred or
+// nDivisor was 0", the Windows 3.1 SDK; the same steps as Wine's MulDiv16,
+// 16-bit negation included).
+int16_t gdi16_muldiv(int16_t a, int16_t b, int16_t c) {
+  if (!c) return -32768;
+  if (c < 0) {
+    a = int16_t(-a);
+    c = int16_t(-c);
+  }
+  int32_t p = int32_t(a) * b;
+  int32_t r = ((a < 0) == (b < 0)) ? (p + c / 2) / c : (p - c / 2) / c;
+  if (r > 32767 || r < -32767) return -32768;
+  return int16_t(r);
 }
 
 }  // namespace adw::win16

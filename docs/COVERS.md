@@ -33,12 +33,14 @@ authoritative for how each part behaves.
   been renamed, and this file uses the new ones: the window title "Long
   After Dark", the data folder `%LOCALAPPDATA%\LongAfterDark` (DESIGN.md
   §6) and the saver `LongAfterDark.scr`.
-* **The documentation and wording pass** (WIP.md item 4). A few strings
+* **The documentation and wording pass** (a later pass of its own). A few strings
   listed here changed because the lanes disappear from the UI; everything
   else was left to that pass, which has since been done.
 
 Terms. A **release** is a package in the importer's registry (PACKAGES.md
-§2): `deluxe`, `ad10`, `ad32`, `tt`, `simpsons`. The UI calls a release by
+§2): `deluxe`, `ad10`, `ad32`, `tt`, `simpsons`, since the sixth release
+`swse` (Star Wars Screen Entertainment), and since the seventh `startrek`
+(Star Trek: The Screen Saver). The UI calls a release by
 its `title`, or by its `shortTitle` where space is tight. A **cover** is the
 art that stands for a release. A **tile** is the cover rendered as a 4:5
 portrait PNG for display. The **filter** is the set of releases whose tiles
@@ -103,7 +105,9 @@ control and the details card) moves down by the band's height.
 * **Tiles** are left-aligned at the content column's left edge, in catalog
   `packages[]` order, which is release-date order, oldest first: Simpsons
   (1994), 3.2, Totally Twisted (1995), Deluxe (1996), 10th Anniversary
-  (1999). A release without a date comes last.
+  (1999); Star Wars (1994) comes second, after the Simpsons, since the sixth
+  release, and Star Trek (1992) first, before them, since the seventh. A
+  release without a date comes last.
 * **Status box.** A status box 200 DIP wide sits at the column's right
   edge, vertically centred on the tile art (§1.6). The tiles area is the
   column minus that box minus 16 DIP.
@@ -118,8 +122,15 @@ control and the details card) moves down by the band's height.
   down (by 4 or more), never up.
 * **Room.** At the minimum content width (852 DIP) the tiles area holds 6
   regular or 8 compact tiles, so today's five releases always fit without
-  scrolling. When the tiles need more room than the tiles area has (future
-  releases), the strip scrolls (§1.3). It never overlaps the status box.
+  scrolling, and so do the six of the sixth release (checked on off-screen
+  renders; a seventh would scroll). The seventh release's seven fit the
+  first-open window (1040 × 800) and, compact, the smallest one (900 × 680)
+  at every scale from 100% to 250%; a window as narrow but 760 DIP or more
+  tall shows five of its seven regular tiles whole (a chevron takes 24
+  DIP), so its row scrolls, by at most two tiles, to the third
+  (`scr_unit_releases`, and the seven-release renders). When the
+  tiles need more room than the tiles area has (future releases), the strip
+  scrolls (§1.3). It never overlaps the status box.
 
 ### 1.3 Overflow and scrolling
 
@@ -490,13 +501,15 @@ that waited on them were settled from the real images and the Internet
 Archive's metadata at implementation (as built, below; the user's own box
 photos are those two releases' covers of choice, through `--set-cover`).
 
-| id | 1st | 2nd | 3rd |
-|---|---|---|---|
-| `deluxe` | download `https://archive.org/download/after-dark-4-deluxe/disc.jpg`, md5 `0b5104351ae6fa60da6d48164e8f548e`, 737758 B, 1488×1452 (checked against the item's metadata on 2026-09-26; it is in the same item as the ISO), art `disc` ("Disc label", Internet Archive) | disc `ADE/PAGE1.BMP` (the setup wizard's portrait art: "After Dark" and flying toasters on black, 118×226), md5 `945259b85a1f0a5e0aedfad53561c838` (28198 B), art `panel` ("Setup art", your disc) | — |
-| `ad10` | download `https://archive.org/download/ad10th/01_ad10_cd.jpg`, md5 `e1e77b74ccc9bcd4e5b818f841f0614d`, 376876 B, art `disc` ("Disc label", Internet Archive) | disc `ADE/PAGE1.BMP` (Joliet `/ADE/page1.bmp`), md5 `30f247d08fe8a4fd394658a3c4564a06`, art `panel` ("Setup art", your disc) | — |
-| `ad32` | disc `INSTALL/SETUP.BMP`, md5 `67e76581f69bcfdb62ef1c7ff61fc426`, **crop 0,0,387,183** (drops the warning and copyright rows), art `splash` ("Installer art", your disc) | download `https://archive.org/download/after-dark-v3_2/disc.jpg`, md5 `68f2aad89dcdc1fdbcb3419ab42077f9`, 349982 B, art `disc` | download `https://archive.org/download/berkeley-systems-after-dark-for-windows/berkeley-systems-after-dark-for-windows.png`, md5 `f2fdf32138f96da06f8d348af059d712`, 1857714 B, art `disc` |
-| `tt` | disc `INSTALL/SETUP.BMP` (the magenta "Totally Twisted" splash, 387×251), **crop 0,0,387,204** (measured: the logo ends at row 197 and the warning text starts at row 211), md5 `3e5eee81009de2a2a432cfabf5d7cfea` (49314 B), art `splash` ("Installer art", your disc) | download `https://archive.org/download/TTW320CD/TTW320CD.tif` (the item's TIFF scan of the disc, 2840×2888, normalized to 2014×2048), md5 `ec19d74fd2ac46d4bc8f6021ad0011e6`, 24632572 B, art `disc` ("Disc label", Internet Archive) | — |
-| `simpsons` | download `https://static.simpsonswiki.com/images/7/72/The_Simpsons_Screen_Saver.png`, md5 `47f4619da9e79b126a4fb45770f0e649`, 1011608 B, art `box` ("Box front", Wikisimpsons) | download `https://web.archive.org/web/20250715075938id_/https://www.whipassgaming.com/images/deadsections/mac/simpsonsfullbox.jpg`, md5 `94db22db1e89b3ff2fdb97e610056602`, 484234 B, **crop 0,0,600,776**, art `box` ("Box front", Wayback Machine) | disc `SETUP.EXE` RT_BITMAP **7500**, file md5 `980867b7ab5394b09adad725d375ba95`, **crop 0,0,387,172** (measured: the art ends at row 171, the first black row before the warning text is 172), art `splash` ("Installer art", your disks) |
+| id | 1st | 2nd | 3rd | 4th |
+|---|---|---|---|---|
+| `deluxe` | download `https://archive.org/download/after-dark-4-deluxe/disc.jpg`, md5 `0b5104351ae6fa60da6d48164e8f548e`, 737758 B, 1488×1452 (checked against the item's metadata on 2026-09-26; it is in the same item as the ISO), art `disc` ("Disc label", Internet Archive) | disc `ADE/PAGE1.BMP` (the setup wizard's portrait art: "After Dark" and flying toasters on black, 118×226), md5 `945259b85a1f0a5e0aedfad53561c838` (28198 B), art `panel` ("Setup art", your disc) | — | — |
+| `ad10` | download `https://archive.org/download/ad10th/01_ad10_cd.jpg`, md5 `e1e77b74ccc9bcd4e5b818f841f0614d`, 376876 B, art `disc` ("Disc label", Internet Archive) | disc `ADE/PAGE1.BMP` (Joliet `/ADE/page1.bmp`), md5 `30f247d08fe8a4fd394658a3c4564a06`, art `panel` ("Setup art", your disc) | — | — |
+| `ad32` | disc `INSTALL/SETUP.BMP`, md5 `67e76581f69bcfdb62ef1c7ff61fc426`, **crop 0,0,387,183** (drops the warning and copyright rows), art `splash` ("Installer art", your disc) | download `https://archive.org/download/after-dark-v3_2/disc.jpg`, md5 `68f2aad89dcdc1fdbcb3419ab42077f9`, 349982 B, art `disc` | download `https://archive.org/download/berkeley-systems-after-dark-for-windows/berkeley-systems-after-dark-for-windows.png`, md5 `f2fdf32138f96da06f8d348af059d712`, 1857714 B, art `disc` | — |
+| `tt` | disc `INSTALL/SETUP.BMP` (the magenta "Totally Twisted" splash, 387×251), **crop 0,0,387,204** (measured: the logo ends at row 197 and the warning text starts at row 211), md5 `3e5eee81009de2a2a432cfabf5d7cfea` (49314 B), art `splash` ("Installer art", your disc) | download `https://archive.org/download/TTW320CD/TTW320CD.tif` (the item's TIFF scan of the disc, 2840×2888, normalized to 2014×2048), md5 `ec19d74fd2ac46d4bc8f6021ad0011e6`, 24632572 B, art `disc` ("Disc label", Internet Archive) | — | — |
+| `simpsons` | download `https://static.simpsonswiki.com/images/7/72/The_Simpsons_Screen_Saver.png`, md5 `47f4619da9e79b126a4fb45770f0e649`, 1011608 B, art `box` ("Box front", Wikisimpsons) | download `https://web.archive.org/web/20250715075938id_/https://www.whipassgaming.com/images/deadsections/mac/simpsonsfullbox.jpg`, md5 `94db22db1e89b3ff2fdb97e610056602`, 484234 B, **crop 0,0,600,776**, art `box` ("Box front", Wayback Machine) | disc `SETUP.EXE` RT_BITMAP **7500**, file md5 `980867b7ab5394b09adad725d375ba95`, **crop 0,0,387,172** (measured: the art ends at row 171, the first black row before the warning text is 172), art `splash` ("Installer art", your disks) | — |
+| `swse` (added with the sixth release) | download `https://web.archive.org/web/19970310054846id_/http://www.presage.com:80/images/pimages/box-starwars.JPEG` (the box front from Presage's own 1997 product page, 150×200), md5 `8b84792a21f3a21e09cc2809d263d9c1`, 30600 B, art `box` ("Box front", Wayback Machine) | download `https://web.archive.org/web/20221205171117id_/https://static.wikia.nocookie.net/starwars/images/9/9a/SWScreenEntertainment.jpg/revision/latest` (Wookieepedia's photo of the same US box, 713×847: the Wayback Machine's byte-exact capture of the stored original), md5 `dc4e541d1a79a46747caf0cb6f425c0a`, 190239 B, art `box` ("Box front", Wayback Machine) | download `https://archive.org/download/swse1/1.jpg` (a scan of the disc label, 1416×1416), md5 `a40d11a61ee0288048bdfdd28e48e57c`, 2156659 B, art `disc` ("Disc label", Internet Archive) | download `https://archive.org/download/cd_AfterDark_Star_Wars_ScreenSaver_for_Win3.1/AfterDark%20Star%20Wars%20-%20CD.jpg` (an older scan of the label, in the exact ISO's item, 1452×1464), md5 `b8ac25eb20a87f44e47ff8ed097698d7`, 948614 B, **crop 20,14,1424,1424** (the disc on white paper), art `disc` ("Disc label", Internet Archive) |
+| `startrek` (added with the seventh release) | download `https://archive.org/download/afterdark-20b_startrek_box/Aaa_itemimage.jpg` (the Windows retail box front from the Internet Archive's box scans, 1180×1525: it fills the tile), md5 `157eb04fcc9bdc0d4a831148ca6cc260`, 577239 B, art `box` ("Box front", Internet Archive) | download `https://archive.org/download/afterdark-20b_startrek_box/After%20Dark%202.0b%20-%20Star%20Trek%20-%20Box%20-%20Front.jpg` (the same front at 600 dpi, 4720×6100, normalized to 1585×2048), md5 `f41d1dbdaadaeeb0f9bc0a6aa76754ce`, 9277274 B, art `box` ("Box front", Internet Archive) | download `https://archive.org/download/afterdark-20b_startrek/afterdark-20b_startrek_disk1.jpg` (a scan of disk 1's label, 1090×1145, in the disk images' own item), md5 `dbda3bc66b809f446a17138073579b53`, 569964 B, art `panel` ("Disk label", Internet Archive) | — |
 
 Notes:
 * **ad32** starts with its disc art because the user chose it: no box scan
@@ -510,6 +523,29 @@ Notes:
   user's machine at import time and never bundled, committed or
   redistributed. The Wikisimpsons and Wayback hosts are third parties; the
   user approved both.
+* **swse.** Star Wars Screen Entertainment's art belongs to Lucasfilm and
+  LucasArts, and is handled like the Simpsons': fetched at import time,
+  never bundled, committed or redistributed. The disc has no picture a disc
+  source can reach (its loose files hold only 32×32 icons; everything else
+  is inside its ARJ archives), so it has no disc source, and an offline
+  import shows the generated cover until `--refresh-covers` fetches one.
+  Fandom's live URL for the second picture is not used: it rewrites what it
+  serves (WebP, or a JPEG with a header stripped), so the Wayback Machine's
+  byte-exact capture stands in for it. Presage's page and Wookieepedia are
+  third parties reached through the Wayback Machine, which the registry
+  already uses.
+* **startrek.** Star Trek: The Screen Saver's art belongs to Paramount and
+  Berkeley Systems, and is handled like the Simpsons' and Star Wars': fetched
+  at import time, never bundled, committed or redistributed. The box scans
+  are by the uploader of the disk images, in a separate item; the disk label
+  is in the images' own item, so it survives if the box item goes. The disks
+  have no picture a disc source can reach (`SETUP.EXE`, the one plain
+  executable, holds only icons; `SPLASH1.BM_`, `BMPRSRC.DL_` and `AD.EX_`
+  are KWAJ-compressed), so it has no disc source, and an offline import
+  shows the generated cover until `--refresh-covers` fetches one. The label
+  is a floppy's, so it takes the art `panel`, drawn as a picture (contained
+  on bands, §2.6), not `disc`, which would cut it to a circle: no new art
+  value was needed.
 
 ### 2.4 Capture during an import
 
@@ -581,7 +617,7 @@ Notes:
 `cover.json`, version 1:
 
 ```json
-{ "version": 1, "package": "simpsons", "tool": "adimport 1.2",
+{ "version": 1, "package": "simpsons", "tool": "adimport 1.3",
   "original": { "origin": "download", "source": 0, "art": "box",
                 "label": "Box front", "credit": "Wikisimpsons",
                 "url": "https://static.simpsonswiki.com/…/The_Simpsons_Screen_Saver.png",
@@ -661,7 +697,8 @@ Every entry of the top-level `packages` array gains `cover`, after
   `cover.json` is damaged is written as `generated`, and the problem is
   logged. `--refresh-covers` repairs it.
 * **What stays the same.** The catalog `version` stays 1 and the generator
-  string becomes `adimport 1.2`. Nothing about modules changes, so
+  string becomes `adimport 1.2` (`adimport 1.3` since the sixth release,
+  PACKAGES.md §6). Nothing about modules changes, so
   `import.catalog_real` and the Deluxe fields stay as they are.
 * **Every catalog write includes covers**: imports, `--catalog-only`,
   `--remove` and the cover commands.
@@ -793,8 +830,8 @@ std::vector<CoverResult> refresh_covers(const std::vector<std::string>& ids, con
 * **Upgrading older installs.** Installs made before this pass have no
   `covers\`, so they show generated covers until either `adimport
   --refresh-covers` (downloads) or a re-import (disc art as well). The
-  importer README says so, and the integrator adds the command to WIP.md's
-  "Needs you" list.
+  importer README says so, and the integrator tells the user of the
+  command.
 
 ### 2.11 GUI: "Change cover…" (T; the pages are specified in §4.2)
 
@@ -1041,7 +1078,7 @@ the importer), but may **not** change anything listed above.
   window text stays for the taskbar, Alt+Tab and screen readers).
 * **No Mica.** The settings dialog paints solid `base`, because GDI cannot
   draw correctly over a system backdrop. Both apps keep solid surfaces.
-  WIP.md's mention of Mica is superseded.
+  An earlier plan for Mica is superseded.
 * **Live theme changes.** On `is_theme_change`: `Theme::load`,
   `apply_window_chrome`, `theme_native_control` on the native parts,
   `allow_dark_menus`, and a full redraw. On `WM_DPICHANGED`:
@@ -1080,8 +1117,9 @@ the importer), but may **not** change anything listed above.
 ### 4.2 Pages
 
 1. **Sources** (the chooser: `adimport --gui` with no source).
-   * Header band `paint_header`: the moon, "Import After Dark" and the
-     tagline "From your discs or the Internet Archive".
+   * Header band `paint_header`: the moon, "Import a release" ("Import
+     After Dark" until the sixth release) and the tagline "From your discs
+     or the Internet Archive".
    * **Installed** section (only when something is installed): one row per
      installed release with its cover at 48×60 (`draw_cover`), its title,
      "N modules · verified: image", and a "Change cover…" link that opens
@@ -1229,7 +1267,7 @@ raised in S's report for T.
 | **T** (theme + importer GUI) | `common/ui/**` (new) · the top-level `CMakeLists.txt` · `importer/gui/**` (new: `gui.h`, the GUI sources, `CMakeLists.txt` defining `adw_import_gui` and its tests, `README.md`, `tests/**`) · `importer/adimport.manifest` · `importer/adimport.rc` |
 | **C** (importer non-GUI) | `importer/**` **except** `gui/**`, `adimport.manifest` and `adimport.rc`. That includes `adimport.cc` (all of it), `CMakeLists.txt`, `README.md`, `packages.*`, `importer.*`, `catalog.*`, `download.*`, the new `covers.*` and any new image-codec files, `known_files*`, and every file in `tests/`, including `test_cli.cc`, whose GUI block is kept as the GUI's regression contract |
 | **S** (screen saver) | `scr/**` |
-| nobody in this pass | `host/**`, `tools/**`, `docs/**` (updated at integration), `WIP.md`, the top-level docs, `.github/**` |
+| nobody in this pass | `host/**`, `tools/**`, `docs/**` (updated at integration), the top-level docs, `.github/**` |
 
 Reading any file is always fine. When an owner needs a change in someone
 else's file, it goes in that owner's report, not into the file.
@@ -1342,7 +1380,8 @@ sections above stay the contract; this records the differences.
 * `AD_COVER_DOWNLOAD=0` in the environment turns every cover download off
   (imports and refresh), as `--no-cover-download` does. Tests whose command
   lines are fixed use it.
-* `import.json` (PACKAGES.md §5.3) reports tool "adimport 1.2".
+* `import.json` (PACKAGES.md §5.3) reports tool "adimport 1.2" ("adimport
+  1.3" since the sixth release).
 * A user-picture cover in `packages[].cover` has no `art` (a user picture has
   no art type); `label` is "Your own picture" and `credit` is "". Readers
   treat `art` as optional (the scr does).

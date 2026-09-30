@@ -137,12 +137,12 @@ std::wstring last_exit_log_path() {
   return join_path(join_path(dir_of(settings_path()), L"logs"), L"saver-last.log");
 }
 
-std::wstring seed_file_path(unsigned long pid, int window_index) {
+std::wstring seed_file_path(unsigned long pid, int window_index, const std::wstring& size) {
   wchar_t buf[MAX_PATH + 2] = {};
   DWORD n = GetTempPathW(MAX_PATH + 1, buf);
   std::wstring dir(buf, n > 0 && n <= MAX_PATH + 1 ? n : 0);
   return join_path(dir, std::wstring(kSeedFilePrefix) + std::to_wstring(pid) + L"-" + std::to_wstring(window_index) +
-                            L".ppm");
+                            (size.empty() ? L"" : L"-" + size) + L".ppm");
 }
 
 std::wstring host_exe_path() {

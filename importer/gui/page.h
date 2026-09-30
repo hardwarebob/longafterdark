@@ -78,7 +78,7 @@ class Page {
 
  protected:
   // ---- what a page provides -----------------------------------------------------------
-  virtual std::wstring header_name() const { return L"Import After Dark"; }
+  virtual std::wstring header_name() const { return L"Import a release"; }
   virtual std::wstring header_tagline() const { return L""; }
   virtual void build() = 0;
   // Places the controls for a client `w` px wide, with `max_h` px of height available;

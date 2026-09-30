@@ -602,7 +602,8 @@ void test_downloads(World& w) {
     CHECK(fs::exists(dl / L"covers" / L"box.png"));
     phosg::JSON cj = cover_json(root, "tt");
     CHECK_EQ(cj.get_int("version"), int64_t(1));
-    CHECK_EQ(cj.get_string("tool"), std::string("adimport 1.2"));
+    CHECK_EQ(cj.get_string("tool"), std::string(kToolName));
+    CHECK_EQ(std::string(kToolName), std::string("adimport 1.3"));
     CHECK_EQ(cj.at("original").get_string("origin"), std::string("download"));
     CHECK_EQ(cj.at("original").get_int("source"), int64_t(0));
     CHECK_EQ(cj.at("original").get_string("fileMd5"), md5_of(w.box_png));

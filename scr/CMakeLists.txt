@@ -149,9 +149,11 @@ add_test(NAME scr_resources COMMAND scr_smoke resources ${_smoke_args} --shipped
 foreach(_t run preview preview-parent-gone not-imported host-missing respawn stall rotate rotate-lead
            start-failure display-off p6-garbage primary-only config config-lead config-live config-classic
            config-thumbs list-top import preview-settings display-change
-           input-play input-alt input-wake input-rotate input-monitors input-display-change seed config-buttons
+           input-play input-alt input-wake input-rotate input-monitors input-display-change seed seed-screens
+           config-buttons
            config-collections config-cover rotate-collections config-details data-root
-           sound sound-wake config-sound present)
+           sound sound-wake config-sound present config-abi rotate-abi rotate-abi-wait screen-abi screen-field numlock
+           config-credit)
   add_test(NAME scr_smoke_${_t} COMMAND scr_smoke ${_t} ${_smoke_args})
   set_tests_properties(scr_smoke_${_t} PROPERTIES LABELS gui SKIP_RETURN_CODE 77 TIMEOUT 90)
 endforeach()
@@ -165,6 +167,18 @@ if(TARGET adhostwin)
 endif()
 # 48 off-screen renders of the dialog.
 set_tests_properties(scr_smoke_list-top PROPERTIES TIMEOUT 300)
+# Six off-screen renders, two of them waiting on background thumbnails.
+set_tests_properties(scr_smoke_config-abi PROPERTIES TIMEOUT 180)
+# Four /s runs, a /p and the dialog with its thumbnails and a Preview (a fifth /s).
+set_tests_properties(scr_smoke_screen-abi PROPERTIES TIMEOUT 180)
+# The same for a module with a "screen" of its own (five /s runs, a /p, and the dialog twice:
+# its thumbnails and Preview, then an import that adds the screen).
+set_tests_properties(scr_smoke_screen-field PROPERTIES TIMEOUT 180)
+# Four scripted /s runs of a few seconds each.
+set_tests_properties(scr_smoke_numlock PROPERTIES TIMEOUT 180)
+# The dialog driven by control ID twice (the second time into a Preview, a
+# /s), then seven off-screen renders.
+set_tests_properties(scr_smoke_config-credit PROPERTIES TIMEOUT 180)
 # Two /s runs, and a scanner may hold a fresh capture for a while.
 set_tests_properties(scr_smoke_present PROPERTIES TIMEOUT 180)
 set_tests_properties(scr_host_stream PROPERTIES TIMEOUT 60)

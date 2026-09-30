@@ -6,6 +6,7 @@
 #include <thread>
 
 #include "adw/ui/capture.h"
+#include "geometry.h"
 #include "log.h"
 #include "paths.h"
 #include "sound.h"
@@ -229,11 +230,16 @@ void ThumbnailQueue::start_next() {
     spec.exe = j.host_exe;
     spec.module_path = j.module_path;
     spec.working_dir = j.win_dir;
-    // The screen the modules were made for; a third of it fills a tile.
+    // The screen the modules were made for, 640x480, a third of which fills
+    // a tile: the module's own rule (module_screen) on a 4:3 display at 480
+    // lines, which is 640x480 for an After Dark, an Intermission and a Star
+    // Trek module alike (a module whose catalog "screen" is another size gets
+    // that one).
+    const SizeI emu = module_screen(own_screen(j.abi, j.screen), 4.0 / 3.0, 1.0).emu;
     spec.env = {
         {L"ADSTREAM", L"1"},
-        {L"ADSCREENW", L"640"},
-        {L"ADSCREENH", L"480"},
+        {L"ADSCREENW", std::to_wstring(emu.w)},
+        {L"ADSCREENH", std::to_wstring(emu.h)},
         {L"ADCVSET", widen(j.cvset)},
         {L"AD_ASSETS_DIR", assets_root()},
     };
@@ -255,7 +261,8 @@ void ThumbnailQueue::start_next() {
     frames_ = 0;
     started_ = Clock::now();
     SetTimer(hwnd_, kTimerWatch, 400, nullptr);
-    log_line("thumbs: run %s pid=%lu (%zu more queued)", current_.id.c_str(), host_->pid(), jobs_.size());
+    log_line("thumbs: run %s size=%dx%d pid=%lu (%zu more queued)", current_.id.c_str(), emu.w, emu.h, host_->pid(),
+             jobs_.size());
     return;
   }
   PostMessageW(notify_, msg_, kThumbIdle, 0);
@@ -273,7 +280,11 @@ void ThumbnailQueue::end_job(bool lane_missing) {
   const bool saved = taker_.finish();
   stop_host();
   if (saved) PostMessageW(notify_, msg_, kThumbSaved, 0);
-  if (lane_missing) PostMessageW(notify_, msg_, kThumbLaneMissing, 0);
+  if (lane_missing) {
+    // This module only: another of its lane or ABI may run (config_dialog.cc).
+    cant_run_.push_back(current_.id);
+    PostMessageW(notify_, msg_, kThumbLaneMissing, 0);
+  }
   SetTimer(hwnd_, kTimerNext, kJobGapMs, nullptr);
 }
 

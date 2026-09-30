@@ -1,5 +1,6 @@
-// adw::import — puts the original Windows After Dark files where the hosts
-// look for them (DESIGN.md §6, PACKAGES.md):
+// adw::import — puts the original Windows modules of the known releases
+// (six After Dark releases and Star Wars Screen Entertainment) where the
+// hosts look for them (DESIGN.md §6, PACKAGES.md):
 //
 //   <assets>\win\FILES\{AD40,CLASSIC,ENGINE,AFI}\**   After Dark 4.0 Deluxe (8.3 upper-case names, as on the CD)
 //   <assets>\win\import.json                           Deluxe's record (version 1)
@@ -9,14 +10,15 @@
 // <assets> is %AD_ASSETS_DIR% or <data folder>\assets, where the data folder
 // is %LOCALAPPDATA%\LongAfterDark (data_folder() below). A source is a disc
 // image (ISO-9660 or a FAT floppy image, sniffed by content; several floppy
-// images are read as one), a ZIP of install files, a mounted disc or folder,
-// or a download of a package's Internet Archive copy (packages.h
-// `downloads`: a disc image, or for the Simpsons a ZIP). The importer
-// identifies which release it is (image md5, then file fingerprints),
-// extracts it with that release's recipe, verifies it against the release's
-// manifest, and swaps in only that release's directory: importing one
-// package never touches another, and a failed or cancelled import leaves
-// everything as it was.
+// images are read as one), a ZIP of install files or of floppy images, a
+// mounted disc or folder, or a download of a package's Internet Archive copy
+// (packages.h `downloads`: a disc image, the images of every install disk, or
+// a ZIP of the install files). The importer identifies which release it is
+// (image md5s — one image, or a set of install disks — then file
+// fingerprints), extracts it with that release's recipe, verifies it against
+// the release's manifest, and swaps in only that release's directory:
+// importing one package never touches another, and a failed or cancelled
+// import leaves everything as it was.
 #pragma once
 
 #include <cstdint>
@@ -46,7 +48,7 @@ inline constexpr const char* kImportDirs[] = {"AD40", "CLASSIC", "ENGINE", "AFI"
 inline constexpr const char* kRequiredFiles[] = {
     "FILES/AD40/ADXPL510.DLL", "FILES/CLASSIC/ADXPL300.DLL", "FILES/ENGINE/OLDMOD16.DLL"};
 
-inline constexpr char kToolName[] = "adimport 1.2";
+inline constexpr char kToolName[] = "adimport 1.3";
 
 // ImportOptions' default staging budget (see there).
 inline constexpr uint64_t kMaxImportFiles = 20000;
@@ -67,8 +69,9 @@ const char* phase_name(Progress::Phase p);
 
 struct Source {
   // `iso` (alias `image`): one or more image files (or a ZIP of install
-  // files); `folder`: a drive root or folder; `download`: a package's
-  // Internet Archive copy (`package`, Deluxe when empty), or `url`.
+  // files, or of floppy images: each image in it is one of the images);
+  // `folder`: a drive root or folder; `download`: a package's Internet
+  // Archive copy (`package`, Deluxe when empty), or `url`.
   enum class Kind { iso, image = iso, folder, download };
   Kind kind = Kind::iso;
   std::filesystem::path path;  // image: the (first) image; folder: drive root / folder; download: downloads dir (empty = default)
@@ -137,16 +140,20 @@ struct ImportResult {
   std::vector<ImportedFile> files;         // sorted by path; installed only when status == ok
   std::vector<std::string> missing_known;  // manifest files the source did not have
   std::string source;                      // human-readable: image path, folder, URL
-  std::string url;                         // download: the URL fetched (a registry copy, or Source::url)
+  std::string url;                         // download: the URL fetched (a registry copy — its first file —, or Source::url)
   std::string final_url;                   // download: after redirects ("" when an earlier download was reused)
   bool download_md5_checked = false;       // download: the file matched an expected md5 (published, or --md5)
-  std::string iso_md5;                     // single-image and download sources
+  std::string iso_md5;                     // single-image sources (one image in a ZIP of floppy images too)
   uint64_t iso_size = 0;
-  bool iso_md5_known = false;              // iso_md5 is the package's known image
+  // iso_md5 is the package's known image, or the parts are every one of its
+  // install disks: "verified": "image".
+  bool iso_md5_known = false;
   bool joliet = false;
   std::string format;                      // iso9660 | iso9660+joliet | fat12 | fat16 | folder
   std::string volume_id;
-  std::vector<ImagePart> parts;            // every image of a multi-image source
+  // Every image of a multi-image source; an image a ZIP holds is
+  // "<zip path>!<member>".
+  std::vector<ImagePart> parts;
   std::string verified;                    // "image" | "files" | "partial" | "none" (see import.json)
   std::string package_id, package_title;   // the identified package
   std::filesystem::path files_dir;         // the package root: <assets>\win\FILES or <assets>\win\packages\<id>

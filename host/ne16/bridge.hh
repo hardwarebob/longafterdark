@@ -4,9 +4,11 @@
 //
 //   OldMod16Bridge — Berkeley's OLDMOD16.DLL as real emulated code: the
 //                    OLDMOD32 thunks become far calls to its five exports.
-//   NativeBridge   — the same five entry points in C++, for the AD 3.x
-//                    packages that ship no OLDMOD16 (AD 3.2, Totally Twisted,
-//                    The Simpsons): what OLDMOD16 does, step for step, as
+//   NativeBridge   — the same five entry points in C++, for the packages
+//                    that ship no OLDMOD16 (AD 3.2, Totally Twisted, The
+//                    Simpsons, and After Dark 2.0's Star Trek: The Screen
+//                    Saver, whose modules AD.EXE 2.0b drove with the same
+//                    messages and blocks): what OLDMOD16 does, step for step, as
 //                    ABI.md §3.3 records it and research/win/dis/OLDMOD16.DLL.asm
 //                    shows where §3.3 is silent. It fills AD_SYSTEM (version
 //                    300, "BUTTHEAD") and AD_MODULE the same way, sends the
@@ -16,9 +18,20 @@
 //                    OLDMOD16's — and loads the engine dir's own AD_SND.DLL by
 //                    full path without OLDMOD16's VerStr >= 400 gate (AD_SND
 //                    3.0.3 and 3.2 export the seven entry points it uses with
-//                    the same argument sizes). It replaces host code (as the
-//                    lane already replaces OLDMOD32 and AFTERDAR.SCR); every
-//                    engine, sound DLL and module still runs as real code.
+//                    the same argument sizes). Of those, five are required
+//                    with one volume pair: adwGetSystemVolumes +
+//                    adwSetSystemVolumes, or else — After Dark 2.0's AD_SND
+//                    1.0 (Star Trek: The Screen Saver), which has no other —
+//                    adwSavePreviousVolume() + adwRestorePreviousVolume(),
+//                    no arguments, called where the first pair is (as
+//                    AD.EXE 2.0b called them; the restore only once the
+//                    save has run). The error id: 1 when AD_SND cannot be
+//                    loaded, 3 when a required entry is missing — one of the
+//                    five, or a whole volume pair (neither pair complete).
+//                    It replaces host code (as the lane already replaces
+//                    OLDMOD32, AFTERDAR.SCR and, for After Dark 2.0, AD.EXE);
+//                    every engine, sound DLL and module still runs as real
+//                    code.
 //
 // All pointers are guest far pointers (sel:off) into memory the lane owns;
 // ctrl4 is four WORDs. Results are what OLDMOD16's exports return.
@@ -72,9 +85,10 @@ class Bridge16 {
 std::unique_ptr<Bridge16> open_oldmod16_bridge(win16::Runtime16& rt, const std::string& host_path, std::string* why);
 
 // The native bridge; `ad_snd_guest_path` is the engine dir's AD_SND.DLL as
-// the guest sees it (C:\WINDOWS\SYSTEM\AD_SND.DLL). What DLLENTRYPOINT(1)
-// did — AD_SYSTEM and AD_MODULE allocated and locked — happens here. Null
-// with *why set when guest memory runs out.
+// the guest sees it (C:\WINDOWS\SYSTEM\AD_SND.DLL): AD_SND 3.x/4.x, or 1.0
+// (the volume pair above). What DLLENTRYPOINT(1) did — AD_SYSTEM and
+// AD_MODULE allocated and locked — happens here. Null with *why set when
+// guest memory runs out.
 std::unique_ptr<Bridge16> open_native_bridge(win16::Runtime16& rt, const std::string& ad_snd_guest_path,
                                              std::string* why);
 

@@ -338,15 +338,16 @@ bool starts_with_zip_signature(const fs::path& path) {
          sig[2] == 3 && sig[3] == 4;
 }
 
-std::unique_ptr<SourceFs> open_zip(const fs::path& path) {
-  constexpr uint64_t kMaxZip = 256ull << 20;
-  const std::string name = to_utf8(path.filename().wstring());
+// A ZIP source is held in memory, at most this large.
+constexpr uint64_t kMaxZip = 256ull << 20;
+
+// The whole file, or nothing when it is larger than kMaxZip.
+std::shared_ptr<std::vector<uint8_t>> read_zip_bytes(const fs::path& path) {
   Handle in(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN,
                         nullptr));
   if (!in.valid()) invalid("cannot read " + to_utf8(path.wstring()) + ": " + win_error_string(GetLastError()));
   LARGE_INTEGER size{};
-  if (!GetFileSizeEx(in.get(), &size) || uint64_t(size.QuadPart) > kMaxZip)
-    invalid(name + " is too large for a ZIP of install files");
+  if (!GetFileSizeEx(in.get(), &size) || uint64_t(size.QuadPart) > kMaxZip) return nullptr;
   auto data = std::make_shared<std::vector<uint8_t>>(size_t(size.QuadPart));
   size_t have = 0;
   while (have < data->size()) {
@@ -356,6 +357,13 @@ std::unique_ptr<SourceFs> open_zip(const fs::path& path) {
       invalid("read error on " + to_utf8(path.wstring()) + ": " + win_error_string(GetLastError()));
     have += got;
   }
+  return data;
+}
+
+std::unique_ptr<SourceFs> open_zip(const fs::path& path) {
+  const std::string name = to_utf8(path.filename().wstring());
+  auto data = read_zip_bytes(path);
+  if (!data) invalid(name + " is too large for a ZIP of install files");
   std::unique_ptr<ZipArchive> zip;
   try {
     zip = std::make_unique<ZipArchive>(std::move(data), name);
@@ -517,6 +525,79 @@ std::unique_ptr<SourceFs> open_folder(const fs::path& dir, std::string* note) {
 std::unique_ptr<SourceFs> union_of(std::vector<std::unique_ptr<SourceFs>> parts) {
   if (parts.size() == 1) return std::move(parts.front());
   return std::make_unique<UnionFs>(std::move(parts));
+}
+
+std::vector<ZippedImage> floppy_images_in_zip(const fs::path& path, std::vector<std::string>* ignored,
+                                              uint64_t max_bytes) {
+  std::vector<ZippedImage> out;
+  std::error_code ec;
+  if (!fs::is_regular_file(path, ec) || !starts_with_zip_signature(path)) return out;
+  // Too large, or no ZIP open_image would read: open_image says why.
+  auto data = read_zip_bytes(path);
+  if (!data) return out;
+  const std::string name = to_utf8(path.filename().wstring());
+  std::unique_ptr<ZipArchive> zip;
+  try {
+    zip = std::make_unique<ZipArchive>(data, name);
+  } catch (const ZipError&) {
+    return out;
+  }
+  std::vector<std::string> others;
+  struct NoBootSector {};
+  uint64_t inflated = 0;  // the members with a boot sector, inflated whole
+  for (const ZipMember& m : zip->members()) {
+    // The sizes of DOS floppies, 160 KB to 2.88 MB: nothing else is
+    // inflated (a whole item's scans and metadata are only named).
+    const bool floppy_sized = m.usize % 512 == 0 && m.usize >= 163840 && m.usize <= 2949120;
+    if (!floppy_sized) {
+      others.push_back(m.name);
+      continue;
+    }
+    if (m.encrypted()) invalid(name + "!" + m.name + " is password-protected");
+    auto bytes = std::make_shared<std::vector<uint8_t>>();
+    try {
+      zip->extract(m, "", [&](const uint8_t* p, size_t n) {
+        const bool first = bytes->size() < 512;
+        bytes->insert(bytes->end(), p, p + n);
+        if (!first || bytes->size() < 512) return;
+        // The first sector decides whether the rest is worth inflating: a
+        // FAT volume's boot sector ends in 55 AA and names a sector size
+        // FatImage takes (a crafted ZIP of thousands of floppy-sized members
+        // costs a chunk each). Every image is held in memory together.
+        const uint8_t* bs = bytes->data();
+        const unsigned bps = unsigned(bs[11] | bs[12] << 8);
+        if (bs[510] != 0x55 || bs[511] != 0xAA || (bps != 512 && bps != 1024 && bps != 2048 && bps != 4096))
+          throw NoBootSector{};
+        if (m.usize > max_bytes - std::min(inflated, max_bytes))
+          invalid(name + " holds more than " + std::to_string(max_bytes >> 20) +
+                  " MB of disk images; no release came on that many disks");
+        bytes->reserve(m.usize);
+      });
+    } catch (const NoBootSector&) {
+      others.push_back(m.name);  // floppy-sized, but no FAT volume
+      continue;
+    } catch (const ZipError& e) {
+      invalid(e.what());
+    }
+    inflated += m.usize;
+    try {
+      FatImage probe{std::shared_ptr<const std::vector<uint8_t>>(bytes)};
+    } catch (const FatError&) {
+      others.push_back(m.name);  // floppy-sized, but no FAT volume
+      continue;
+    }
+    out.push_back({m.name, std::move(bytes)});
+  }
+  if (ignored && !out.empty()) *ignored = std::move(others);
+  return out;
+}
+
+std::unique_ptr<SourceFs> open_fat_image(std::shared_ptr<const std::vector<uint8_t>> bytes, const std::string& name) {
+  try {
+    return std::make_unique<FatFs>(std::make_unique<FatImage>(std::move(bytes)));
+  } catch (const FatError& e) {
+    invalid(name + " is not a FAT floppy image (" + e.what() + ")");
+  }
 }
 
 }  // namespace adw::import

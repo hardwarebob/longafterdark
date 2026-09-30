@@ -188,6 +188,10 @@ bool ConfigScript::parse(std::string_view text, std::string* error) {
     } else if (verb == "SELECT") {
       a.kind = Action::Kind::select;
       if (!parse_int(tail, &a.value)) return fail("SELECT needs an index");
+    } else if (verb == "PICK") {
+      a.kind = Action::Kind::pick;
+      a.text = utf8_or_1252(tail);
+      if (a.text.empty()) return fail("PICK needs the item's text");
     } else if (verb == "MULTI") {
       a.kind = Action::Kind::multi;
       std::string list(tail);
@@ -244,6 +248,19 @@ bool ConfigScript::apply(HWND dlg, const Action& a) {
         return false;
       }
       return true;
+    case Action::Kind::pick: {
+      // The item whose whole text this is (ignoring case), wherever a sorted
+      // list put it; then as SELECT.
+      if (!c) return false;
+      bool combo = is_class(c, L"ComboBox");
+      if (!combo && !is_class(c, L"ListBox")) return false;
+      LRESULT i = SendMessageW(c, combo ? CB_FINDSTRINGEXACT : LB_FINDSTRINGEXACT, WPARAM(-1), LPARAM(a.text.c_str()));
+      if (i < 0) return false;
+      Action s = a;
+      s.kind = Action::Kind::select;
+      s.value = int(i);
+      return apply(dlg, s);
+    }
     case Action::Kind::multi:
       if (!c || !is_class(c, L"ListBox")) return false;
       SendMessageW(c, LB_SETSEL, FALSE, -1);
@@ -311,7 +328,10 @@ LRESULT CALLBACK ConfigScript::subclass_proc(HWND dlg, UINT msg, WPARAM wp, LPAR
         std::vector<Action> actions = self->blocks_[block];
         for (const Action& a : actions) {
           if (!IsWindow(dlg)) break;
-          if (!apply(dlg, a)) log("ADCONFIGSCRIPT line %d: control %d is missing or does not fit", a.line, a.id);
+          if (!apply(dlg, a)) {
+            log("ADCONFIGSCRIPT line %d: control %d is missing or does not fit%s", a.line, a.id,
+                a.kind == Action::Kind::pick ? (", or has no item \"" + narrow(a.text) + "\"").c_str() : "");
+          }
         }
       }
       if (IsWindow(dlg)) SetTimer(dlg, kTimeoutTimer, self->timeout_ms_, nullptr);

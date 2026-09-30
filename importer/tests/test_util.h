@@ -14,6 +14,9 @@
 #include <vector>
 
 #include "adw/core/data_root.h"
+#include "md5.h"
+#include "packages.h"
+#include "source.h"
 #include "winutil.h"
 
 namespace test {
@@ -148,6 +151,13 @@ inline std::string read_text(const std::filesystem::path& p) {
   return std::string(b.begin(), b.end());
 }
 
+// Whether `s` is UTF-8 to Windows' own strict decoder (MB_ERR_INVALID_CHARS):
+// the tests' check of what the importer writes, independent of the
+// importer's own winutil.h utf8_sequence_length.
+inline bool strict_utf8(const std::string& s) {
+  return s.empty() || MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), int(s.size()), nullptr, 0) > 0;
+}
+
 // A fresh, empty scratch directory (argv[1] of the test, or %TEMP%).
 inline std::filesystem::path scratch(int argc, char** argv, const char* name) {
   std::filesystem::path p = argc > 1 ? std::filesystem::path(argv[1])
@@ -155,6 +165,95 @@ inline std::filesystem::path scratch(int argc, char** argv, const char* name) {
   adw::import::remove_tree(p);  // not std::filesystem::remove_all: see winutil.h
   std::filesystem::create_directories(p);
   return p;
+}
+
+// Where the real-image tests look for images, which they identify by size
+// and md5, never by name: every folder of AD_SOURCE_ISO_DIR (';'-separated),
+// else `fallback` (<repo>\source_iso), and the folders directly inside each
+// (so <repo>\source_iso\Implemented is searched too). Only read.
+inline std::vector<std::filesystem::path> image_dirs(const std::filesystem::path& fallback) {
+  std::vector<std::filesystem::path> roots, out;
+  const std::wstring env = get_env(L"AD_SOURCE_ISO_DIR");
+  if (!env.empty()) {
+    size_t i = 0;
+    while (i <= env.size()) {
+      size_t j = env.find(L';', i);
+      if (j == std::wstring::npos) j = env.size();
+      if (j > i) roots.push_back(env.substr(i, j - i));
+      i = j + 1;
+    }
+  } else if (!fallback.empty()) {
+    roots.push_back(fallback);
+  }
+  std::error_code ec;
+  for (const auto& r : roots) {
+    out.push_back(r);
+    std::vector<std::filesystem::path> subs;
+    for (auto it = std::filesystem::directory_iterator(r, ec); !ec && it != std::filesystem::directory_iterator();
+         it.increment(ec))
+      if (it->is_directory(ec)) subs.push_back(it->path());
+    ec.clear();
+    std::sort(subs.begin(), subs.end());
+    out.insert(out.end(), subs.begin(), subs.end());
+  }
+  return out;
+}
+
+// The first file directly in one of `dirs` with this size and md5 (only
+// files of that size are hashed); "" when there is none.
+inline std::filesystem::path find_image(const std::vector<std::filesystem::path>& dirs, uint64_t size,
+                                        const std::string& md5) {
+  std::error_code ec;
+  for (const auto& d : dirs) {
+    for (auto it = std::filesystem::directory_iterator(d, ec); !ec && it != std::filesystem::directory_iterator();
+         it.increment(ec)) {
+      if (!it->is_regular_file(ec) || it->file_size(ec) != size) continue;
+      if (adw::import::md5_file_hex(it->path()) == md5) return it->path();
+    }
+    ec.clear();
+  }
+  return {};
+}
+
+// The images of every install disk of a release on several (packages.h
+// KnownImage::disk), identified by size and md5, never by name: a loose
+// image of each disk directly in one of `dirs` (from either known copy of
+// it), in disk order; else one ZIP of 256 MB or less whose floppy images
+// cover every disk (the Internet Archive's ZIP of the images, as
+// source_iso/afterdark-20b_startrek.zip is). Empty when neither is there, or
+// the package has no install disks. Only read.
+inline std::vector<std::filesystem::path> find_disk_set(const std::vector<std::filesystem::path>& dirs,
+                                                        const adw::import::Package& p) {
+  int n = 0;
+  for (const adw::import::KnownImage& k : p.images) n = std::max(n, k.disk);
+  if (!n) return {};
+  std::vector<std::filesystem::path> loose(static_cast<size_t>(n));
+  for (const adw::import::KnownImage& k : p.images)
+    if (k.disk && loose[size_t(k.disk - 1)].empty()) loose[size_t(k.disk - 1)] = find_image(dirs, k.size, k.md5);
+  if (std::all_of(loose.begin(), loose.end(), [](const std::filesystem::path& x) { return !x.empty(); })) return loose;
+  std::error_code ec;
+  for (const auto& d : dirs) {
+    for (auto it = std::filesystem::directory_iterator(d, ec); !ec && it != std::filesystem::directory_iterator();
+         it.increment(ec)) {
+      const std::string name = adw::import::to_utf8(it->path().filename().wstring());
+      if (!it->is_regular_file(ec) || it->file_size(ec) > (256ull << 20) || name.size() < 4 ||
+          _stricmp(name.c_str() + name.size() - 4, ".zip") != 0)
+        continue;
+      std::vector<bool> have(static_cast<size_t>(n), false);
+      try {
+        for (const adw::import::ZippedImage& z : adw::import::floppy_images_in_zip(it->path())) {
+          const std::string md5 = adw::import::md5_hex(z.bytes->data(), z.bytes->size());
+          for (const adw::import::KnownImage& k : p.images)
+            if (k.disk && md5 == k.md5) have[size_t(k.disk - 1)] = true;
+        }
+      } catch (const std::exception&) {
+        continue;
+      }
+      if (std::all_of(have.begin(), have.end(), [](bool b) { return b; })) return {it->path()};
+    }
+    ec.clear();
+  }
+  return {};
 }
 
 // Every regular file under `root`, as '/'-separated relative paths.

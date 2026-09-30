@@ -6,7 +6,9 @@
 // the boot sector, the first FAT, the fixed root directory, subdirectories
 // through their cluster chains. Directory data is read when a directory is
 // listed, file data only when a file is read — a file that is never asked
-// for is never touched (PACKAGES.md §4.2 I5).
+// for is never touched (PACKAGES.md §4.2 I5). An image is a file, or bytes
+// already in memory: a floppy image inside a ZIP (Star Trek: The Screen
+// Saver's two disks, as the Internet Archive zips them), read by one reader.
 //
 // Validation is strict, because an image is untrusted input: a BPB with a
 // zero or impossible field, a missing 55 AA signature, an image shorter than
@@ -43,6 +45,8 @@ class FatImage {
  public:
   // Throws FatError when the file is not a readable FAT12/16 image.
   explicit FatImage(const std::filesystem::path& path);
+  // The same over an image in memory (every check is the file's).
+  explicit FatImage(std::shared_ptr<const std::vector<uint8_t>> bytes);
   ~FatImage();
   FatImage(const FatImage&) = delete;
   FatImage& operator=(const FatImage&) = delete;
@@ -53,7 +57,9 @@ class FatImage {
   uint32_t sectors_per_cluster() const;
   uint32_t cluster_count() const;
   uint8_t media() const;
-  const std::string& volume_label() const;  // from the root directory's label entry ("" when none)
+  // From the root directory's label entry, decoded from code page 437 as the
+  // names are (UTF-8, case kept; "" when none).
+  const std::string& volume_label() const;
 
   const FatEntry& root() const;
   // Children of a directory in on-disk order: deleted entries, LFN entries,
@@ -66,6 +72,7 @@ class FatImage {
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  void open();
 };
 
 }  // namespace adw::import

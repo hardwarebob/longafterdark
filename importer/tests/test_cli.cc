@@ -149,8 +149,9 @@ int main(int argc, char** argv) {
   test::write_bytes(dest / L"win" / L"catalog-win.json", {'s', 't', 'a', 'l', 'e'});
   CHECK_EQ(run(exe, {L"--catalog-only", L"--dest", dest.wstring()}, "--catalog-only", &out), 0);
   CHECK(out.find("0 modules, 0 controls") != std::string::npos);
-  // COVERS.md §2.7: the generator is adimport 1.2.
-  CHECK(test::read_text(dest / L"win" / L"catalog-win.json").find("\"generator\": \"adimport 1.2\"") !=
+  // The generator: adimport 1.3 since the Intermission modules (the catalog's
+  // "abi" field and the intermission recipe; 1.2 was the covers).
+  CHECK(test::read_text(dest / L"win" / L"catalog-win.json").find("\"generator\": \"adimport 1.3\"") !=
         std::string::npos);
   CHECK_EQ(run(exe, {L"--catalog-only", L"--dest", dest.wstring(), L"--quiet"}, "--catalog-only --quiet", &out), 0);
   CHECK(out.empty());
@@ -204,6 +205,13 @@ int main(int argc, char** argv) {
   // Deluxe with a generated cover (the synthetic disc has no setup art).
   CHECK_EQ(run(exe, {L"--list-packages", L"--dest", dest.wstring()}, "--list-packages", &out), 0);
   CHECK(out.find("; cover: generated") != std::string::npos);
+  // Seven releases; the title column fits the longest title, so every state
+  // starts in the same column.
+  CHECK(out.find("\n  swse      Star Wars Screen Entertainment not installed; download 6.9 MB (disc image)") !=
+        std::string::npos);
+  CHECK(out.find("\n  startrek  Star Trek: The Screen Saver    not installed; download 2.8 MB (2 floppy images)") !=
+        std::string::npos);
+  CHECK(out.find("\n  tt        Totally Twisted After Dark     not installed;") != std::string::npos);
   CHECK_EQ(run(exe, {L"--set-cover", L"tt", pic, L"--dest", dest.wstring()}, "--set-cover, not imported", &out), 1);
   CHECK(out.find("Totally Twisted After Dark isn't imported") != std::string::npos);
   CHECK_EQ(run(exe, {L"--set-cover", L"deluxe", pic, L"--dest", dest.wstring()}, "--set-cover, no picture"), 2);

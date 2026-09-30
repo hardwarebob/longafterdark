@@ -79,10 +79,11 @@ jobs:
       #
       # -LE gui leaves out the tests that open real windows on the desktop:
       # scr_smoke_* (with the opt-in scr_smoke_e2e-*) and import.gui_flow.
-      # The runner has no After Dark modules, so the suites that need them
-      # skip themselves (exit 77): core.lane_detect_assets, loader_corpus,
-      # win16.assets, pe32.assets, pe32.packages, ne16.assets, ne16.pkg,
-      # ne16.interaction and import.catalog_real; so do the opt-in ones
+      # The runner has no After Dark, Star Wars Screen Entertainment or Star
+      # Trek modules, so the suites that need them skip themselves (exit 77):
+      # core.lane_detect_assets, loader_corpus, win16.assets, pe32.assets,
+      # pe32.packages, ne16.assets, ne16.pkg, ne16.interaction, ne16.swse,
+      # ne16.startrek and import.catalog_real; so do the opt-in ones
       # (core.audio_assets, import.e2e, import.pkg_real, import.download_real,
       # import.covers_real) and cpu_perf (no upstream resource_dasm clone to
       # compare with). The download and cover tests serve their files from a

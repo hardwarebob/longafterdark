@@ -1,6 +1,8 @@
 // core.audio — the host audio engine (docs/AUDIO.md §10.1): formats,
 // ADPCM decoders byte for byte against the host's own msacm32 codecs, gains,
-// mixer determinism (a golden hash), timing, streams, SMF, captures, config.
+// mixer determinism (a golden hash), timing, streams, SMF, raw MIDI (the log,
+// its order with song events, running status, reset, the bus gain), captures,
+// config.
 //
 //   adw_core_audio_tests [<test-filter>]
 //
@@ -1317,6 +1319,148 @@ TEST(shutdown_silences_playing_songs) {
   }
   remove_file(wav);
   remove_file(c.capture_mid);
+}
+
+// ============================================================================================
+// raw MIDI (midiOut*: a guest that sequences itself)
+
+TEST(raw_midi_log_order_running_status_and_reset) {
+  std::string wav = temp_path("raw.wav");
+  Config c = capture_config(wav);
+  {
+    auto e = make_engine(c);
+    // A song on channel 1 alongside: its events and the raw ones share the log in time order.
+    SongId s = e->load_song(smf(0, 500, {Trk().ev(0, {0x90, 48, 100}).ev(500, {0x80, 48, 0}).eot()}));
+    e->song_play(s, 0);
+    e->midi_short(0x00644092, 100000);  // note on, channel 3
+    e->midi_short(0x00005A3C, 150000);  // running status: 0x92 60 90
+    e->midi_short(0x005007B2, 200000);  // the guest's CC7 at unity bus gain: 80 as it is
+    e->midi_short(0x777705C2, 250000);  // program change: the bytes past its one data byte are not read
+    e->midi_short(0x00000011, 300000);  // running status is 0xC2 now: one data byte
+    e->midi_short(0x000000F8, 600000);  // real time: an F7 escape; running status stays
+    e->midi_short(0x00000012, 610000);  // … so this is another program change
+    e->midi_short(0x000000F6, 620000);  // system common: ends running status
+    e->midi_short(0x00000013, 630000);  // no status to run on: dropped
+    e->midi_short(0x000000F0, 640000);  // SysEx does not come through midiOutShortMsg: dropped
+    // Half MIDI volume: the raw port's channel gets its CC7 re-sent (80 -> 40);
+    // a channel first used afterwards gets its scaled default first (100 -> 50).
+    e->set_bus_gain(Bus::midi, gain_from_mm(0x7FFF7FFF), 700000);
+    e->midi_short(0x00643C95, 800000);
+    // Long messages: SysEx as given, a stream with running status inside it,
+    // real time between, a status byte where data belongs (that message is
+    // dropped, the status byte starts the next) and a message cut short.
+    const uint8_t sysex[] = {0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7};
+    e->midi_long(sysex, 900000);
+    const uint8_t stream[] = {0x93, 62, 100, 64, 100, 0xF8, 0xC3, 9, 0x94, 0xF6, 0x94, 62};
+    e->midi_long(stream, 910000);
+    // Reset: note-offs for what the guest left sounding, then sustain off and
+    // all notes off on each channel it has used.
+    e->midi_reset(1000000);
+    e->midi_short(0x00000040, 1100000);  // running status ended with the reset: dropped
+    e->shutdown(2000000);
+    // Songs and raw messages count as MIDI events alike.
+    CHECK(e->stats().midi_events > 20);
+  }
+  auto log = read_midi_log(c.capture_mid);
+  auto at = [&](uint64_t ms) {
+    std::vector<std::vector<uint8_t>> v;
+    for (auto& l : log)
+      if (l.ms == ms) v.push_back(l.m);
+    return v;
+  };
+  using V = std::vector<std::vector<uint8_t>>;
+  CHECK(at(0) == V({{0xB0, 7, 100}, {0x90, 48, 100}}));
+  CHECK(at(100) == V({{0x92, 64, 100}}));
+  CHECK(at(150) == V({{0x92, 60, 90}}));
+  CHECK(at(200) == V({{0xB2, 7, 80}}));
+  CHECK(at(250) == V({{0xC2, 5}}));
+  CHECK(at(300) == V({{0xC2, 0x11}}));
+  CHECK(at(500) == V({{0x80, 48, 0}}));  // the song's own note-off, before the raw 600 ms ones
+  CHECK(at(600) == V({{0xF7, 0xF8}}));
+  CHECK(at(610) == V({{0xC2, 0x12}}));
+  CHECK(at(620) == V({{0xF7, 0xF6}}));
+  CHECK(at(630).empty() && at(640).empty());
+  CHECK(at(700) == V({{0xB2, 7, 40}}));  // the song has ended: only the raw channel's CC7
+  CHECK(at(800) == V({{0xB5, 7, 50}, {0x95, 60, 100}}));
+  CHECK(at(900) == V({{0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7}}));
+  CHECK(at(910) == V({{0xB3, 7, 50}, {0x93, 62, 100}, {0x93, 64, 100}, {0xF7, 0xF8}, {0xC3, 9}, {0xF7, 0xF6}}));
+  CHECK(at(1000) == V({{0x82, 60, 0}, {0x82, 64, 0}, {0xB2, 64, 0}, {0xB2, 123, 0},
+                       {0x83, 62, 0}, {0x83, 64, 0}, {0xB3, 64, 0}, {0xB3, 123, 0},
+                       {0x85, 60, 0}, {0xB5, 64, 0}, {0xB5, 123, 0}}));
+  CHECK(at(1100).empty());
+  // Nothing sounds at shutdown: no further silencing.
+  CHECK(!log.empty() && log.back().ms == 1000);
+  for (size_t i = 1; i < log.size(); i++) CHECK(log[i].ms >= log[i - 1].ms);
+  remove_file(wav);
+  remove_file(c.capture_mid);
+}
+
+// Real-time bytes (F8–FF) may come anywhere in a long message, as MIDI 1.0
+// lets them: between a message's data bytes, or inside a SysEx, each goes out
+// on its own as it comes, and the message around it goes on, running status
+// and all (a port fed the buffer plays both).
+TEST(raw_midi_real_time_bytes_inside_messages) {
+  std::string wav = temp_path("rawrt.wav");
+  Config c = capture_config(wav);
+  {
+    auto e = make_engine(c);
+    const uint8_t clock_in_note[] = {0x90, 60, 0xF8, 64};
+    e->midi_long(clock_in_note, 100000);
+    const uint8_t sensing_in_running[] = {0x91, 62, 64, 63, 0xFE, 64};
+    e->midi_long(sensing_in_running, 200000);
+    const uint8_t start_then_running[] = {0xFA, 65, 64};  // running status 0x91 goes on after it
+    e->midi_long(start_then_running, 300000);
+    const uint8_t clock_in_sysex[] = {0xF0, 0x43, 0xF8, 0x10, 0xF7};
+    e->midi_long(clock_in_sysex, 400000);
+    // A real-time byte, then a status byte where data belongs: that one drops the message.
+    const uint8_t clock_then_status[] = {0x92, 60, 0xF8, 0xC2, 5};
+    e->midi_long(clock_then_status, 500000);
+    e->shutdown(1000000);
+  }
+  auto log = read_midi_log(c.capture_mid);
+  auto at = [&](uint64_t ms) {
+    std::vector<std::vector<uint8_t>> v;
+    for (auto& l : log)
+      if (l.ms == ms) v.push_back(l.m);
+    return v;
+  };
+  using V = std::vector<std::vector<uint8_t>>;
+  CHECK(at(100) == V({{0xF7, 0xF8}, {0x90, 60, 64}}));
+  CHECK(at(200) == V({{0x91, 62, 64}, {0xF7, 0xFE}, {0x91, 63, 64}}));
+  CHECK(at(300) == V({{0xF7, 0xFA}, {0x91, 65, 64}}));
+  CHECK(at(400) == V({{0xF7, 0xF8}, {0xF0, 0x43, 0x10, 0xF7}}));
+  CHECK(at(500) == V({{0xF7, 0xF8}, {0xC2, 5}}));
+  remove_file(wav);
+  remove_file(c.capture_mid);
+}
+
+TEST(raw_midi_shutdown_silences_and_disabled_engines_ignore) {
+  std::string wav = temp_path("rawshut.wav");
+  Config c = capture_config(wav);
+  {
+    auto e = make_engine(c);
+    e->midi_short(0x00643C91, 1000);
+    e->midi_short(0x00000000 | 0x3E | (0x64 << 8), 2000);  // running status: 0x91 62 100
+    e->midi_short(0x00003C91, 3000);                        // note on at velocity 0 = off
+    e->shutdown(5000);
+    e->midi_short(0x00643C91, 6000);  // after shutdown: accepted, nothing written
+  }
+  auto log = read_midi_log(c.capture_mid);
+  CHECK(log.size() == 5);
+  if (log.size() == 5) {
+    CHECK(log[3].ms == 5 && log[3].m == std::vector<uint8_t>({0x81, 62, 0}));
+    CHECK(log[4].ms == 5 && log[4].m == std::vector<uint8_t>({0xB1, 123, 0}));
+  }
+  remove_file(wav);
+  remove_file(c.capture_mid);
+  // Disabled engines take the calls and do nothing.
+  auto d = make_engine(Config{});
+  d->midi_short(0x00643C90, 0);
+  const uint8_t sx[] = {0xF0, 0x01, 0xF7};
+  d->midi_long(sx, 0);
+  d->midi_reset(0);
+  null_engine().midi_short(0x00643C90, 0);
+  CHECK_EQ(d->stats().midi_events, uint64_t(0));
 }
 
 // ============================================================================================

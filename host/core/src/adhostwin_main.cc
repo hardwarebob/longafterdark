@@ -6,14 +6,16 @@
 //   adhostwin.exe --configure <module> --button <slot> [--owner <hwnd>] [KEY=VALUE …]
 //
 // Picks the lane from the module's header (PE32 -> the AD 4 lane, NE -> the
-// Classic lane), then hands everything to run_host(): frames out on stdout,
-// commands in on stdin, per DESIGN.md §1. KEY=VALUE arguments override the
-// environment (ADSTREAM=1, ADFRAMES=100, …). Diagnostics go to stderr only.
+// Classic lane, which runs After Dark 2.x/3.x and Intermission modules), then
+// hands everything to run_host(): frames out on stdout, commands in on stdin,
+// per DESIGN.md §1. KEY=VALUE arguments override the environment
+// (ADSTREAM=1, ADFRAMES=100, …). Diagnostics go to stderr only.
 #include <fcntl.h>
 #include <io.h>
 #include <windows.h>
 #include <shellapi.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cinttypes>
 #include <cstdlib>
@@ -37,16 +39,18 @@ using namespace adw;
 namespace {
 
 void usage() {
-  log("usage: adhostwin.exe <module.AD | --test-pattern> [KEY=VALUE ...]");
+  log("usage: adhostwin.exe <module (.AD, .IMX) | --test-pattern> [KEY=VALUE ...]");
   log("       adhostwin.exe --capabilities");
   log("       adhostwin.exe --configure <module> --button <slot> [--owner <hwnd>] [KEY=VALUE ...]");
   log("  env/KEY: ADSTREAM=1 ADSCREENW/ADSCREENH ADFRAMES=<n> ADFBHASH=1 ADOUT=<dir>");
   log("           ADCVSET=<i>=<v>,... ADSEED=<n>|random ADNOPACE=1 AD_ASSETS_DIR ADTRACE=<cats>");
-  log("           ADCAPS=0|1 ADSTATE=<dir>|:memory: ADSTATUSHANDLE=<n> ADSTATUSLOG=1");
+  log("           ADCAPS=0|1 ADNUMLOCK=0|1 ADSTATE=<dir>|:memory: ADSTATUSHANDLE=<n> ADSTATUSLOG=1");
   log("           AD_LOCALAPPDATA=<dir> (instead of %%LOCALAPPDATA%% for the data folder)");
   log("  sound:   ADSOUND=1 ADAUDIOOUT=<file.wav> ADVOLUME=0..100 ADAUDIORATE=<hz> ADAUDIOLATENCYMS=<ms>");
   log("           ADAUDIOLIVE=0 ADMIDI=0 ADMIDIDEV=<n> ADMIDIBASE=1 (--test-pattern: ADTESTAUDIO=1)");
-  log("  stdin:   GO | SET <i> <v> | KEY <vk> <0|1> | CAPS <0|1> | MOUSE <x> <y> <buttons> | QUIT");
+  log("  lanes:   ne16: ADNE16KIND=auto|ad3|imx ADNE16READER=auto|imq|native ADNE16BRIDGE=auto|oldmod16|native ...");
+  log("           (the lane knobs: host/ne16/lane.hh, host/pe32/lane.hh)");
+  log("  stdin:   GO | SET <i> <v> | KEY <vk> <0|1> | CAPS <0|1> | NUMLOCK <0|1> | MOUSE <x> <y> <buttons> | QUIT");
   log("  see host/core/README.md");
 }
 
@@ -92,10 +96,13 @@ std::vector<LinkedLane> linked_lanes() {
   return v;
 }
 
-// "lanes=pe32,ne16 configure=pe32,ne16 status=1 state=1 seed=1 audio=1"
-// (§3.3; audio: AUDIO.md §4): only what this build has.
+// "lanes=pe32,ne16 configure=pe32,ne16 abis=afterdark,intermission status=1
+// state=1 seed=1 audio=1 numlock=1" (§3.3; audio: AUDIO.md §4; numlock: the
+// NUMLOCK line and ADNUMLOCK are understood): only what this build has.
+// abis= is the union of the linked lanes' Lane::abis(), in lane order.
 std::string capabilities_line() {
   std::string lanes, configure;
+  std::vector<std::string> abis;
   for (const LinkedLane& l : linked_lanes()) {
     if (!lanes.empty()) lanes += ',';
     lanes += l.name;
@@ -104,8 +111,15 @@ std::string capabilities_line() {
       if (!configure.empty()) configure += ',';
       configure += l.name;
     }
+    if (lane) {
+      for (const std::string& a : lane->abis()) {
+        if (std::find(abis.begin(), abis.end(), a) == abis.end()) abis.push_back(a);
+      }
+    }
   }
-  return "lanes=" + lanes + " configure=" + configure + " status=1 state=1 seed=1 audio=1";
+  std::string abi_list;
+  for (const std::string& a : abis) abi_list += (abi_list.empty() ? "" : ",") + a;
+  return "lanes=" + lanes + " configure=" + configure + " abis=" + abi_list + " status=1 state=1 seed=1 audio=1 numlock=1";
 }
 
 bool file_exists(const std::string& p) {
@@ -144,7 +158,7 @@ int pick_lane(const Env& env, std::string& module, std::unique_ptr<Lane>& lane, 
       *why = module + ": " + probe.detail;
       return kExitUsage;
     case LaneKind::unsupported:
-      *why = module + ": not an After Dark module this host can run (" + probe.detail + ")";
+      *why = module + ": not a module this host can run (" + probe.detail + ")";
       return kExitUsage;
     case LaneKind::pe32:
 #if ADW_HAVE_LANE_PE32
@@ -413,11 +427,12 @@ int main() {
   // on a console would just stall a person's interactive run.
   io.go_wait = reader.kind() == StdinReader::Kind::pipe || reader.kind() == StdinReader::Kind::file;
 
-  log("lane %s, %dx%d, %s, stdin %s, seed %" PRIu64 "%s%s%s", lane->name(), env.screen_w, env.screen_h,
+  log("lane %s, %dx%d, %s, stdin %s, seed %" PRIu64 "%s%s%s%s", lane->name(), env.screen_w, env.screen_h,
       env.stream ? (env.stream_p6 ? "streaming P6" : "streaming P8") : "headless",
       StdinReader::kind_name(reader.kind()), env.seed,
       env.frames ? (", " + std::to_string(env.frames) + " frames").c_str() : "",
-      env.caps_at_start ? ", caps on" : "", status.mapped() ? ", status record" : "");
+      env.caps_at_start ? ", caps on" : "", env.numlock_at_start ? ", num lock on" : "",
+      status.mapped() ? ", status record" : "");
   HostResult r;
   try {
     r = run_host(*lane, module, env, io);

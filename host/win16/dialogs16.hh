@@ -25,8 +25,11 @@
 //     turned into real colours through the hardware palette and blitted);
 //   * MessageBox → a real MessageBoxW; COMMDLG GetOpenFileName/GetSaveFileName
 //     → the real dialogs, returning 8.3 H:\ paths (win32::Vfs::host_to_guest);
-//     WinHelp → logged, 1; WinExec("notepad <file>") → the real Notepad on
-//     the file's upper-layer copy (NONSENSE's Edit Names).
+//     COMMDLG ChooseFont → the real font dialog (screen fonts), its choice
+//     written back as the 16-bit LOGFONT, point size, colour and font type
+//     (SWTEXT's Select Font; cancelled, logged, when hidden: no script line
+//     picks a font); WinHelp → logged, 1; WinExec("notepad <file>") → the
+//     real Notepad on the file's upper-layer copy (NONSENSE's Edit Names).
 //
 // The ADCONFIG* test hooks (win32/config_script.hh) script the real
 // dialogs. In the saver nothing here is installed: dialogs stay refused.

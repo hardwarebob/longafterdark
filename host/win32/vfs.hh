@@ -19,6 +19,13 @@
 // it with ERROR_PATH_NOT_FOUND. The drive root ("C:\") and every directory on
 // the way to a mount point or a virtual file exist, empty but for those.
 //
+// The current directory is DOS's: a current drive, and on every drive a
+// current directory of its own (its root until one is set there). "name"
+// resolves against the current drive's, "\name" against its root, and
+// "X:name" against drive X's own — so a folder list that changes to H: and
+// back to "c:" finds C: where it left it (win16/dos16.hh: INT 21h AH=0Eh,
+// 19h, 3Bh and 47h, and USER's DlgDirList, keep DOS's rules on top).
+//
 // Overlay semantics (§7.3):
 //   * lookup: the upper layer, then virtual files, then the lower directory;
 //     list() merges all three, the upper winning by name.
@@ -106,8 +113,26 @@ class Vfs {
   // were mounted with short names); "" when neither applies (no H:, a UNC path).
   std::string host_to_guest(std::string_view host_path) const;
 
+  // ---- the current directory (DOS's: a current drive, a directory per drive) ----
+  // The current drive's current directory ("C:\\AFTERDRK"); its first
+  // character is the current drive.
   const std::string& cwd() const { return cwd_; }
-  bool set_cwd(std::string_view guest);  // false if it is not an existing directory
+  // An existing directory becomes its drive's current directory, and that
+  // drive the current one (Win32 SetCurrentDirectory; USER's DlgDirList).
+  // False, and nothing changes, when it is not an existing directory.
+  bool set_cwd(std::string_view guest);
+  // DOS's chdir (INT 21h AH=3Bh): the directory becomes its drive's current
+  // directory; the current drive stays what it was. False, and nothing
+  // changes, when it is not an existing directory.
+  bool set_drive_cwd(std::string_view guest);
+  // Drive `letter`'s current directory: cwd() for the current drive, else the
+  // one set there last, else the drive's root ("H:\\").
+  std::string drive_cwd(char letter) const;
+  // DOS's select disk (INT 21h AH=0Eh): drive `letter` becomes the current
+  // drive, at its own current directory (its root, should that one be gone).
+  // False, and nothing changes, when the guest's disk has no such drive (no
+  // directory at its root).
+  bool set_drive(char letter);
 
   // ---- files ----
   // One file API for both lanes (KERNEL32 CreateFileA/_lopen/_lcreat/OpenFile,
@@ -156,9 +181,11 @@ class Vfs {
   // StateLock around both.
   bool write_file(std::string_view guest, std::string_view bytes, uint32_t* win32_error);
 
-  // Guest paths written this run (created, replaced, renamed to), first-write
-  // order, no repeats: the --configure JSON's "written".
-  const std::vector<std::string>& written() const { return written_; }
+  // Guest paths written this run (created, replaced, renamed to) that are
+  // still there, first-write order, no repeats: the --configure JSON's
+  // "written". A file the run wrote and then removed or renamed away (STRESS's
+  // GetTempFileName file, deleted again in the memory C:\WINDOWS\TEMP) is not.
+  std::vector<std::string> written() const;
   // True when some overlay has a persistent (host) upper.
   bool persistent() const;
   // The state mutex's name ("" while no persistent upper is mounted).
@@ -214,6 +241,7 @@ class Vfs {
   mutable std::map<std::string, std::weak_ptr<FileBuffer>> open_buffers_;
   std::vector<std::string> written_;
   std::string cwd_ = "C:\\";
+  std::map<char, std::string> drive_cwds_;  // the other drives' current directories (drive letter, upper case)
   std::string state_root_;
   mutable void* mutex_ = nullptr;
   uint64_t mem_time_;

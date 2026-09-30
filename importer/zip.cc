@@ -98,6 +98,14 @@ ZipArchive::ZipArchive(std::shared_ptr<const std::vector<uint8_t>> data, std::st
     m.local_offset = le32(c + 42);
     if (p + 46 + nlen + xlen + clen > size_t(cd_off) + cd_size) throw ZipError(name_ + ": damaged central directory");
     m.name.assign(reinterpret_cast<const char*>(c + 46), nlen);
+    // The name as UTF-8, before anything reads it (zip.h). Bit 11 says it is
+    // UTF-8 (APPNOTE 4.4.4): each byte that is not UTF-8 becomes U+FFFD.
+    // Without the bit the specification says code page 437 (what
+    // Explorer and 7-Zip write on an English Windows, their OEM code page),
+    // but archivers elsewhere write UTF-8 without it: a name that is UTF-8
+    // stays so, any other is code page 437.
+    if (m.flags & 0x800) m.name = to_valid_utf8(m.name);
+    else if (!is_utf8(m.name)) m.name = oem437_to_utf8(m.name);
     p += 46 + size_t(nlen) + xlen + clen;
     if (m.csize == 0xFFFFFFFF || m.usize == 0xFFFFFFFF || m.local_offset == 0xFFFFFFFF)
       throw ZipError(name_ + ": ZIP64 members are not supported");
@@ -112,7 +120,8 @@ ZipArchive::ZipArchive(std::shared_ptr<const std::vector<uint8_t>> data, std::st
     } catch (const ImportError& ex) {
       throw ZipError(ex.what());
     }
-    if (!seen.insert(ascii_upper(m.name)).second) throw ZipError(name_ + ": two members are named " + m.name);
+    // One name as Windows compares them (non-ASCII letters too; names.h).
+    if (!seen.insert(name_key(m.name)).second) throw ZipError(name_ + ": two members are named " + m.name);
     if (m.encrypted() && m.csize < 12) throw ZipError(name_ + "!" + m.name + ": encrypted member shorter than its header");
     members_.push_back(std::move(m));
   }

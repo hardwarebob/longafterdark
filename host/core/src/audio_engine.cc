@@ -10,6 +10,11 @@
 //
 // Every call that takes a time first clamps it (never backwards) and renders
 // up to it, so a state change is heard from output frame floor(t * R / 10^6).
+//
+// The MIDI bus carries the songs' events and the guest's own raw messages
+// (midi_short/long/reset, for a guest that sequences itself through midiOut):
+// both reach the sinks stamped with their guest time, in time order, under the
+// same CC7 rule for the bus gain (AUDIO.md §6.4).
 #include <algorithm>
 #include <bitset>
 #include <cinttypes>
@@ -98,6 +103,9 @@ class DisabledEngine : public Engine {
   uint64_t song_length(SongId) const override { return 0; }
   bool song_playing(SongId, Time) override { return false; }
   void close_song(SongId, Time) override {}
+  void midi_short(uint32_t, Time) override {}
+  void midi_long(std::span<const uint8_t>, Time) override {}
+  void midi_reset(Time) override {}
   void set_bus_gain(Bus, Gain, Time) override {}
   Gain bus_gain(Bus) const override { return Gain{}; }
   void poll(Time, std::vector<Event>&) override {}
@@ -529,6 +537,119 @@ class EngineImpl : public Engine {
     ATRACE("@%" PRIu64 " song %u close", t, id);
   }
 
+  // ---- raw MIDI (midiOut*) ----
+  void midi_short(uint32_t msg, Time t) override {
+    t = sync(t);
+    const uint8_t b[3] = {uint8_t(msg), uint8_t(msg >> 8), uint8_t(msg >> 16)};
+    if (b[0] >= 0xF8) {  // real time: one byte; running status stays
+      emit_raw_system(t, b, 1);
+      return;
+    }
+    if (b[0] >= 0xF0) {  // system common ends running status; F0/F7 belong in a long message
+      raw_.running = 0;
+      if (int n = system_len(b[0])) emit_raw_system(t, b, size_t(n));
+      return;
+    }
+    uint8_t st, d1, d2;
+    if (b[0] & 0x80) {
+      st = b[0], d1 = b[1], d2 = b[2];
+    } else if (raw_.running) {
+      st = raw_.running, d1 = b[0], d2 = b[1];
+    } else {
+      return;  // data with no status to run on: dropped, as a synth would
+    }
+    raw_.running = st;
+    raw_channel(st, uint8_t(d1 & 0x7F), uint8_t(d2 & 0x7F), t);
+  }
+
+  // Real-time bytes (F8–FF) may come anywhere in the stream, as MIDI 1.0 lets
+  // them — between a message's data bytes and inside a SysEx too: each goes
+  // out on its own as it comes, and the message around it goes on (running
+  // status included), as a synth on the cable would take them.
+  void midi_long(std::span<const uint8_t> bytes, Time t) override {
+    t = sync(t);
+    const size_t n = bytes.size();
+    size_t i = 0;
+    while (i < n) {
+      const uint8_t b = bytes[i];
+      if (b == 0xF0) {
+        // SysEx: through its F7, or up to the next status byte that is not
+        // real time (which ends an unterminated one), or the buffer's end.
+        std::vector<uint8_t> sysex{b};
+        size_t j = i + 1;
+        while (j < n) {
+          const uint8_t c = bytes[j++];
+          if (c >= 0xF8) {
+            emit_raw_system(t, &c, 1);
+            continue;
+          }
+          if (c >= 0x80 && c != 0xF7) {
+            j--;
+            break;
+          }
+          sysex.push_back(c);
+          if (c == 0xF7) break;
+        }
+        emit_midi(t, sysex.data(), sysex.size());
+        raw_.running = 0;
+        i = j;
+        continue;
+      }
+      if (b >= 0xF8) {
+        emit_raw_system(t, &b, 1);
+        i++;
+        continue;
+      }
+      if (b >= 0xF1) {
+        raw_.running = 0;
+        size_t len = size_t(system_len(b));
+        if (len == 0 || i + len > n) {  // a stray F7, or cut short
+          i++;
+          continue;
+        }
+        emit_raw_system(t, bytes.data() + i, len);
+        i += len;
+        continue;
+      }
+      uint8_t st = raw_.running;
+      if (b & 0x80) {
+        st = b;
+        i++;
+      } else if (!st) {
+        i++;
+        continue;
+      }
+      const size_t need = ((st & 0xF0) == 0xC0 || (st & 0xF0) == 0xD0) ? 1 : 2;
+      uint8_t data[2] = {0, 0};
+      size_t got = 0;
+      while (got < need && i < n) {
+        const uint8_t c = bytes[i];
+        if (c >= 0xF8) {  // real time: out now, and the message goes on
+          emit_raw_system(t, &c, 1);
+          i++;
+          continue;
+        }
+        if (c & 0x80) break;
+        data[got++] = c;
+        i++;
+      }
+      if (got < need) {
+        if (i >= n) break;  // cut short at the end: dropped
+        raw_.running = 0;   // a status byte where data belongs: the message is dropped
+        continue;
+      }
+      raw_.running = st;
+      raw_channel(st, data[0], data[1], t);
+    }
+  }
+
+  void midi_reset(Time t) override {
+    t = sync(t);
+    raw_.running = 0;
+    raw_notes_off(t, true);
+    ATRACE("@%" PRIu64 " raw MIDI reset (channels %04x)", t, raw_.used);
+  }
+
   // ---- buses, events, time ----
   void set_bus_gain(Bus b, Gain g, Time t) override {
     t = sync(t);
@@ -536,11 +657,15 @@ class EngineImpl : public Engine {
     if (cur == g) return;
     cur = g;
     ATRACE("@%" PRIu64 " bus %s gain %04x/%04x", t, bus_name(b), g.left, g.right);
-    if (b == Bus::midi)
+    if (b == Bus::midi) {
       for (auto& [id, s] : songs_)
         if (s.playing)
           for (int c = 0; c < 16; c++)
             if (s.used & (1u << c)) send_cc7(t, c, s.cc7[c]);
+      // The raw port's channels too (the synth holds their scaled CC7).
+      for (int c = 0; c < 16; c++)
+        if (raw_.used & (1u << c)) send_cc7(t, c, raw_.cc7[c]);
+    }
   }
 
   Gain bus_gain(Bus b) const override { return bus_gain_[b == Bus::wave ? 0 : 1]; }
@@ -571,6 +696,7 @@ class EngineImpl : public Engine {
     // playing song. The songs themselves keep their (guest-visible) state.
     for (auto& [id, s] : songs_)
       if (s.playing) notes_off(s, t, true);
+    raw_notes_off(t, false);
     if (live_pcm_) {
       live_pcm_->close();
       final_underruns_ = live_pcm_->underruns();
@@ -647,6 +773,16 @@ class EngineImpl : public Engine {
     std::array<uint8_t, 16> cc7{};  // the song's own channel volume, before the bus gain
     std::array<std::bitset<128>, 16> sounding;
     std::vector<std::vector<uint8_t>> chase;  // state to re-send at the next play (after a seek)
+  };
+  // The raw MIDI port (midi_short/long/reset): one per engine, as the guest's
+  // one MIDI output device is. Its channels keep their CC7 (and stay "used")
+  // across resets: the synth keeps them too.
+  struct RawMidi {
+    uint8_t running = 0;   // running status (a channel status byte)
+    uint16_t used = 0;     // bit c = the port has sent a channel message on channel c
+    std::array<uint8_t, 16> cc7;  // the guest's own channel volume, before the bus gain
+    std::array<std::bitset<128>, 16> sounding;
+    RawMidi() { cc7.fill(100); }
   };
 
   // ---- helpers ----
@@ -762,12 +898,13 @@ class EngineImpl : public Engine {
     emit_midi(at, m, 3);
   }
   // CC7 = round(value x the MIDI bus gain), the gain being the mean of its sides.
-  void send_cc7(Time at, int ch, uint8_t value) {
+  uint8_t scaled_cc7(uint8_t value) const {
     const Gain& g = bus_gain_[1];
     uint32_t mean = (uint32_t(g.left) + g.right) / 2;
     uint32_t v = (uint32_t(value) * mean + 16384) >> 15;
-    emit3(at, uint8_t(0xB0 | ch), 7, uint8_t(std::min<uint32_t>(v, 127)));
+    return uint8_t(std::min<uint32_t>(v, 127));
   }
+  void send_cc7(Time at, int ch, uint8_t value) { emit3(at, uint8_t(0xB0 | ch), 7, scaled_cc7(value)); }
   void notes_off(Song& s, Time t, bool all_notes_off) {
     for (int c = 0; c < 16; c++) {
       for (int n = 0; n < 128; n++)
@@ -777,6 +914,59 @@ class EngineImpl : public Engine {
     if (all_notes_off)
       for (int c = 0; c < 16; c++)
         if (s.used & (1u << c)) emit3(t, uint8_t(0xB0 | c), 123, 0);
+  }
+  // The raw port's channel message (midi_short, midi_long): the bus gain on
+  // its CC7 and on a channel's first use, its notes tracked for silencing.
+  void raw_channel(uint8_t st, uint8_t d1, uint8_t d2, Time t) {
+    const int c = st & 0x0F, type = st & 0xF0;
+    const bool cc7 = type == 0xB0 && d1 == 7;
+    if (!(raw_.used & (1u << c))) {
+      raw_.used = uint16_t(raw_.used | (1u << c));
+      ATRACE("@%" PRIu64 " raw MIDI: channel %d in use", t, c + 1);
+      // A channel whose CC7 the guest never sets still gets the bus gain, as
+      // song_play gives a song's channels theirs.
+      if (!cc7 && scaled_cc7(raw_.cc7[c]) != raw_.cc7[c]) send_cc7(t, c, raw_.cc7[c]);
+    }
+    if (type == 0x90 && d2 > 0) raw_.sounding[c].set(d1);
+    else if (type == 0x80 || type == 0x90) raw_.sounding[c].reset(d1);
+    if (cc7) {
+      raw_.cc7[c] = d2;
+      send_cc7(t, c, d2);
+      return;
+    }
+    const uint8_t m[3] = {st, d1, d2};
+    emit_midi(t, m, (type == 0xC0 || type == 0xD0) ? 2 : 3);
+  }
+  // System common (1..3 bytes: status and data) or real time (1): an SMF has no
+  // event for them, so they go as an F7 escape (the live sink sends its bytes raw).
+  void emit_raw_system(Time t, const uint8_t* b, size_t n) {
+    uint8_t m[4] = {0xF7, b[0], 0, 0};
+    for (size_t i = 1; i < n; i++) m[i + 1] = uint8_t(b[i] & 0x7F);
+    emit_midi(t, m, n + 1);
+  }
+  // Bytes in a system common message (status included); 0 for F0/F7, which
+  // only a long message carries.
+  static int system_len(uint8_t st) {
+    switch (st) {
+      case 0xF1: case 0xF3: return 2;  // MTC quarter frame, song select
+      case 0xF2: return 3;             // song position
+      case 0xF4: case 0xF5: case 0xF6: return 1;  // undefined, tune request
+      default: return 0;
+    }
+  }
+  // Silences the raw port: note-off for every note it left sounding, then CC123
+  // on those channels; a reset (midiOutReset) also sends sustain off and CC123
+  // on every channel the port has used.
+  void raw_notes_off(Time t, bool reset) {
+    for (int c = 0; c < 16; c++) {
+      if (!(raw_.used & (1u << c))) continue;
+      const bool any = raw_.sounding[c].any();
+      for (int k = 0; k < 128; k++)
+        if (raw_.sounding[c].test(size_t(k))) emit3(t, uint8_t(0x80 | c), uint8_t(k), 0);
+      raw_.sounding[c].reset();
+      if (reset) emit3(t, uint8_t(0xB0 | c), 64, 0);
+      if (reset || any) emit3(t, uint8_t(0xB0 | c), 123, 0);
+    }
   }
   void stop_song(SongId id, Song& s, Time t) {
     s.pos0 = std::min(s.smf.length_us, s.pos0 + (t - s.t0));
@@ -1039,6 +1229,7 @@ class EngineImpl : public Engine {
   std::map<VoiceId, Voice> voices_;
   std::map<StreamId, Stream> streams_;
   std::map<SongId, Song> songs_;
+  RawMidi raw_;
   std::map<Key, Event> pending_;
   Gain bus_gain_[2];
   Stats stats_;

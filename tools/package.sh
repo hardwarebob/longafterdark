@@ -10,8 +10,8 @@
 # source gives the same bytes. The new folder is staged beside the old one
 # and swapped in only when complete; if the old one is in use (a running
 # screen saver or settings window), nothing is replaced.
-# No After Dark file is ever staged: the user imports their own discs (or the
-# Internet Archive copies) with adimport.
+# No After Dark or Star Wars Screen Entertainment file is ever staged: the
+# user imports their own discs (or the Internet Archive copies) with adimport.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD="${AD_BUILD_DIR:-$ROOT/build/win-release}"
@@ -69,7 +69,8 @@ Long After Dark: third-party software
 
 The three programs (LongAfterDark.scr, adhostwin.exe, adimport.exe) are
 linked statically, so each carries inside it the parts of the code below
-that it uses. The full licence texts are in this folder.
+that it uses. The full licence texts are in this folder (UNARJ's terms,
+which have no file of their own, are quoted below).
 
   resource_dasm.LICENSE.txt       MIT
     The x86 emulator in adhostwin.exe is derived from resource_dasm
@@ -85,7 +86,27 @@ that it uses. The full licence texts are in this folder.
   zlib.LICENSE.txt                zlib
     zlib (https://zlib.net/), commit
     $ZLIB_REV,
-    in adimport.exe (the After Dark 3.x installers' archives).
+    in adimport.exe (the After Dark 3.x installers' archives, and the
+    CRC-32 of Star Wars Screen Entertainment's).
+
+  (no file: the terms are here)   UNARJ's terms
+    The ARJ decoder in adimport.exe, which reads Star Wars Screen
+    Entertainment's archives, is a modified version of the decoder of
+    UNARJ by Robert K. Jung (ARJ Software), DECODE.C with UNARJ.C's bit
+    reader: ported to C++, with bounds checks added. UNARJ's LZH routines
+    follow Haruhiko Okumura's AR (ar002). adimport.exe only extracts ARJ
+    archives; it cannot make one. DECODE.C's header says (UNARJ.C's says
+    the same, Copyright (c) 1991-93, without the request for a copy):
+      Copyright (c) 1991 by Robert K Jung.  All rights reserved.
+      This code may be freely used in programs that are NOT ARJ
+      archivers (both compress and extract ARJ archives).
+      If you wish to distribute a modified version of this program, you
+      MUST indicate that it is a modified version both in the program
+      and source code.
+      If you modify this program, I would appreciate a copy of the new
+      source code.  I am holding the copyright on the source code, so
+      please do not delete my name from the program files or from the
+      documentation.
 
   LLVM.LICENSE.txt                Apache-2.0 WITH LLVM-exception
     The LLVM runtimes (libc++, libc++abi, libunwind, compiler-rt) of
@@ -97,44 +118,55 @@ that it uses. The full licence texts are in this folder.
     https://www.mingw-w64.org/), as built by llvm-mingw $LLVM_MINGW_VER,
     in all three programs.
 
-Everything else the programs use comes with Windows. No After Dark file is
-included.
+Apart from the code above and this project's own, everything the programs
+use comes with Windows. No After Dark or Star Wars Screen Entertainment file
+is included.
 EOF
 
 cat > "$DIST/README.txt" <<'EOF'
 Long After Dark
 ===============
 
-Long After Dark is a screen saver for Windows that runs the original Windows
-After Dark modules, unchanged, under x86 emulation. It knows five releases:
+Long After Dark is a screen saver for Windows that runs the original modules
+of After Dark and of LucasArts' Star Wars Screen Entertainment, unchanged,
+under x86 emulation. It knows seven releases:
 
-  id        Release                              Internet Archive download
-  deluxe    After Dark 4.0 Deluxe (1996)         CD image, 381.7 MB
-  ad10      After Dark 10th Anniversary (1999)   CD image, 143.3 MB
-  ad32      After Dark 3.2 (1995)                CD image, 58.8 MB
-  tt        Totally Twisted After Dark (1995)    CD image, 37.9 MB
-  simpsons  The Simpsons Screen Saver (1994)     install files (ZIP), 2.6 MB
+  id        Release                                Internet Archive download
+  deluxe    After Dark 4.0 Deluxe (1996)           CD image, 381.7 MB
+  ad10      After Dark 10th Anniversary (1999)     CD image, 143.3 MB
+  ad32      After Dark 3.2 (1995)                  CD image, 58.8 MB
+  tt        Totally Twisted After Dark (1995)      CD image, 37.9 MB
+  simpsons  The Simpsons Screen Saver (1994)       install files (ZIP), 2.6 MB
+  swse      Star Wars Screen Entertainment (1994)  CD image, 6.9 MB
+  startrek  Star Trek: The Screen Saver (1992)     two floppy images, 2.8 MB
 
-No After Dark files are included: you import them from your own copies (and
-are responsible for sourcing them legally). Requires 64-bit Windows on an x64
-PC.
+Star Trek: The Screen Saver is After Dark 2.0 (version 2.0b) with 16 Star
+Trek modules. Star Wars Screen Entertainment is not an After Dark release
+(it is sometimes listed as "After Dark Star Wars"): its modules were made
+for Delrina's Intermission screen saver engine.
+
+No After Dark or Star Wars Screen Entertainment files are included: you
+import them from your own copies (and are responsible for sourcing them
+legally). Requires 64-bit Windows on an x64 PC.
 
 This folder holds three programs. Keep them together: the screen saver looks
 for the other two next to itself.
 
   LongAfterDark.scr   the screen saver and its settings window
   adhostwin.exe       the emulator; the screen saver starts one per monitor
-  adimport.exe        copies the After Dark modules from your discs
+  adimport.exe        copies the modules from your discs
 
 
-1. Import your After Dark releases
+1. Import your releases
 
    Double-click adimport.exe, or click Import... in the screen saver's
    settings. Then pick a source:
      - A disc or floppy image: .iso, .bin, .img, .ima, .vfd or .flp, or a
-       .zip of the install files. For the two Simpsons floppies, select both.
+       .zip of the install files or of the floppy images. For a release on
+       several floppies, select every image (the Simpsons' two, Star Trek's
+       two), or the ZIP they came in.
      - A drive or folder: the CD itself, or a folder copied from it.
-     - A download from the Internet Archive: the five releases with their
+     - A download from the Internet Archive: the seven releases with their
        sizes, plus one entry that fetches every release not imported yet.
        Downloads resume if interrupted, and each one is checked against its
        published MD5 before it is used.
@@ -142,11 +174,23 @@ for the other two next to itself.
    against that release's known MD5s and installs it beside the releases
    already imported. Import as many as you like.
 
+   Star Wars Screen Entertainment verifies only as the build on its CD:
+   the CD, its ISO or Redump BIN image, the ZIP of its files, or
+   "adimport --download swse". The floppy sets found online (the US
+   five-disk set and the German edition) are other builds: they fail
+   verification (exit code 3) unless imported with "adimport --no-verify".
+
+   Star Trek: The Screen Saver came on two floppies: import both images
+   together, in either order, the ZIP they came in, a folder of both disks'
+   files, or "adimport --download startrek". One disk alone is refused.
+
    From a command prompt, with the ids above:
      adimport --image "C:\Images\After Dark 3.2.iso"
      adimport --image disk1.img --image disk2.img
+     adimport --image afterdark-20b_startrek.zip
      adimport --from E:\
      adimport --download ad10
+     adimport --download swse
      adimport --download all
      adimport --list-packages
      adimport --remove tt
@@ -181,20 +225,32 @@ for the other two next to itself.
    Settings... in Screen Saver Settings (or right-click LongAfterDark.scr ->
    Configure) picks one module or Random, the modules it rotates through,
    how often it changes, the resolution, the monitors to use and the sound,
-   with a live preview of the selected module.
+   with a live preview of the selected module. Some modules have buttons of
+   their own, such as Fish World's "Select Fish..." or each Star Wars
+   module's "Configure...", which open the module's own settings window;
+   what you set there is saved at once (Star Trek's Sounder finds your own
+   drives under [-h-] in its "Sounds.." window, as After Dark's Globe does
+   in its "Map..." window; pick a folder near a drive's root: as in DOS, its
+   short path must fit in 63 characters). The resolution applies to
+   the other modules: the Star Wars and Star Trek modules always draw at
+   their original 640x480, scaled up to fit the screen.
 
    Sound is on by default. Only the primary monitor's screen saver plays
-   it, at After Dark's own volume (50): the modules' wave effects, their
-   MIDI music (through Windows' MIDI synthesizer) and the Simpsons' speech.
+   it, at the default volume (50): the modules' wave effects, their MIDI
+   music (through Windows' MIDI synthesizer) and the Simpsons' speech.
    In the settings window, Sound (Primary monitor / Off) and Volume (0-100)
-   change that. Preview plays sound with the values you have not saved yet;
-   the small live preview never does.
+   change that. For Star Wars Screen Entertainment, Volume sets the music
+   too, as the Windows mixer's synthesizer slider did: Intermission itself
+   set only the effects' volume. Preview plays sound with the values you
+   have not saved yet; the small live preview never does.
 
    Any key except Shift, Ctrl, Caps Lock and Num Lock, a click, the mouse
    wheel or moving the mouse ends the screen saver. Caps Lock never does:
    in some modules it changes something or starts a game. While a game is
    playing, press Caps Lock again to stop playing, or Alt to end the screen
-   saver at once. Locking the computer (Win+L) always ends it.
+   saver at once. Num Lock starts Star Trek's Final Exam: type the number
+   of your answer; moving the mouse ends the exam and the screen saver.
+   Locking the computer (Win+L) always ends it.
 
 Where your files are
 
@@ -212,8 +268,9 @@ Updating
 
 Status
 
-   202 modules from the five releases run, with their sound, their Caps
-   Lock games and their own option buttons. Still being finished:
+   232 modules from the seven releases, with their sound, their Caps Lock
+   games, Final Exam's Num Lock exam and their own option buttons. Still
+   being finished:
      - Speed: each module's pace follows a model of a mid-1990s PC; not
        every module has been compared with the original yet.
    There is no installer or code signing yet. "adimport --version" says
@@ -224,7 +281,8 @@ Licences
 
    LICENSE.txt is the project's licence. The licences of the code built
    into the programs are in licenses\ (NOTICE.txt there says which is
-   whose).
+   whose, and quotes the terms of UNARJ, whose ARJ decoder adimport.exe
+   uses in a modified version).
 EOF
 crlf "$DIST/README.txt" "$DIST/LICENSE.txt" "$L"/*.txt
 

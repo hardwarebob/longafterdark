@@ -48,7 +48,8 @@ void write_text(const fs::path& p, const std::string& s) { test::write_bytes(p, 
 void fake_install(const fs::path& assets, const std::vector<std::string>& ids) {
   const fs::path win = assets / L"win";
   std::string packages;
-  static const std::map<std::string, int> modules = {{"deluxe", 84}, {"ad10", 46}, {"ad32", 44}, {"tt", 13}, {"simpsons", 15}};
+  static const std::map<std::string, int> modules = {{"deluxe", 84}, {"ad10", 46},     {"ad32", 44},      {"tt", 13},
+                                                      {"simpsons", 15}, {"swse", 14}, {"startrek", 16}};
   for (const std::string& id : ids) {
     const std::string record = "{\"version\": " + std::string(id == "deluxe" ? "1" : "2") +
                                ", \"verified\": \"image\", \"importedUtc\": \"2026-09-26T08:00:00Z\", \"fileCount\": 26}";
@@ -150,6 +151,8 @@ void test_model(const fs::path& dir) {
     CHECK(gui::missing_covers_note(0).empty());
   }
   CHECK(gui::verified_words("image", "simpsons") == L"verified against the original disks");
+  CHECK(gui::verified_words("image", "startrek") == L"verified against the original disks");
+  CHECK(gui::verified_words("image", "swse") == L"verified against the original disc");
   CHECK(gui::verified_words("files", "simpsons") == L"every file verified");
   CHECK(gui::verified_words("none", "deluxe") == L"not verified");
   CHECK_EQ(gui::catalog_module_counts(assets / L"win").size(), size_t(2));
@@ -164,8 +167,17 @@ void test_model(const fs::path& dir) {
     { FILE* f = _wfopen((downloads / simpsons->downloads.front().file_name).c_str(), L"wb"); if (f) fclose(f); }
     fs::resize_file(downloads / simpsons->downloads.front().file_name, simpsons->downloads.front().size);
   }
+  // Star Trek: The Screen Saver's first copy is two images: only disk 1's is
+  // here, so it is not downloaded yet.
+  const Package* startrek = find_package("startrek");
+  CHECK(startrek && !startrek->downloads.empty() && !startrek->downloads.front().more_images.empty());
+  if (startrek && !startrek->downloads.empty()) {
+    const Download& d = startrek->downloads.front();
+    { FILE* f = _wfopen((downloads / d.file_name).c_str(), L"wb"); if (f) fclose(f); }
+    fs::resize_file(downloads / d.file_name, d.size);
+  }
   auto dl = gui::download_rows(assets, "", downloads);
-  CHECK_EQ(dl.size(), size_t(5));
+  CHECK_EQ(dl.size(), size_t(7));
   for (const auto& r : dl) {
     CHECK(r.text.find(r.title + L"\n") == 0);
     if (r.id == "deluxe" || r.id == "tt")
@@ -174,12 +186,26 @@ void test_model(const fs::path& dir) {
     CHECK((r.text.find(L"already downloaded") != std::wstring::npos) == (r.id == "simpsons"));
     if (r.id == "simpsons") CHECK(r.text.find(L"Install files (ZIP)") != std::wstring::npos);
     if (r.id == "deluxe") CHECK(r.text.find(L"CD image") != std::wstring::npos);
+    if (r.id == "swse") CHECK(r.text.find(L"Star Wars Screen Entertainment\nCD image \u00b7 6.9 MB\nNot imported yet") == 0);
+    if (r.id == "startrek") {
+      CHECK(r.text == L"Star Trek: The Screen Saver\n2 floppy disk images \u00b7 2.8 MB\nNot imported yet");
+      CHECK_EQ(r.size, uint64_t(2 * 1474560));
+    }
+  }
+  // With disk 2's image too, the pair is downloaded.
+  if (startrek && !startrek->downloads.empty() && !startrek->downloads.front().more_images.empty()) {
+    const DownloadPart& q = startrek->downloads.front().more_images.front();
+    { FILE* f = _wfopen((downloads / q.file_name).c_str(), L"wb"); if (f) fclose(f); }
+    fs::resize_file(downloads / q.file_name, q.size);
+    for (const auto& r : gui::download_rows(assets, "startrek", downloads))
+      CHECK(r.text == L"Star Trek: The Screen Saver\n2 floppy disk images \u00b7 2.8 MB\nNot imported yet \u00b7 already "
+                      L"downloaded");
   }
   auto all = gui::all_missing_row(dl);
   CHECK(all.has_value());
   if (all) {
-    CHECK((all->ids == std::vector<std::string>{"ad10", "ad32", "simpsons"}));
-    CHECK(all->text.find(L"Every release not imported yet\n3 releases") == 0);
+    CHECK((all->ids == std::vector<std::string>{"ad10", "ad32", "simpsons", "swse", "startrek"}));
+    CHECK(all->text.find(L"Every release not imported yet\n5 releases") == 0);
   }
   auto one = gui::download_rows(assets, "tt", downloads);
   CHECK_EQ(one.size(), size_t(1));

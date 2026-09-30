@@ -275,9 +275,11 @@ Notes:
 
 | Binary | Builds | Sound role |
 |---|---|---|
-| `AD_SND.DLL` | 3: Deluxe = 10th (`b3ab…`, "4.0.0 Sep 12 1996"), 3.2 = TT (`07a2…`), Simpsons (`08d3…`, "3.0.4 Jul 05 1994") | the Classic sound library (§2.10); mandatory for OLDMOD16 (ABI.md §3.3) |
+| `AD_SND.DLL` | 3: Deluxe = 10th (`b3ab…`, "4.0.0 Sep 12 1996"), 3.2 = TT (`07a2…`), Simpsons (`08d3…`, "3.0.4 Jul 05 1994"); and since the seventh release Star Trek's 1.0 ("V1.0", §2.12) | the Classic sound library (§2.10); mandatory for OLDMOD16 (ABI.md §3.3) |
 | `SIMP_SND.DLL` | Simpsons | "Simpsons Shared Sounds": **143** type-3000 WAVE resources (all 8-bit 11025 Hz PCM mono, 109 s: the speech and effects), no code but a `WEP`; loaded by name by all 15 Simpsons modules and read through ADXPL310/AD_SND |
 | `TT_SND.DLL` | TT and 10th (same file, also in the 10th's `MUSIC\`) | 12 type-3000 WAVE resources (8-bit PCM mono at 11025, 11127, 22254 and 22255 Hz; 8 s); loaded by name by 7 TT modules |
+| `ST_SND.DLL` | Star Trek (since the seventh release) | 71 type-3000 WAVE resources (all 8-bit PCM mono at 11025 Hz, 94.8 s: the effects, Final Frontier's theme, McCoy's quotes); `AD_MOD.DLL` loads it by name from `<Path>ST_RES\` for 15 modules (§2.12) |
+| `AD_MME.DRV`, `AD_MPT.DRV`, `AD_SB.DRV` | Star Trek | AD_SND 1.0's plug-in sound drivers (§2.12); only `AD_MME.DRV` is installed |
 | `ADXPL300/310/40.DLL` | 16-bit engines | `XSoundDatabase` (→ AD_SND) and `XSoundMusicPlayer` (→ `mciSendString`); import MMSYSTEM `midiOutGetNumDevs`, `waveOutGetNumDevs/GetDevCaps`, `mciSendString` |
 | `ADXPL510.DLL` | Deluxe (`3fe1…`), 10th (`7976…`) | `XNoiseMaker`/`XNoise` (DirectSound, ACM), `WinMidiPlayer` (MCI), `XCdAudio`, `SoundHelp`; imports WINMM (aux, mixer, MCI) and MSACM32; `dsound.dll` dynamically |
 | `ADTASK.DLL`, `ADW30.EXE` | 3.2, TT, Simpsons | the original AD 3 host. Not run: the native bridge replaces it (PACKAGES.md §7.4) |
@@ -569,11 +571,82 @@ instruction):
 | Where | Formats |
 |---|---|
 | AD4 WAV resources (29 modules) | IMA-ADPCM 22050/11025/44100 mono; PCM 8- and 16-bit mono at 11025/22050 |
-| AD 3.x type-3000 resources, SIMP_SND, TT_SND | 8-bit PCM mono at 11025, 22050, 22000, 11000, 11127, 7418, 5564, 5563, 5011 Hz; **MS-ADPCM 11025 mono** in 8 ADXPL40 modules (BUNGEE, CHAM, CS, MESSYGES, MIKES, PHLEGM_B, TCLOCKS, VOYEUR), which on Win95 played through `sndPlaySound` via the wave mapper's ACM |
+| AD 3.x type-3000 resources, SIMP_SND, TT_SND; since the seventh release ST_SND (all 11025 Hz) | 8-bit PCM mono at 11025, 22050, 22000, 11000, 11127, 7418, 5564, 5563, 5011 Hz; **MS-ADPCM 11025 mono** in 8 ADXPL40 modules (BUNGEE, CHAM, CS, MESSYGES, MIKES, PHLEGM_B, TCLOCKS, VOYEUR), which on Win95 played through `sndPlaySound` via the wave mapper's ACM |
 | HOF.SRF | its own chunks, mixed by HALLOFFA to 22050 16-bit mono PCM |
 | Music | SMF 0/1, PPQN (§1.5) |
 
 No stereo sound effect, no 44.1 kHz PCM, no MP3, no DirectSound 3D.
+
+### 2.12 After Dark 2.0: AD_SND 1.0 and its sound drivers — VERIFIED / EMPIRICAL
+
+Star Trek: The Screen Saver's sound library (since the seventh release;
+`research/win/nedis.py` listings in `research/win/pkg/startrek/content/dis/`
+and `…/lane/dis/`, and the content and lane surveys' runs in
+`research/win/pkg/startrek/survey/`, all gitignored) is AD_SND 1.0
+("AfterDark Sound DLL Module"; `adwSoundDllVer` answers "V1.0"). It plays
+nothing itself: it hands every sound to a **plug-in sound driver**.
+
+* **Init.** `adwSoundInit(WORD, LPSTR err)` returns 0, 1 (a device error,
+  its text in `err`) or 2 ("Error reading the Sound preferences from
+  AD_PREFS.INI"). It reads `AD_PREFS.INI` `[After Dark] Path` (adding a
+  backslash) and `[Sound] Mute` (default "NO"; a first letter `Y` mutes),
+  loads every `<Path>*.DRV` (up to 8) to list the devices by their
+  `adwsdGetDeviceName`, then loads `<Path>` plus `[Sound] SoundDriver` and
+  resolves its 18 `adwsd*` entries. An empty or unknown driver gives 1:
+  "The Current Sound Device can not be found/loaded. Select another device
+  in the Sound Setup Dialog."
+* **The modules.** 15 go through `AD_MOD.DLL`'s sound classes, which import
+  11 AD_SND entries by name (`adwOpenSound`, `adwCloseSound`,
+  `adwCreateSound`, `adwFreeSound`, `adwGetSoundInfo`, `adwLoadSoundFile`,
+  `adwLoadSoundResource`, `adwPlaySound`, `adwSetSoundMode`,
+  `adwSoundAsyncCap`, `adwStopSound`): the bank is
+  `LoadLibrary(<Path>ST_RES\ST_SND.DLL)`, and a sound is
+  `adwLoadSoundResource(hInst, id)`, a type-3000 resource of it (71 of
+  them, ids 1000–1913). Sounder imports 9 entries itself and plays `*.WAV`
+  files with `adwLoadSoundFile`. `WantSound` sets `AD_MODULE+0x1E`
+  (`bWantSnd`) in 15 modules, all but Ion Storm, so the bridge calls
+  `adwSetSoundMute` and `adwSetVolume` for them (PACKAGES.md §7.4). Every
+  play in every run had the flags `0x0007`
+  (`SND_ASYNC|SND_NODEFAULT|SND_MEMORY`): no loops, no synchronous plays,
+  and no MIDI or MCI (no module or engine DLL imports MMSYSTEM).
+* **Mute.** `adwSetSoundMute` writes `AD_PREFS.INI [Sound] Mute=YES|NO`
+  every time, so the value lands in the state overlay (INTERACTION.md
+  §7.1), and `adwPlaySound` returns 1 without playing while muted or at
+  volume 0. The bridge sets the mute at every load of a module that wants
+  sound, so a value an earlier run left there never decides.
+* **The drivers.**
+
+  | Driver | Device | In the host |
+  |---|---|---|
+  | `AD_MME.DRV` | "Multimedia Windows Sound (Windows 3.1)" | plays: the driver the lane's profile seed names (PACKAGES.md §7.3) |
+  | `AD_MPT.DRV` | "PC Internal Speaker", through M.P. Technologies' `SPALETTE.DLL`, which programs the timer chip (ports 0x43, 0x40, 0x42 and 0x61) and calls `AD_LIB.DLL`'s `GET_VXD_ENTRYPOINT` | hangs: the first sound waits on the timer's counter (`SPALETTE 3:090c`, `in al,0x40` in a loop), which the runtime does not provide, until the call's instruction budget fails the run ("did not return within 1000000000 instructions"); the disks' `AD_PREFS.INI` named it, and neither is installed |
+  | `AD_SB.DRV` | "Sound Blaster Card (Windows 3.0)", through `SNDBLST.DLL` | refuses: init returns 1, "you are running Windows 3.0 Multimedia or Windows 3.1. Select the Multimedia Windows Sound Device …"; not installed |
+
+  So the lane seeds `AD_PREFS.INI [Sound] SoundDriver=AD_MME.DRV`
+  (PACKAGES.md §7.3), the one driver that plays in the host, where the
+  disks' `AD_PREFS.INI` named `AD_MPT.DRV`; the recipe installs neither that
+  file nor the PC-speaker path (PACKAGES.md §4.3). It is the choice the
+  original's Sound Setup offered as "Multimedia Windows Sound (Windows
+  3.1)", and its captures match the modules' own resources (§10.7).
+
+* **`AD_MME.DRV`** imports only WIN87EM, KERNEL and USER, and reaches
+  MMSYSTEM with `GetModuleHandle("MMSystem")` and `GetProcAddress` by
+  ordinal: `sndPlaySound` (2), `mmsystemGetVersion` (5), `waveOutGetNumDevs`
+  (401), `waveOutGetDevCaps` (402), `waveOutOpen` (404, `WAVE_FORMAT_QUERY`
+  for 11025 and 22050 Hz 8-bit mono), `waveOutGetVolume` (415) and
+  `waveOutSetVolume` (416), all of which the Win16 runtime has (§8.2,
+  §8.3). A sound is `sndPlaySound(SND_MEMORY|SND_NODEFAULT|SND_ASYNC)`
+  (with `SND_LOOP` on request) of the locked resource, unlocked right after
+  the call. The volume v (0–100) is `waveOutSetVolume(v × 655.35)` on both
+  channels (50 gives `0x7FFF7FFF`); at 0 nothing plays. With no wave device
+  (`ADSOUNDDEV=0`) init returns 1, "there are no Multimedia Sound Devices
+  installed", and every module runs silent.
+* **The volume pair.** AD_SND 1.0 saves and restores the device volume with
+  `adwSavePreviousVolume()` and `adwRestorePreviousVolume()` (ABI.md §3.9),
+  which the bridge calls where it calls AD_SND 3.x's
+  `adwGetSystemVolumes`/`adwSetSystemVolumes`. Its Sound Setup dialog
+  (`adwSoundSetup`, where After Dark 2.0's user picked the driver) was
+  reached only from `AD.EXE`'s "&Sound.." button, never by a module.
 
 ---
 
@@ -582,7 +655,8 @@ No stereo sound effect, no 44.1 kHz PCM, no MP3, no DirectSound 3D.
 ```
 adhostwin.exe
   run_host ─ creates audio::Engine from Config::from_env(env) ─► LaneContext::audio
-             after every step: engine.advance(clock.now_us())
+             after every step: engine.advance(clock.now_us()), unless the lane
+                               advanced it during the step (ne16: §8.6)
              at the end:       engine.shutdown(t), then lane.shutdown()
 
   pe32 lane (win32 shims)                 ne16 lane (win16 shims)
@@ -655,6 +729,25 @@ parallel. A change needs all three to agree, and this section is updated.
 `LaneContext`. Existing `LaneContext{env, screen, clock, input}` aggregates
 stay valid, and `run_host` sets it.
 
+**Amendment (2026-09-28, Star Wars Screen Entertainment).** SWSE's music
+is sequenced by the guest itself: MEMMIDI plays the song through
+`midiOutShortMsg` from a multimedia timer (§8.3, §8.6). The engine gains a
+raw MIDI port, `midi_short`/`midi_long`/`midi_reset` (below, after the
+songs; semantics §6.4). They are virtual with bodies that do nothing, a
+disabled engine's answer, so an `Engine` written before them (a lane's test
+double) still builds; `make_engine`'s engines implement them. Nothing else
+in the header changes but three comments: the one on `Time`, which names
+the dated time of a call a Win16 callback or timer procedure makes (§8.6);
+the one on `advance`, which says when `run_host` leaves a step's end to the
+lane; and the note beside these three methods, which says a method added
+this way must be forwarded by `LaneEngine`. `run_host`
+hands a lane its engine wrapped in `LaneEngine` (`host/core/src/host.cc`),
+which forwards every method and notes whether the lane called `advance`
+during a step: if it did, `run_host` leaves that step's end to the lane
+(§3). A method added with a body, as these three were, compiles without
+the wrapper forwarding it, and the lanes' calls would reach the disabled
+body: it must be added to `LaneEngine` too.
+
 ```cpp
 // adw/core/audio.h — the host audio engine (docs/AUDIO.md). FROZEN:
 // the lanes code against this header; a change goes through AUDIO.md §5.
@@ -676,9 +769,11 @@ namespace adw::audio {
 
 // Guest time: virtual microseconds on VirtualClock's scale, as a guest clock
 // read would see it at the moment of the call (pe32: rt.clock().now_us();
-// ne16: Runtime16::peek_us()). Never read_us() or any read that nudges time:
-// audio calls must not move the clock. Times passed to one Engine never go
-// backwards; a value earlier than the latest seen is taken as the latest seen.
+// ne16: Runtime16::peek_us(), or for a call a callback or timer procedure
+// makes, the procedure's due time plus what it has run, win16/sound16.hh).
+// Never read_us() or any read that nudges time: audio calls must not move the
+// clock. Times passed to one Engine should not go backwards: a value earlier
+// than the latest seen is taken as the latest seen.
 using Time = uint64_t;
 
 // ---- configuration ----------------------------------------------------------
@@ -850,6 +945,12 @@ class Engine {
   virtual bool song_playing(SongId s, Time t) = 0;
   virtual void close_song(SongId s, Time t) = 0;         // stops; its pending events are dropped
 
+  // Raw MIDI on the MIDI bus (amendment above): the guest's own messages,
+  // stamped with t, into the .mid log and the live synth as song events are.
+  virtual void midi_short(uint32_t msg, Time t) {}       // midiOutShortMsg's DWORD; a data byte first = running status
+  virtual void midi_long(std::span<const uint8_t> bytes, Time t) {}  // midiOutLongMsg: SysEx, or any message stream
+  virtual void midi_reset(Time t) {}                     // midiOutReset: note-offs, sustain off, all notes off
+
   // The guest's device volumes: wave = waveOutSetVolume; midi = midiOutSetVolume, auxSetVolume(1).
   virtual void set_bus_gain(Bus b, Gain g, Time t) = 0;
   virtual Gain bus_gain(Bus b) const = 0;
@@ -860,7 +961,9 @@ class Engine {
   // The time of the earliest event not yet polled; 0 = none.
   virtual Time next_event_time() = 0;
 
-  // Render up to t. run_host calls it after every step; lanes may call it too.
+  // Render up to t. After each step run_host calls it with the step's time,
+  // unless the lane called it during that step (host.cc LaneEngine): a lane
+  // that calls it owns its steps' ends.
   virtual void advance(Time t) = 0;
   // Stop audible output now (QUIT, stdin EOF, ADFRAMES, lane end): live PCM
   // stops, MIDI all-notes-off, captures are finalized. Later calls are accepted
@@ -945,6 +1048,43 @@ Engine& null_engine();
 * **Delivery**: events whose time falls in the rendered span are sent to the
   MIDI sinks, together with the scaling and note-off messages above, each
   stamped with its guest time.
+* **Raw MIDI** (`midi_short`/`midi_long`/`midi_reset`, the amendment of §5):
+  messages a guest sequences itself (Win16 `midiOut*`, §8.3) share the bus
+  with the songs. Each call first renders up to its time, so song events due
+  by then reach the sinks first and the log stays in time order; the message
+  then goes to the sinks stamped with that time. The engine has one raw port,
+  as the guest has one MIDI device.
+  * `midi_short`: the DWORD's low byte is the status, then the data bytes
+    its type implies (only those are read: MEMMIDI leaves stack bytes in the
+    rest). A data byte first is running status, as `midiOutShortMsg` allows;
+    with no status to run on it is dropped, as a synth would. System common
+    messages end running status; real-time bytes do not. `F0`/`F7` are
+    long-message bytes and are dropped here.
+  * `midi_long`: SysEx `F0 … F7` as given, or any stream of messages with
+    running status inside it (a status byte other than real time where data
+    belongs drops that message and starts the next; a message cut short at
+    the end is dropped). Real-time bytes (`F8`–`FF`) may come anywhere, as
+    MIDI 1.0 lets them: between a message's data bytes, or inside a SysEx,
+    each goes out on its own as it comes (before the message it interrupted
+    is complete), and the message goes on, running status and all — as a
+    synth on the cable takes them.
+  * System common and real-time messages have no SMF event of their own:
+    they go to the sinks as an `F7` escape holding the raw bytes.
+  * The MPC rule is the song player's (it chooses between an SMF's two
+    arrangements); raw messages pass as the guest sends them.
+  * **Bus gain, the songs' CC7 rule**: the guest's CC7 is sent as `round(value
+    × gain)` and remembered per channel (default 100); a gain change re-sends
+    the scaled CC7 of every channel the port has used; a channel's first
+    message is preceded by its scaled default CC7 when the gain makes it
+    differ from 100 (as `song_play` gives a song's channels theirs). At unity
+    gain, the default, the port passes exactly what the guest sent.
+  * `midi_reset` (what `midiOutReset` does): note-off for every note the port
+    left sounding, then sustain off (CC64 0) and all notes off (CC123) on
+    every channel it has used; running status ends. The channels keep their
+    CC7 and stay used: the synth keeps them too.
+  * `shutdown` silences the port like a playing song: note-offs for what it
+    left sounding and CC123 on those channels.
+  * A disabled engine does nothing with them.
 
 ### 6.5 Events
 
@@ -964,7 +1104,8 @@ close stream turns its pending chunks into `chunk_done` at the reset time.
 * **Capture MIDI** (`capture_mid`): an SMF **event log**. Format 0, division
   500 PPQN at the default tempo, so 1 tick = 1 ms of guest time. It holds
   exactly the messages sent to the synth: song events after the MPC rule,
-  scaled CC7, note-offs, SysEx. The track length is patched at `shutdown`
+  the guest's raw messages (system ones as `F7` escapes), scaled CC7,
+  note-offs, SysEx. The track length is patched at `shutdown`
   and every 5 s. **There is no deterministic General MIDI synthesizer in the
   host, so captures never render MIDI to PCM.** Tests assert on this log.
 * **Live PCM** (`live`):
@@ -1009,6 +1150,7 @@ close stream turns its pending chunks into `chunk_done` at the reset time.
 | Win32 `waveOutSetVolume` (HALLOFFA) | `set_bus_gain(wave, …)` |
 | Win16 `waveOutSetVolume` (AD_SND `adwSetVolume`) | `set_bus_gain(wave, …)` |
 | Win16 `midiOutSetVolume`, `auxSetVolume(1)` | `set_bus_gain(midi, …)` |
+| (host) an Intermission module's load, engine on: the saver's volume as the mixer's synth line (§10.6) | `set_bus_gain(midi, gain_from_mm(v))`, v = volume × 0xFFFF / 100 per channel |
 
 `ADVOLUME` reaches the guest (AD4 block, Classic bridge) and comes back
 through these calls, as it did on the original machine. At 50, the AD4
@@ -1237,6 +1379,10 @@ play at half amplitude.
     (`LoadADModule3216`'s arguments) and the native bridge (`adwSetSoundMute`,
     `adwSetVolume`). Today they come from `ADSOUND` and `ADVOLUME`.
   * `AD_PREFS.INI` stays absent, so AD_SND's own mute default is off.
+    (After Dark 2.0, since the seventh release: the lane seeds its `Path`
+    and `SoundDriver`, and AD_SND 1.0 reads a `[Sound] Mute` it wrote
+    itself into the state overlay; the bridge's `adwSetSoundMute` sets the
+    mute right after, for every module that wants sound, §2.12.)
   * `ADSOUNDDEV=0` keeps meaning "no wave device at all".
 
 ### 8.2 `sndPlaySound` (MMSYSTEM.2)
@@ -1273,8 +1419,42 @@ play at half amplitude.
 * `midiOutGetNumDevs` → **1** (the engines' `IsMusicAvail`, §2.9).
 * `midiOutGetDevCaps`: "Long After Dark MIDI", `MOD_MAPPER`-like synth,
   16 channels, `MIDICAPS_VOLUME|LRVOLUME`.
-* `midiOutGet`/`SetVolume` → MIDI bus. `midiOutOpen`/`ShortMsg` are not
-  imported by the corpus → `MMSYSERR_NOTSUPPORTED`.
+* `midiOutGet`/`SetVolume` → MIDI bus.
+* **The raw port** (for a guest that sequences itself: Star Wars Screen
+  Entertainment's MEMMIDI, under SWSE; no After Dark binary imports
+  `midiOutOpen` or `midiOutShortMsg`, statically or by name):
+  * `midiOutOpen(MIDI_MAPPER or 0)`: a handle (`0xE000`… in fours, as
+    `waveOut`'s), with `CALLBACK_NULL`/`WINDOW`/`TASK`/`FUNCTION` and
+    `MM_MOM_OPEN`/`DONE`/`CLOSE` per §8.6; `*lphMidiOut` is zeroed first. One
+    client at a time, as a Win16 MIDI output device (the mapper too) had:
+    a second open → `MMSYSERR_ALLOCATED`. Another device id →
+    `MMSYSERR_BADDEVICEID`; an unknown callback type → `MMSYSERR_INVALFLAG`.
+    (Not coupled to the MCI sequencer's songs: no guest has used both.)
+  * `midiOutShortMsg` → `midi_short` at the call's time (§8.6), `MMSYSERR_NOERROR`
+    (never `MIDIERR_NOTREADY`, on which MEMMIDI would retry).
+  * `midiOutPrepareHeader`/`Unprepare` (`MHDR_PREPARED`; a 28-byte MIDIHDR with
+    data, else `MMSYSERR_INVALPARAM`; `MIDIERR_STILLPLAYING` while
+    `MHDR_INQUEUE`). `midiOutLongMsg` needs a prepared header
+    (`MIDIERR_UNPREPARED`); the buffer is copied to `midi_long` at the call,
+    `MHDR_DONE` is set when the call returns (the synth takes it at once),
+    and `MM_MOM_DONE(hmo, lpMidiHdr)` goes out at the next delivery point
+    (sent from a procedure, a later one than the delivery running it,
+    §8.6). Nothing is ever left queued, so `midiOutClose` never answers
+    `MIDIERR_STILLPLAYING` and `midiOutReset` has no header to return.
+  * `midiOutReset` → `midi_reset`. `midiOutClose` sends nothing to the synth.
+  * `midiOutCachePatches`/`CacheDrumPatches` → `MMSYSERR_NOTSUPPORTED`: the
+    caps carry no `MIDICAPS_CACHE` (MEMMIDI checks it and never asks,
+    1:01bf), and a device without it answers so (the `MODM_CACHEPATCHES`
+    contract; Wine's mapper, `dlls/midimap`, too). No document of the
+    Windows 95 mapper's own answer was found (§10.6).
+  * `midiOutGetID`: the id opened (`0xFFFF` for the mapper).
+    `midiOutMessage` → `MMSYSERR_NOTSUPPORTED`.
+  * Without an enabled engine there is no MIDI device: `midiOutOpen` zeroes
+    the handle and answers `MMSYSERR_NODRIVER` (the mapper) or
+    `MMSYSERR_BADDEVICEID`; every handle is `MMSYSERR_INVALHANDLE`. (The
+    signature-only `midiOutOpen` of before returned 0, "success", without
+    writing the handle; SWSE reads only the handle, 1:688e, so nothing it
+    does changes.)
 * `auxGetNumDevs` 2 and `aux*` as §7.6.
 * `mixerGetNumDevs` stays 0, and with the engine on the mixer API is not
   exported **by name** (`GetProcAddress` answers 0; ordinals still resolve).
@@ -1324,8 +1504,9 @@ RATRACE, TOAST3, YBYH, CS, FRANKEN, LISA, SNOWBALL:
 * **Sources**: `engine.poll(now)` → `chunk_done` → `MM_WOM_DONE`;
   `song_end` → `MM_MCINOTIFY(SUCCESSFUL)`. Plus the synchronous ones the
   lane raises itself: `MM_WOM_OPEN` at open, `MM_WOM_CLOSE` after the last
-  DONE, and `SUPERSEDED`/`ABORTED` when the superseding or aborting command
-  runs.
+  DONE, `MM_MOM_OPEN`/`DONE`/`CLOSE` (§8.3), and `SUPERSEDED`/`ABORTED` when
+  the superseding or aborting command runs. And the periods of the
+  **multimedia timer events** (below), which need no engine.
 * **Order**: by event time, then by issue order; per device in the order
   above.
 * **Window messages** (`CALLBACK_WINDOW`, MCI notify) are **posted** to the
@@ -1341,6 +1522,81 @@ RATRACE, TOAST3, YBYH, CS, FRANKEN, LISA, SNOWBALL:
   `call_far` with the callback's DS. A callback may call only the
   interrupt-safe APIs (`PostMessage`, `timeGetTime`, `waveOutWrite`…), as on
   Windows. Re-entrancy is guarded: no delivery while a delivery is running.
+* **A procedure's calls are dated at its event's time.** On Windows a
+  `CALLBACK_FUNCTION` or timer procedure ran at interrupt time, at its
+  event's time; here it runs at the first safe point after it. The MMSYSTEM
+  calls it makes are dated from its due time plus the virtual time it has
+  run since, not from the safe point: the notes a timer sequences (MEMMIDI)
+  reach the log and the synth at their own times, and a one-shot event set
+  again from its procedure keeps its schedule, however late the safe points
+  come (a module that makes no call between frames is delivered once a
+  frame, and a frame that ends inside a long call leaves its periods to the
+  next one). Neither a delivery nor the ne16 lane's step end renders the
+  engine past a due point that has not been delivered: a delivery takes it
+  only as far as the events due, the step end only up to the next due point
+  (`Runtime16::audio_due()`), not to the guest's time. So those dates are
+  not clamped to a later time the engine has already taken — but for the
+  few µs a procedure runs, which the next one due at the same delivery
+  point may find the engine past. Clocks the guest reads (`timeGetTime`,
+  `GetTickCount`) still read the safe point's time: they never go back.
+* **MCI commands are the exception**: a procedure that sends one (Win16
+  forbade it: MCI was no interrupt-safe API; no guest does) has it dated at
+  the safe point, which is never behind a time the engine has taken, so a
+  song starts at the command's own time and a `play … to` stop, and its
+  `MM_MCINOTIFY`, come when the song has really played to `to`.
+* **What a procedure causes waits for a later delivery point.** A
+  notification a procedure raises while a delivery runs it — its device
+  opened or closed (`MM_WOM_OPEN`/`CLOSE`, `MM_MOM_OPEN`/`CLOSE`), a long
+  MIDI message sent (`MM_MOM_DONE`), a WAVEHDR it wrote that the stream has
+  done by the delivery point's time (an empty one) — is delivered at a later
+  delivery point than the one running it, whatever its date, as
+  `MM_MOM_DONE` after a guest's own `midiOutLongMsg` waits for the next
+  delivery point. A procedure that answers each notification with another
+  request (streaming SysEx by `midiOutLongMsg` from `MM_MOM_DONE`, an empty
+  WAVEHDR written again from `MM_WOM_DONE`) thus takes one step per delivery
+  point instead of looping inside one while its dates, and virtual time,
+  barely move: with `ADMIPS=0`, or once the 1 s cap on the instructions no
+  clock read has charged is reached, they do not move at all, and such a
+  loop would never end. With the timer events' bound (below), every
+  delivery ends.
+* **Multimedia timer events** (`timeSetEvent`, `system16.cc`, engine or no
+  engine; with sound off nothing but a timer event installs the delivery
+  hook, so a module that sets none runs exactly as before):
+  * `timeSetEvent(wDelay, wResolution, lpFunction, dwUser, fuEvent)`: 1 to
+    65535 ms (the 16-bit `TIMECAPS`; Wine's winmm, `MMSYSTIME_MININTERVAL`/
+    `MAXINTERVAL`); `TIME_PERIODIC` or one-shot; at most 16 events (Wine's
+    table); ids from 1; 0 on failure. The first period is due `wDelay` ms
+    after the call's time (after the procedure's due time when a procedure
+    sets it).
+  * Each period is one nested call of `TimeProc(wID, 0, dwUser, 0, 0)`, FAR
+    PASCAL (MEMMIDI's MIDITIMERPROC reads `dwUser` at `[bp+0Eh]` and returns
+    `retf 10h`, 1:1380), with its module's DS, at the first safe point at or
+    after the period, in (time, issue) order with the other callbacks. The
+    event is rescheduled before the call, so the procedure may kill it or set
+    others. A one-shot event is gone once called (`timeKillEvent` then
+    answers `TIMERR_NOCANDO`).
+  * **Missed periods are caught up**: each gets its call, as Windows kept a
+    periodic event on its schedule after a delay (Wine's winmm, time.c, on
+    Windows' behaviour). Bounded: a periodic event more than 250 ms behind
+    (a streamed run's host held up, frames not stepped) drops its oldest
+    periods, keeping the last 250 ms of them (at least one) on its grid, and
+    an event a procedure sets is dated no more than 250 ms back (so a
+    one-shot chain catches up as little).
+  * `timeKillEvent`: `TIMERR_NOERROR`, or `TIMERR_NOCANDO` for no such event.
+    `timeBeginPeriod`/`timeEndPeriod`: `TIMERR_NOERROR` (0 ms:
+    `TIMERR_NOCANDO`); the resolution changes nothing here.
+    `timeGetDevCaps`: {1, 65535} (a missing or short `TIMECAPS`:
+    `TIMERR_STRUCT`).
+  * A procedure whose code segment was freed with its event still set kills
+    the event (logged) instead of faulting.
+  * Cost: MEMMIDI's procedure runs ~500 guest instructions a period; 250
+    periods a virtual second cost about 2 ms of host time (§10.6).
+  * Traces: `ADTRACE=sound` has `timeSetEvent`/`timeKillEvent` and the
+    periods dropped behind the bound, but not the periods themselves nor the
+    short messages, hundreds a virtual second: `ADTRACE=timer16` gives a
+    line per procedure call (the event, its procedure and `dwUser`, the
+    period's due time and the time it was delivered at), `ADTRACE=midi16`
+    one per `midiOutShortMsg` with the time it is dated at.
 * Deterministic: the delivery points are functions of the guest's own calls
   and virtual time.
 
@@ -1438,6 +1694,16 @@ Nothing automated plays on the real device except the one opt-in check in
   tempo changes mid-song, SysEx, SMPTE division). Checks cover event times,
   length, seek with chase, the MPC rule (dual-mode detection and the
   `ADMIDIBASE` override) and CC7 scaling on bus-gain changes.
+* **Raw MIDI**: the `.mid` log of `midi_short`/`midi_long`/`midi_reset`
+  calls interleaved with a song's events (time order), running status
+  (kept across real-time bytes, ended by system common and by a reset),
+  the unread high bytes of a short message, system messages as `F7`
+  escapes, SysEx and message streams in a long message (malformed and cut
+  short ones dropped), real-time bytes inside a long message's channel
+  message, running-status message or SysEx (out on their own, the message
+  kept), the CC7 rule (re-sent on a gain change, a first-use default when
+  not at unity), the reset's note-offs/CC64/CC123, silencing at `shutdown`,
+  and a disabled engine ignoring them.
 * **Captures**: the WAV header (rate, 16/2, length = `floor(t_end·R/10⁶)`
   frames, patched on shutdown and on the 5 s grid); the `.mid` log re-parses
   with our own SMF parser, times in ms; a killed-process file is still
@@ -1480,8 +1746,28 @@ synthetic callers, as the existing suites do, against an engine made with
   * `MM_MCINOTIFY` posted at the right virtual time, then dispatched to a
     synthetic window procedure before the next DRAWFRAME.
   * SUPERSEDED/ABORTED order.
-  * `CALLBACK_FUNCTION` delivered at the next API call and never re-entrantly.
+  * `CALLBACK_FUNCTION` delivered at the next API call and never re-entrantly;
+    a procedure answering each `MM_MOM_DONE` with `midiOutLongMsg`, or each
+    `MM_WOM_DONE` with an empty WAVEHDR written again (the real engine),
+    takes one step per delivery point, with `ADMIPS=0` and at 100 MIPS with
+    a delivery point 1.1 s late.
   * The `MCISEQ.DRV`/`TOOLHELP` gates.
+  * midiOut's raw port: open/short/long/reset/close, the one-client rule,
+    MIDIHDR flags and errors, `MM_MOM_*` to a window and to a function,
+    patch caching refused, the honest failures without an engine.
+  * Timer events with synthetic `TimeProc`s: periodic and one-shot calls at
+    their periods (counts, times, `dwUser`), missed periods caught up and
+    the 250 ms bound, kill, the 16-event table, re-entrancy, a one-shot set
+    again from its own procedure keeping its schedule, the `midiOutShortMsg`
+    a procedure sends dated at its periods, timers without an engine,
+    determinism; and with the real engine, a timer-driven sequencer's
+    note-ons 4 ms apart in the `.mid` log though delivered once a frame
+    (printing the cost of 250 callbacks a virtual second), also in the ne16
+    lane's order — frames of 10 ms of guest work without a call, the engine
+    rendered up to `Runtime16::audio_due()` at each frame's end — and a timer
+    procedure's `play … to 800 notify`, after the engine was rendered past its
+    due time, playing 800 ms from the song's real start before it stops and
+    notifies.
 
 ### 10.3 Real modules (opt-in, skip 77 without assets; in `core/tests` as `core.audio_assets`)
 
@@ -1589,6 +1875,87 @@ releases (`build/win-pkg-setup/assets`), scratch data only.
   session "Long After Dark", peaking at −16.5 dBFS (the capture of the same
   run headless: −16.6). The sound host got `QUIT` first and ended cleanly.
 
+### 10.6 Star Wars Screen Entertainment's music (2026-09-28)
+
+SWSE.DLL opens the MIDI mapper and hands the song file to MEMMIDI (Sonic
+Foundry), which plays it itself: `timeBeginPeriod(4)`, a 4 ms periodic
+`timeSetEvent` whose procedure advances the song by one period and sends
+the due events with `midiOutShortMsg` (§8.3, §8.6). Checked on the real
+modules through WP W's Intermission harness (the real `IMIMXPLY.IMQ`,
+SWSE, MEMMIDI; 1800 frames, 30 s of 60 Hz headless time, the engine
+capturing), each capture's note-ons matched (channel, key, velocity, within
+±8 ms of a least-squares fit) against the song files:
+
+| Module | Song | Note-ons in 30 s | Matched | Largest deviation | Tempo (fitted) |
+|---|---|---:|---:|---:|---:|
+| VADER | `EMPIRE.MID` | 804 | 804 | 4.5 ms | 0.99960 |
+| BATTLES | `BATTLE.MID` | 765 | 765 | 2.9 ms | 1.00001 |
+| CANTINA | `CANTINA.MID` | 656 | 656 | 2.0 ms | 0.99998 |
+| TRENCH (Music "Once"; the shipped `SWSE.INI` says "Never") | `BATTLE.MID` | 682 | 682 | 2.1 ms | 1.00001 |
+| SWTEXT | `SWTHEME.MID` | 1000 | 1000 | 2.6 ms | 0.99997 |
+
+* Channels 1–10, as in the files; the deviations are MEMMIDI's 4 ms grid.
+  EMPIRE's 588 235 µs a quarter plays 0.04% fast, as 588 ms a quarter would
+  (MEMMIDI's own arithmetic, EMPIRICAL): the file's tempo otherwise.
+* 6 400–7 500 timer procedure calls a run (250 per virtual second from the
+  song's start), none dropped; MEMMIDI's procedure runs about 500 guest
+  instructions a call. Against the same frames without the event, the host
+  spends about 2 ms more per virtual second, inside run-to-run noise (the
+  isolated cost of a delivery with a small procedure and one
+  `midiOutShortMsg`: 0.6 µs, `win16.sound`). A module that makes no call
+  between frames is delivered once a frame, and a frame that ends inside a
+  long call leaves the periods due to the next one, yet its notes keep the
+  4 ms grid: they are dated at their periods, and the lane's step end never
+  renders the engine past a period still to be delivered (§8.6).
+* Two captures of each module are identical (WAV, `.mid`, `FBHASH`). With
+  sound off the `FBHASH` streams equal those of the same build without
+  midiOut and timer events — also when the guest wants music (Volume 50)
+  and there is no engine: SWSE reads only the handle, which `midiOutOpen`
+  now zeroes and answers `MMSYSERR_NODRIVER`.
+* After Dark: all 202 modules, runs A, C and S, identical to the build
+  without these changes, the C runs' WAV and `.mid` captures included; no
+  difference from the accepted baselines.
+* Open points:
+  * The Windows 95 mapper's own answer to `midiOutCachePatches` was not
+    found; the device reports no `MIDICAPS_CACHE`, so MEMMIDI never asks.
+  * Volume (resolved since): Intermission sets only the wave volume
+    (`ANTSW.INI [Intermission] Volume` × 595 through `waveOutSetVolume`);
+    on the original the Windows mixer's synth line alone set the music's.
+    The IMX protocol now stands in for that line: at load, with the engine
+    on, it sets the MIDI bus from the saver's volume, as After Dark's
+    reaches it (linear, 50 = half amplitude; `host/ne16/imx_protocol.cc`,
+    §6.7), so the raw port scales MEMMIDI's CC7 (§6.4). The `.mid`
+    captures at `ADVOLUME` 10 and 100 differ.
+  * The raw port and the MCI sequencer are not one client between them
+    (§8.3); no guest uses both.
+
+### 10.7 Star Trek: The Screen Saver's sound (2026-09-29)
+
+The 16 real modules over the package's AD_SND 1.0 and `AD_MME.DRV` (§2.12),
+captured with `ADAUDIOOUT` and `ADAUDIOLIVE=0` for 900 frames (15 s of
+60 Hz headless time), twice (`ne16.startrek`, and the host work's
+`research/win/pkg/startrek/host/tools/sound_run.py`, gitignored):
+
+* 14 modules are audible in 15 s. Sounds started: Brain Cells 19,
+  Communications 14, Final Exam 23, Final Frontier 1 (its 14.5 s theme),
+  Horta 14, The Mission 1, Ship Panels 14, Planetary Atlas 23, Scotty's
+  Files 9, Sickbay 7, Sounder 7 (`JIM.WAV`), Spock 13, Tholian Web 1 and
+  Tribbles 12, peaking between −18 and −6 dBFS at volume 50. Ion Storm has
+  no sound, and Space's one sound comes minutes later (at 400 s in a
+  12-minute run).
+* Against the resources (the content survey): correlation 1.0000 for Final
+  Frontier's theme (resource 1005), 0.9999 for a Tribbles sound (1601) and
+  0.9981 for a Tholian Web one (1001), within 0–1 samples of the traced
+  start, at a gain of 0.500 at volume 50 with both channels equal.
+  `ADVOLUME` reaches `waveOutSetVolume` (20 gives `0x33333333`, 100
+  `0xFFFFFFFF`).
+* Two captures of each module are identical, and so are its frame streams.
+  In the content survey's runs sound on and off gave identical frame
+  streams for 13 of the 16: Final Frontier, Horta and Ship Panels differ,
+  because the muted path skips the driver's API calls, which cost virtual
+  time.
+* Not exercised: live output (`ADAUDIOLIVE=1`, §12).
+
 ---
 
 ## 11. Work split
@@ -1660,3 +2027,5 @@ must not add files under `host/core`. Integration then runs §10.3 and §10.4.
 * **Sound-on `FBHASH` baselines** have not been recorded yet (the item
   above). Sound-on runs are deterministic (§10.3's repeat case), so they
   can be.
+* **Star Trek: The Screen Saver's sound** has only been captured
+  (§10.7), never played on a device.

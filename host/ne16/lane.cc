@@ -13,7 +13,6 @@
 #include "adw/core/log.h"
 #include "adw/core/text.h"
 #include "loader/ne.hh"
-#include "win16/dos16.hh"
 #include "win16/dialogs16.hh"
 #include "win16/gdi16.hh"
 #include "win16/input16.hh"
@@ -66,141 +65,56 @@ bool file_exists(const std::string& p) {
   return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
-bool read_host_file(const std::string& p, std::vector<uint8_t>* out) {
-  HANDLE h = CreateFileW(widen(p).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-  if (h == INVALID_HANDLE_VALUE) return false;
-  LARGE_INTEGER sz{};
-  bool ok = GetFileSizeEx(h, &sz) && sz.QuadPart >= 0 && sz.QuadPart < (16 << 20);
-  if (ok) {
-    out->resize(size_t(sz.QuadPart));
-    DWORD got = 0;
-    ok = out->empty() || (ReadFile(h, out->data(), DWORD(out->size()), &got, nullptr) && got == out->size());
-  }
-  CloseHandle(h);
-  return ok;
-}
-
-bool same_dir(const std::string& a, const std::string& b) {
-  return CompareStringOrdinal(widen(full_path(a)).c_str(), -1, widen(full_path(b)).c_str(), -1, TRUE) == CSTR_EQUAL;
-}
-
-uint16_t u16(std::string_view s, size_t off) {
-  if (off + 2 > s.size()) return 0;
-  return uint16_t(uint8_t(s[off]) | (uint8_t(s[off + 1]) << 8));
+bool dir_exists(const std::string& p) {
+  DWORD a = GetFileAttributesW(widen(p).c_str());
+  return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
 }  // namespace
 
-// The guest's disk (INTERACTION.md §7.2), one 1996 machine per package:
-//   C:\AFTERDRK   the module's folder — the install directory, the AD Data
-//                 Files directory, where the helper DLLs, sound databases and
-//                 data files sit beside the modules — under a copy-on-write
-//                 upper layer <state>\<package>\<MODDIR> (NONSENSE.TXT,
-//                 MESG_AD3.DAT land there)
-//   C:\AFTERD~1   the same folder under the short name of the original
-//                 install directory ("C:\After Dark"), which data files
-//                 carry baked in (BITMAPS.ADC lists C:\afterd~1\bitmaps); the
-//                 same upper (a memory upper is one per mount). An alias: it
-//                 resolves, but a listing of C:\ leaves it out (a 1996
-//                 install had one of the two; DOS Shell's DIR shows C:\)
-//   C:\WINDOWS    virtual seed files under <state>\<package>\WINDOWS
-//                 (MODULES.INI, AFTERDRK.INI, WIN.INI …, and LunData.dat as
-//                 the installers put it there), shared with the package's AD4
-//                 modules
-//   C:\WINDOWS\SYSTEM  the engine dir (OLDMOD16, AD_SND), read-only
-//   H:\<L>\…      the host's drives, read-only, 8.3 names (file dialogs)
-// Without ADSTATE every upper layer is memory: nothing is read from or
-// written to the user's state, so headless runs and FBHASH stay as they were.
-void mount_disk(Runtime16& rt, const Env& env, const std::string& module_path, const Ne16Layout& layout) {
-  const win16::Runtime16Options& o = rt.options();
-  win32::Vfs& vfs = rt.vfs();
-  std::string pkg = package_state_dir(env, module_path);
-  std::string moddir = file_of(layout.module_dir);
-  if (env.state_persistent()) vfs.set_state_root(env.state_root);
-  vfs.mount_overlay(o.windows_dir, "", pkg.empty() ? "" : pkg + "\\WINDOWS");
-  vfs.mount_overlay(o.guest_dir, layout.module_dir, pkg.empty() ? "" : pkg + "\\" + moddir);
-  vfs.mount_overlay("C:\\AFTERD~1", layout.module_dir, pkg.empty() ? "" : pkg + "\\" + moddir);
-  vfs.hide_in_listing("C:\\AFTERD~1");
-  vfs.mount(o.system_dir, layout.engine_dir, /*writable=*/false);
-  vfs.mount_host_drives(/*short_names=*/true);
-  vfs.set_cwd(o.guest_dir);
-  for (const std::string& d : layout.search_dirs) rt.modules().add_search_dir(d);
-  // What the installers copied from the module folder into WINDOWS (the ad10
-  // install map has WINDOWS\LunData.dat, byte-identical to the disc's
-  // LUNDATA.DAT beside LUNATIC.AD): Lunatic Fringe reads its keys and scores
-  // from GetWindowsDirectory()\LunData.dat, and without it says
-  // "Configuration File Not Accessible. Will Use Default Keys.". A lower-layer
-  // seed: the module's own writes (Keys…, Clear Scores, high scores) go to the
-  // upper layer as usual.
-  for (const char* f : {"LunData.dat"}) {
-    std::vector<uint8_t> bytes;
-    if (read_host_file(layout.module_dir + "\\" + f, &bytes)) vfs.add_virtual_file(o.windows_dir + "\\" + f, std::move(bytes));
+std::unique_ptr<Protocol16> Ne16Lane::choose_protocol(const Ne16Layout& layout, const Env& env, std::string* why) {
+  bool is_auto = true;
+  ModuleKind kind = ModuleKind::ad3;
+  if (const std::string* k = env.get("ADNE16KIND")) {
+    if (!parse_kind_choice(*k, &is_auto, &kind)) {
+      log("ADNE16KIND='%s' is not auto, ad3 or imx; using auto", k->c_str());
+      is_auto = true;
+    }
   }
-  // MODULES.INI's per-install settings, now that the module dir is mounted.
-  win16::seed_modules_ini(rt);
-  trace("lane", "disk: C:\\WINDOWS and %s over %s", o.guest_dir.c_str(),
-        pkg.empty() ? "memory (no ADSTATE)" : (pkg + " (" + moddir + ")").c_str());
+  if (is_auto) {
+    std::unique_ptr<loader::ne::Image> img;
+    try {
+      img = std::make_unique<loader::ne::Image>(loader::ne::Image::from_file(layout.module_path));
+    } catch (const std::exception&) {
+      return make_ad3_protocol(layout);  // not a readable NE image: the AD3 protocol says so, as before
+    }
+    KindProbe p = detect_kind(*img, file_of(layout.module_path));
+    if (!p.ok) {
+      *why = p.why;
+      return nullptr;
+    }
+    kind = p.kind;
+  } else {
+    trace("lane", "%s: kind %s (ADNE16KIND)", file_of(layout.module_path).c_str(), kind_name(kind));
+  }
+  return kind == ModuleKind::imx ? make_imx_protocol(layout) : make_ad3_protocol(layout);
 }
 
-int16_t control_default16(std::string_view rec) {
-  if (rec.size() < 0x1A) return 0;
-  uint16_t kind = u16(rec, 0x00);
-  int16_t def = int16_t(u16(rec, 0x18));
-  switch (kind) {
-    case 1: {  // string slider: `count` 16-byte labels at +0x20, then the stop values
-      uint16_t count = std::min<uint16_t>(u16(rec, 0x16), 101);
-      if (!count) return 0;
-      size_t at = 0x20 + size_t(count) * 16;
-      if (at + size_t(count) * 2 > rec.size()) return 0;
-      std::vector<int32_t> stops;
-      // A list that does not start at 0 gets a 0 stop in front (AFTERDAR.SCR 0x404f7b).
-      if (u16(rec, at) != 0) stops.push_back(0);
-      for (uint16_t i = 0; i < count; i++) stops.push_back(u16(rec, at + 2 * i));
-      int32_t v = stops.front();
-      for (int32_t s : stops)
-        if (s <= def) v = s;
-      return int16_t(v);
-    }
-    case 2: {  // numeric slider: clamped to [min, max] at +0x30/+0x32
-      if (rec.size() < 0x34) return def;
-      int16_t lo = int16_t(u16(rec, 0x30)), hi = int16_t(u16(rec, 0x32));
-      if (lo > hi) std::swap(lo, hi);
-      return std::clamp<int16_t>(def, lo, hi);
-    }
-    case 3: {  // popup: an item index
-      uint16_t count = u16(rec, 0x16);
-      return count ? std::clamp<int16_t>(def, 0, int16_t(count - 1)) : 0;
-    }
-    case 5:  // checkbox
-      return def ? 1 : 0;
-    default:  // none, button
-      return 0;
-  }
-}
+Ne16Lane::Ne16Lane() : Ne16Lane(&Ne16Lane::choose_protocol) {}
 
-Ne16Lane::Ne16Lane() = default;
+Ne16Lane::Ne16Lane(ProtocolFactory make_protocol) : make_protocol_(std::move(make_protocol)) {}
 
 Ne16Lane::~Ne16Lane() {
-  bridge_.reset();
+  proto_.reset();
   rt_.reset();
   free_fibers();
-}
-
-std::string Ne16Lane::error_text() const {
-  if (!rt_ || !scratch_) return "(no error text)";
-  std::string s;
-  try {
-    s = rt_->read_str(scratch_ + scratch::kError, scratch::kErrorSize);
-  } catch (const std::exception&) {
-  }
-  return s.empty() ? "(no error text)" : s;
 }
 
 // A failed init drops the runtime at once: it refers to ctx's screen, clock
 // and input, which run_host destroys before the lane (lane.h).
 bool Ne16Lane::init(const std::string& module_path, LaneContext& ctx) {
   if (init_impl(module_path, ctx)) return true;
-  bridge_.reset();
+  proto_.reset();
   rt_.reset();
   free_fibers();
   loaded_ = false;
@@ -214,42 +128,25 @@ bool Ne16Lane::init_impl(const std::string& module_path, LaneContext& ctx) {
   std::string path = full_path(module_path);
   module_name_ = file_of(path);
   // Where the engine files come from (package.hh, PACKAGES.md §7.1/§7.3).
-  layout_ = resolve_layout(path, env.win_assets_dir(), file_exists);
-  const std::string& dir = layout_.module_dir;
-  const std::string& engine = layout_.engine_dir;
-  bool bridge_auto = true;
-  BridgeKind forced = BridgeKind::oldmod16;
-  if (const std::string* b = env.get("ADNE16BRIDGE")) {
-    if (!parse_bridge_choice(*b, &bridge_auto, &forced)) {
-      log("ADNE16BRIDGE='%s' is not auto, oldmod16 or native; using auto", b->c_str());
-      bridge_auto = true;
-    }
+  layout_ = resolve_layout(path, env.win_assets_dir(), file_exists, dir_exists);
+  // The module's protocol (protocol.hh) and its choices, before anything
+  // else: AD3's bridge, volume and mute, IMX's reader and volume, and the
+  // guest dir and the display's starting palette.
+  std::string refused;
+  proto_ = make_protocol_(layout_, env, &refused);
+  if (!proto_) {
+    log("%s: %s", module_name_.c_str(), refused.c_str());
+    return false;
   }
-  bridge_kind_ = bridge_auto ? choose_bridge(layout_, file_exists) : forced;
-  volume_ = uint16_t(std::min<uint64_t>(env_u64(env, "ADVOLUME", 50), 100));
-  mute_ = env.flag("ADSOUND") ? 0 : 1;
-  // Sound (lane.hh "Sound", AUDIO.md §8.1): with the host audio engine on,
-  // the module is unmuted at After Dark's volume slider (ADVOLUME, through
-  // the engine's config); AD_PREFS.INI stays absent, so AD_SND's own mute
-  // default (off) holds.
-  const bool sound_on = ctx.audio && ctx.audio->enabled();
-  if (sound_on) {
-    volume_ = uint16_t(std::clamp(ctx.audio->config().volume, 0, 100));
-    mute_ = 0;
-  }
-
   win16::Runtime16Options opts;
+  proto_->configure_runtime(opts, ctx);
+
   opts.arena_size = uint32_t(std::clamp<uint64_t>(env_u64(env, "ADHEAPMB", 64), 16, 512) << 20);
   opts.call_budget = env_u64(env, "ADCALLBUDGET", 1'000'000'000ull);
   opts.tick_quantum_ms = uint32_t(std::clamp<uint64_t>(env_u64(env, "ADTICKMS", 55), 1, 1000));
   if (env.get("ADSOUNDDEV")) opts.sound_device = env.flag("ADSOUNDDEV");
-  // The display's starting palette (Runtime16Options::desktop_palette): a
-  // desktop's distinct colours for the AD 3 generation packages (no OLDMOD16
-  // in their engine dir: the native bridge stands in for ADW30/ADTASK, and
-  // ADXPL310's identity palette needs them — SIMPCLOK); the lane's original
-  // black-between-the-statics for everything OLDMOD16 runs, so Deluxe's and
-  // ad10's streams stay as they were. ADDESKTOPPAL=0/1 overrides.
-  opts.desktop_palette = layout_.packaged && choose_bridge(layout_, file_exists) == BridgeKind::native;
+  // The display's starting palette is the protocol's
+  // (Runtime16Options::desktop_palette); ADDESKTOPPAL=0/1 overrides it.
   if (env.get("ADDESKTOPPAL")) opts.desktop_palette = env.flag("ADDESKTOPPAL");
   if (const std::string* w = env.get("ADSTEP16")) {
     unsigned cs = 0, lo = 0, hi = 0;
@@ -268,7 +165,23 @@ bool Ne16Lane::init_impl(const std::string& module_path, LaneContext& ctx) {
   opts.read_step_us = uint32_t(env_u64(env, "ADREADSTEPUS", 5));
   opts.insns_per_us = uint32_t(env_u64(env, "ADMIPS", 100));
   opts.api_cost_insns = uint32_t(env_u64(env, "ADAPICOST", 500));
-  opts.pixel_cost_insns = uint32_t(env_u64(env, "ADPIXCOST", 2));
+  // What a blit's or fill's pixel costs the DRAWFRAME budget is the
+  // protocol's (Protocol16::pixel_cost, lane.hh "Pacing"): After Dark's
+  // ADPIXCOST, an Intermission module's ADNE16IMXPIXCOST; neither knob
+  // changes the other's cost.
+  const Protocol16::PixelCost pixel = proto_->pixel_cost();
+  opts.pixel_cost_insns = uint32_t(env_u64(env, pixel.knob, pixel.def));
+  if (strcmp(pixel.knob, "ADPIXCOST") != 0) {
+    if (env.get("ADPIXCOST")) {
+      log("%s: ADPIXCOST is ignored: it is the After Dark modules' pixel cost; this module's is %s",
+          module_name_.c_str(), pixel.knob);
+    }
+    // The knob's text as given: a value env_u64 refused shows beside the
+    // default it fell back to.
+    const std::string* raw = env.get(pixel.knob);
+    trace("lane", "%s: a pixel a blit or fill writes costs %" PRIu32 " (%s%s%s)", module_name_.c_str(),
+          opts.pixel_cost_insns, raw ? pixel.knob : "the protocol's default", raw ? "=" : "", raw ? raw->c_str() : "");
+  }
   // Pacing (lane.hh): with ADMIPS set, headless time is Runtime16's
   // frame-bounded model, which applies the read step itself, and streamed
   // time is the wall clock as it is (a run of DRAWFRAMEs reads the clock
@@ -282,6 +195,16 @@ bool Ne16Lane::init_impl(const std::string& module_path, LaneContext& ctx) {
   max_draws_ = opts.insns_per_us ? uint32_t(std::clamp<uint64_t>(env_u64(env, "ADMAXDRAWS", 64), 1, 100000)) : 1;
   // Long calls (lane.hh): on with the virtual CPU; ADNE16LONGCALLS=0 turns them off.
   long_calls_ = opts.insns_per_us && !(env.get("ADNE16LONGCALLS") && !env.flag("ADNE16LONGCALLS"));
+  // Carried overruns (lane.hh "Pacing"): the protocol's choice, with the
+  // DRAWFRAME budget on; ADNE16IMXCARRY=0 turns them off.
+  carry_ = proto_->carries_overruns() && draw_mips_ && !(env.get("ADNE16IMXCARRY") && !env.flag("ADNE16IMXCARRY"));
+  if (proto_->carries_overruns()) {
+    const std::string carried = "carried into the next frames (below " + std::to_string(kMaxOwedBudgets) + " budgets owed)";
+    trace("lane", "%s: overruns %s", module_name_.c_str(),
+          carry_       ? carried.c_str()
+          : draw_mips_ ? "not carried (ADNE16IMXCARRY=0)"
+                       : "not carried (no DRAWFRAME budget)");
+  }
   // Small screens (lane.hh): the guest gets a display k times the output.
   guest_scale_ = auto_guest_scale(ctx.screen.width(), ctx.screen.height());
   if (const std::string* s = env.get("ADNE16SCALE"); s && !s->empty() && *s != "auto") {
@@ -311,7 +234,7 @@ bool Ne16Lane::init_impl(const std::string& module_path, LaneContext& ctx) {
     // MMSYSTEM's sound half over the host audio engine (win16/sound16.hh);
     // without an enabled one, the silent device the lane always had.
     win16::attach_audio16(rt, ctx.audio);
-    mount_disk(rt, env, path, layout_);
+    proto_->mount(rt, env);
     win32::Display& display = rt.attach_display(guest_screen_ ? *guest_screen_ : ctx.screen);
     // The desktop the saver started over (win32/display.hh "desktop seed"),
     // as in the pe32 lane. AFTERDAR.SCR's full-screen saver window never
@@ -335,80 +258,9 @@ bool Ne16Lane::init_impl(const std::string& module_path, LaneContext& ctx) {
     hdc_ = win16::gdi16_screen_dc(rt, hwnd_);
     if (!hdc_) throw std::runtime_error("no screen DC");
 
-    std::string ad_snd = engine + "\\AD_SND.DLL", why;
-    if (bridge_kind_ == BridgeKind::oldmod16) {
-      // The AD_SND guard (PACKAGES.md §7.3): an AD_SND.DLL beside the module
-      // (older than OLDMOD16 accepts, in every layout seen) would be found
-      // before the engine dir's. Load the engine's first; OLDMOD16's
-      // LoadLibrary("ad_snd.dll") then finds it by module name.
-      if (!same_dir(dir, engine) && file_exists(dir + "\\AD_SND.DLL") && file_exists(ad_snd)) {
-        uint16_t e = 0;
-        if (rt.modules().load_host(ad_snd, &e)) log("%s: %s\\AD_SND.DLL is ignored; OLDMOD16 gets %s", module_name_.c_str(), dir.c_str(), ad_snd.c_str());
-      }
-      bridge_ = open_oldmod16_bridge(rt, engine + "\\OLDMOD16.DLL", &why);
-    } else {
-      bridge_ = open_native_bridge(rt, opts.system_dir + "\\AD_SND.DLL", &why);
-    }
-    if (!bridge_) {
-      log("%s: %s", module_name_.c_str(), why.c_str());
-      census();
-      return false;
-    }
-
-    // The scratch block the far pointers point into.
-    uint16_t hb = rt.global().alloc(win16::GlobalHeap16::kZeroInit, scratch::kSize);
-    if (!hb) throw std::runtime_error("no guest memory for the scratch block");
-    scratch_ = uint32_t(hb) << 16;
-
-    // SetADPalette3216(hpal[i], i) for the four AD palettes (ABI.md §3.1).
-    AdPalettes pals = load_palettes(layout_, bridge_kind_, file_exists);
-    std::string pal_text = pals.pal.empty() ? "none: " + pals.error : pals.source;
-    trace("lane", "%s: package %s, module dir %s, engine dir %s, bridge %s%s, AD_SND %s, palettes %s, %s display palette",
-          module_name_.c_str(), layout_.packaged ? layout_.package_id.c_str() : "legacy", dir.c_str(), engine.c_str(),
-          bridge_name(bridge_kind_), bridge_auto ? "" : " (ADNE16BRIDGE)", ad_snd.c_str(), pal_text.c_str(),
-          opts.desktop_palette ? "desktop" : "boot");
-    if (pals.pal.empty()) log("%s: no AD palettes (%s); palette requests will fail", module_name_.c_str(), pals.error.c_str());
-    auto& gdi = rt.state<win16::Gdi16>();
-    for (size_t i = 0; i < pals.pal.size(); i++) {
-      uint16_t hpal = gdi.create_palette(pals.pal[i]);
-      bridge_->set_palette(hpal, uint16_t(i));
-    }
-
-    // Controls: the record defaults, ADCVSET over them.
-    std::shared_ptr<loader::ne::Image> img;
-    try {
-      img = std::make_shared<loader::ne::Image>(loader::ne::Image::from_file(path));
-    } catch (const std::exception& e) {
-      log("%s: not an NE module: %s", module_name_.c_str(), e.what());
-      census();
-      return false;
-    }
-    for (int i = 0; i < 4; i++) {
-      int16_t def = 0;
-      if (const auto* res = img->find_resource(loader::ResId::of(1000), loader::ResId::of(uint16_t(i + 1)))) {
-        def = control_default16(img->resource_data(*res));
-      }
-      ctrl_[i] = int16_t(ctx.input.control(i, def));
-      rt.wr16(scratch_ + scratch::kCtrl + 2u * uint32_t(i), uint16_t(ctrl_[i]));
-      trace("lane", "control %d = %d%s", i, ctrl_[i], ctrl_[i] == def ? "" : " (ADCVSET)");
-    }
-
-    // LoadADModule3216 → LOADADMODULE16(hwnd, hdc, ctrl4, volume, mute, path, err, errLen, &errId).
-    // The module as the install directory holds it (C:\AFTERD~1 is the same
-    // folder under another name; the long form is the one AD's INI files held).
-    std::string guest = opts.guest_dir + "\\" + win16::upper16(module_name_);
-    rt.write_str(scratch_ + scratch::kPath, guest, 260);
-    uint16_t r = bridge_->load(hwnd_, hdc_, scratch_ + scratch::kCtrl, volume_, mute_, scratch_ + scratch::kPath,
-                               scratch_ + scratch::kError, scratch::kErrorSize, scratch_ + scratch::kErrId);
-    trace("lane", "LOADADMODULE16(%s, volume %u, mute %u) -> %u", guest.c_str(), volume_, mute_, r);
-    if (!r) {
-      uint16_t id = rt.rd16(scratch_ + scratch::kErrId);
-      // OLDMOD32 turned these ids into its own strings (ABI.md §3.7).
-      std::string why_id = id == 1   ? "cannot load AD_SND.DLL (" + ad_snd + ")"
-                           : id == 2 ? "AD_SND.DLL is too old"
-                           : id == 3 ? "AD_SND.DLL lacks an entry point"
-                                     : error_text();
-      log("%s: the module did not load: %s", module_name_.c_str(), why_id.c_str());
+    // The module, through its protocol (AD3: the bridge, the AD palettes, the
+    // controls, LOADADMODULE16); it has logged why when it fails.
+    if (!proto_->load(rt, hwnd_, hdc_, ctx)) {
       census();
       return false;
     }
@@ -449,21 +301,6 @@ bool Ne16Lane::init_impl(const std::string& module_path, LaneContext& ctx) {
   return false;
 }
 
-void Ne16Lane::send_controls() {
-  for (int i = 0; i < 4; i++) rt_->wr16(scratch_ + scratch::kCtrl + 2u * uint32_t(i), uint16_t(ctrl_[i]));
-  // SetModuleCtrlValues3216 → SETMODULECTRLVALUES16(volume, mute, ctrl4).
-  bridge_->set_controls(volume_, mute_, scratch_ + scratch::kCtrl);
-  // The bridge copied them into AD_MODULE.iControlValue (+6), where the module reads them.
-  if (tracing("lane")) {
-    uint32_t mod = bridge_->ad_module();
-    if (mod) {
-      trace("lane", "SETMODULECTRLVALUES16(%u, %u, {%d, %d, %d, %d}) -> AD_MODULE controls {%d, %d, %d, %d}", volume_,
-            mute_, ctrl_[0], ctrl_[1], ctrl_[2], ctrl_[3], int16_t(rt_->rd16(mod + 6)), int16_t(rt_->rd16(mod + 8)),
-            int16_t(rt_->rd16(mod + 10)), int16_t(rt_->rd16(mod + 12)));
-    }
-  }
-}
-
 // Transient content. The host shows the screen as each DRAWFRAME leaves it,
 // but a 1996 monitor showed it at every refresh during the call too: a
 // module that draws, waits in a CPU delay loop and erases within one
@@ -491,17 +328,19 @@ void Ne16Lane::settle_screen() {
 }
 
 void Ne16Lane::on_command(const Command& c) {
-  if (!rt_ || !loaded_) return;
+  // A module that woke the saver is called no more (step()): input and SET go nowhere.
+  if (!rt_ || !loaded_ || woke_) return;
   sync_input();
   settle_screen();
-  if (c.kind == Command::Kind::key || c.kind == Command::Kind::caps || c.kind == Command::Kind::mouse) {
+  if (c.kind == Command::Kind::key || c.kind == Command::Kind::caps || c.kind == Command::Kind::numlock ||
+      c.kind == Command::Kind::mouse) {
     // An interactive module takes every input line as its own (INTERACTION.md §5.2).
     if (wants_events_ && c.seq > eaten_) eaten_ = c.seq;
     queue_input(c);
     return;
   }
-  if (c.kind == Command::Kind::set && c.a >= 0 && c.a < 4) {
-    ctrl_[c.a] = int16_t(c.b);
+  // SET: the protocol's to take (AD3: control values 0..3).
+  if (c.kind == Command::Kind::set && proto_->set_control(c.a, c.b)) {
     // Mid-DRAWFRAME (a long call the last frame ended inside) the guest cannot
     // be called: the values go to the module before its next DRAWFRAME.
     if (suspended_) {
@@ -509,7 +348,7 @@ void Ne16Lane::on_command(const Command& c) {
       return;
     }
     try {
-      send_controls();
+      proto_->send_controls();
     } catch (const std::exception& e) {
       log("%s: SET %d %d: %s", module_name_.c_str(), c.a, c.b, e.what());
     }
@@ -523,6 +362,9 @@ void Ne16Lane::queue_input(const Command& c) {
   p.kind = c.kind;
   p.seq = c.seq;
   if (c.kind == Command::Kind::key) {
+    // A protocol that takes no key messages (IMX): the key state alone,
+    // which run_host has updated; nothing goes to the guest's queue.
+    if (!proto_->takes_key_messages()) return;
     p.vk = uint8_t(c.a & 0xFF);
     p.down = c.b != 0;
     p.was_down = key_down_[p.vk];
@@ -542,7 +384,7 @@ void Ne16Lane::queue_input(const Command& c) {
     mouse_y_ = p.y;
     mouse_buttons_ = p.buttons;
   } else {
-    return;  // CAPS: the toggle state only (the KEY 20 line before it is the key)
+    return;  // CAPS, NUMLOCK: the toggle state only (the KEY 20 or 144 line before it is the key)
   }
   pending_input_.push_back(p);
 }
@@ -550,7 +392,8 @@ void Ne16Lane::queue_input(const Command& c) {
 // At a point the guest can be called (the start of a frame's DRAWFRAME run,
 // or where a suspended long call resumes, on_deadline): each KEY
 // through the WH_KEYBOARD chain, then — unless a hook consumed it — into the
-// saver window's queue; each MOUSE as WM_MOUSEMOVE and button messages.
+// saver window's queue (a protocol that takes key messages: queue_input);
+// each MOUSE as WM_MOUSEMOVE and button messages.
 void Ne16Lane::deliver_input() {
   std::vector<PendingInput> batch;
   batch.swap(pending_input_);
@@ -608,13 +451,21 @@ void Ne16Lane::end_step_input() {
   wake_ = wake_ || r.wake;
   queued_seq_ = r.pending;
   hooked_ = win16::user16_has_keyboard_hook(*rt_);
+  // What an Intermission module posted to its own task (SWSE's FORCETOWAKE,
+  // lane.hh "Intermission (IMX)"), taken by the protocol's message pump: said,
+  // never a wake.
+  if (r.task_posts != task_posts_) {
+    trace("lane", "%s: frame %" PRIu64 ": %u message(s) posted to the guest's task so far (the latest %04X): not a wake",
+          module_name_.c_str(), frames_, r.task_posts, r.last_task_msg);
+    task_posts_ = r.task_posts;
+  }
 }
 
 LaneStatus Ne16Lane::status() const {
   LaneStatus s;
   s.interactive = wants_events_;
   s.cursor = cursor_;
-  s.source = wants_events_ ? kStatusSourceAd3 : 0;
+  s.source = wants_events_ ? kStatusSourceAd3 : 0;  // the toggle is AD3's 0x0E (Protocol16::Call)
   // Within the last 120 steps it read the saver window's queue, or a keyboard hook is in.
   s.key_filter = hooked_ || (read_queue_ && frames_ - last_read_frame_ < kReaderSteps);
   s.wake = wake_;
@@ -628,38 +479,46 @@ LaneStatus Ne16Lane::status() const {
   return s;
 }
 
-// The frame's run of DRAWFRAMEs (lane.hh "Pacing"): until the work budget,
-// ADMAXDRAWS calls, or - with long calls on - the frame's deadline. False
-// when the module stopped the run.
+// The frame's run of DRAWFRAMEs (lane.hh "Pacing"): until the work budget
+// (less what the frame pays back of a carried overrun), ADMAXDRAWS calls, or
+// - with long calls on - the frame's deadline. False when the module stopped
+// the run.
 bool Ne16Lane::draw_run() {
   for (;;) {
     if (controls_pending_) {
       controls_pending_ = false;
-      send_controls();
+      proto_->send_controls();
     }
     if (!pending_input_.empty()) deliver_input();
     // The host's message loop ran between DRAWFRAMEs: MM_MCINOTIFY and
     // MM_WOM_* due by now reach their windows (lane.hh "Sound").
     win16::audio16_pump(*rt_);
-    // AFTERDAR.SCR 0x401f6f: SetWindowOrgEx(hdc, 0, 0) before every DRAWFRAME.
-    if (HDC h = rt_->state<win16::Gdi16>().host_dc(hdc_)) SetWindowOrgEx(h, 0, 0, nullptr);
+    // One call of the protocol (AD3: SetWindowOrgEx, MODULEMESSAGE16(DRAWFRAME)).
     mid_call_ = true;
-    uint16_t r = bridge_->message(2, scratch_ + scratch::kError, scratch::kErrorSize);
+    Protocol16::Call r = proto_->call();
     mid_call_ = false;
     draws_++;
     frame_draws_++;
-    int16_t v = int16_t(r);
-    if (v != 0) trace("lane", "MODULEMESSAGE16(DRAWFRAME) -> %d", v);
-    if (v == 0x0E) {
+    if (r.kind == Protocol16::Call::Kind::toggle_events) {
       wants_events_ = !wants_events_;
-    } else if (v == 0x11 || v == 0x12) {
-      cursor_ = v == 0x11;
-    } else if (v > 0 && v <= 0x12) {
-      log("%s: frame %" PRIu64 ": the module stopped (result %d): %s", module_name_.c_str(), frames_, v,
-          error_text().c_str());
+    } else if (r.kind == Protocol16::Call::Kind::cursor_on || r.kind == Protocol16::Call::Kind::cursor_off) {
+      cursor_ = r.kind == Protocol16::Call::Kind::cursor_on;
+    } else if (r.kind == Protocol16::Call::Kind::stop) {
+      log("%s: frame %" PRIu64 ": the module stopped (result %d): %s", module_name_.c_str(), frames_, r.code,
+          proto_->error_text().c_str());
       return false;
+    } else if (r.kind == Protocol16::Call::Kind::wake) {
+      // The module asked the saver to end, as the user's input would (AD.EXE
+      // 2.0 took result 5 as its wake): the status says wake, so the saver
+      // ends as when the user wakes it; the frame is presented as the call
+      // left it, and the module is called no more (step()).
+      woke_ = wake_ = true;
+      log("%s: frame %" PRIu64 ": the module woke the saver (result %d)%s", module_name_.c_str(), frames_, r.code,
+          ctx_->env.stream ? "; it is called no more" : "; the run ends");
+      return true;
     }
-    if (frame_draws_ >= max_draws_ || rt_->work_insns() - frame_w0_ >= frame_budget_) return true;
+    proto_->after_call();
+    if (frame_draws_ >= max_draws_ || rt_->work_insns() - frame_w0_ >= frame_allow_) return true;
     if (long_calls_ && rt_->peek_us() >= frame_deadline_) return true;
   }
 }
@@ -713,6 +572,16 @@ bool Ne16Lane::suspend_frame() {
 
 StepResult Ne16Lane::step() {
   if (!rt_ || !loaded_) return StepResult::failed;
+  // After the module's wake (draw_run) it is called no more. A headless run
+  // ends here (exit 0): nobody reads its status, and a saver would have
+  // ended. Streamed, the front end has the wake in the status of the frame
+  // before; until it ends the run, the frames repeat the last picture (and
+  // sound already playing plays on).
+  if (woke_) {
+    if (!ctx_->env.stream) return StepResult::finished;
+    frames_++;
+    return StepResult::ok;
+  }
   try {
     trace("lane", "frame %" PRIu64, frames_);
     settle_screen();
@@ -733,8 +602,14 @@ StepResult Ne16Lane::step() {
     frame_draws_ = 0;
     const uint64_t i0 = rt_->instructions(), d0 = draws_, t0 = rt_->peek_us();
     const bool resumed = suspended_;
+    // Carried overruns (lane.hh "Pacing"): the frame's budget first pays back
+    // what the last frames' calls did beyond theirs, and a frame it all goes
+    // to makes no call — the modeled machine is still busy with them.
+    const uint64_t paid = carry_ ? std::min(owed_, frame_budget_) : 0;
+    frame_allow_ = frame_budget_ - paid;
+    const bool idle = carry_ && !resumed && !frame_allow_;
     in_step_ = true;
-    if (long_calls_) {
+    if (long_calls_ && !idle) {
       // Long calls (lane.hh): the frame ends at the deadline even inside a
       // DRAWFRAME. Headless, the deadline is the frame grid's next line;
       // streamed, 90% of a period of wall time from now (the rest is the
@@ -746,7 +621,17 @@ StepResult Ne16Lane::step() {
       rt_->clear_deadline();
     } else {
       try {
-        run_result_ = draw_run() ? Run::frame_done : Run::stopped;
+        if (idle) {
+          // No call, but what goes on between calls does: the input, the
+          // audio (MEMMIDI's timer is delivered at the pump and at API
+          // calls), the protocol's message loop.
+          if (!pending_input_.empty()) deliver_input();
+          win16::audio16_pump(*rt_);
+          proto_->after_call();
+          run_result_ = Run::frame_done;
+        } else {
+          run_result_ = draw_run() ? Run::frame_done : Run::stopped;
+        }
       } catch (...) {
         in_step_ = false;
         throw;
@@ -762,10 +647,43 @@ StepResult Ne16Lane::step() {
       census();
       return StepResult::failed;
     }
-    trace("pace", "frame %" PRIu64 ": %" PRIu64 " DRAWFRAME(s)%s%s, work %" PRIu64 " of %" PRIu64 " (%" PRIu64
-          " instructions), time %" PRIu64 " us (grid %" PRIu64 ", began %" PRIu64 ")",
-          frames_, draws_ - d0, resumed ? ", resumed" : "", suspended_ ? ", ended inside one" : "",
-          rt_->work_insns() - frame_w0_, frame_budget_, rt_->instructions() - i0, rt_->peek_us(), ctx_->clock.now_us(), t0);
+    const uint64_t work = rt_->work_insns() - frame_w0_;
+    if (carry_) {
+      // What the frame's passes did beyond what it was allowed is owed. A
+      // pass that runs past its frame's deadline owes nothing, neither in the
+      // frames that end inside it nor in the one it returns in: it is paced
+      // by the deadline (Long calls), not by the budget. The passes that
+      // frame runs after it returns are owed as any frame's are: one only
+      // starts while the frame's work is below its allowance (draw_run), so
+      // what they did beyond it is the frame's work less the allowance (all
+      // of the budget: the frame before ended inside a call, so nothing was
+      // owed or paid back). What is owed stays below kMaxOwedBudgets budgets,
+      // and each frame without a call pays a whole budget back, so at most
+      // kMaxOwedBudgets - 1 frames in a row make none.
+      if (suspended_) {
+        owed_ = 0;  // it ended inside a call
+      } else if (resumed && draws_ - d0 <= 1) {
+        owed_ = 0;  // it only finished the call it resumed
+      } else if (idle) {
+        // A frame without a call pays a whole budget back, whatever its pumps
+        // did (MEMMIDI's timer procedures, the message loop): owing that work
+        // again would let a frame whose pumps cost a budget stall the module
+        // for good, and the bound above would not hold.
+        owed_ -= paid;
+      } else {
+        const uint64_t over = work > frame_allow_ ? work - frame_allow_ : 0;
+        owed_ = std::min(owed_ - paid + over, kMaxOwedBudgets * frame_budget_ - 1);
+      }
+      if (idle) idle_frames_++;
+    }
+    if (tracing("pace")) {
+      char carried[64] = "";
+      if (carry_) snprintf(carried, sizeof(carried), ", %" PRIu64 " paid back, %" PRIu64 " owed", paid, owed_);
+      trace("pace", "frame %" PRIu64 ": %" PRIu64 " DRAWFRAME(s)%s%s, work %" PRIu64 " of %" PRIu64 " (%" PRIu64
+            " instructions)%s, time %" PRIu64 " us (grid %" PRIu64 ", began %" PRIu64 ")",
+            frames_, draws_ - d0, resumed ? ", resumed" : "", suspended_ ? ", ended inside one" : "", work, frame_budget_,
+            rt_->instructions() - i0, carried, rt_->peek_us(), ctx_->clock.now_us(), t0);
+    }
     if (suspended_) long_frames_++;
     rt_->settle_time();
     // Real GDI batches drawing per thread: finish it before the host reads the pixels.
@@ -785,8 +703,13 @@ StepResult Ne16Lane::step() {
     // ahead of the core clock run_host advances with (by the frame's work
     // headless, by the modeled init time streamed), and the engine takes an
     // earlier time as the latest it has seen — so without this a streamed run
-    // would render only at the guest's audio calls.
-    if (ctx_->audio && ctx_->audio->enabled()) ctx_->audio->advance(rt_->peek_us());
+    // would render only at the guest's audio calls. But never past an audio
+    // event not yet delivered (Runtime16::audio_due): a timer procedure's
+    // calls are dated at its period's due time (win16/sound16.hh), and a frame
+    // can end with periods due and undelivered — inside a call, or after one
+    // that made no API call — whose notes would otherwise sound at the
+    // engine's time, bunched at the frame's end.
+    if (ctx_->audio && ctx_->audio->enabled()) ctx_->audio->advance(std::min(rt_->peek_us(), rt_->audio_due()));
     return StepResult::ok;
   } catch (const GuestError16& e) {
     log("%s: frame %" PRIu64 ": %s", module_name_.c_str(), frames_, e.what());
@@ -826,13 +749,14 @@ void Ne16Lane::shutdown() {
   if (!rt_) return;
   settle_screen();
   if (transient_frames_) trace("lane", "%" PRIu64 " frame(s) presented transient content", transient_frames_);
-  trace("lane", "%s: %" PRIu64 " DRAWFRAME calls over %" PRIu64 " frames (%" PRIu64 " ended inside one)",
-        module_name_.c_str(), draws_, frames_, long_frames_);
+  trace("lane", "%s: %" PRIu64 " DRAWFRAME calls over %" PRIu64 " frames (%" PRIu64 " ended inside one%s)",
+        module_name_.c_str(), draws_, frames_, long_frames_,
+        carry_ ? (", " + std::to_string(idle_frames_) + " made none").c_str() : "");
   try {
     abandon_long_call();
-    if (loaded_ && bridge_ && !suspended_) bridge_->unload();
+    if (loaded_ && proto_ && !suspended_) proto_->unload();
     loaded_ = false;
-    if (bridge_ && !suspended_) bridge_->close();
+    if (proto_ && !suspended_) proto_->close();
     if (!suspended_) rt_->modules().free_all();
     // What the guest left playing or open (win16/sound16.hh).
     win16::audio16_close(*rt_);
@@ -840,7 +764,7 @@ void Ne16Lane::shutdown() {
     log("%s: while closing: %s", module_name_.c_str(), e.what());
   }
   census();
-  bridge_.reset();
+  proto_.reset();
   rt_.reset();
   free_fibers();
 }
@@ -923,18 +847,19 @@ void Ne16Lane::present() {
   }
 }
 
-// Configure mode (lane.hh "Configure"): the module's button handler, as
-// AFTERDAR.SCR's property page ran it through OLDMOD32's ButtonPushed3216 —
-// BUTTONPUSHED16 of the real OLDMOD16, or the native bridge's same sequence —
-// with the module's dialogs real (win16/dialogs16.hh) and its disk
-// persistent (ADSTATE, or the --configure default).
+// Configure mode (lane.hh "Configure"): the module's button handler, run by
+// its protocol (Protocol16::button; AD3: as AFTERDAR.SCR's property page ran
+// it through OLDMOD32's ButtonPushed3216 — BUTTONPUSHED16 of the real
+// OLDMOD16, or the native bridge's same sequence) with the module's dialogs
+// real (win16/dialogs16.hh) and its disk persistent (ADSTATE, or the
+// --configure default).
 ConfigureResult Ne16Lane::configure(const std::string& module_path, LaneContext& ctx, const ConfigureRequest& req,
                                     std::string* json_out) {
   ctx_ = &ctx;
   const Env& env = ctx.env;
   std::string path = full_path(module_path);
   module_name_ = file_of(path);
-  layout_ = resolve_layout(path, env.win_assets_dir(), file_exists);
+  layout_ = resolve_layout(path, env.win_assets_dir(), file_exists, dir_exists);
   auto finish = [&](ConfigureResult r, int shown, const std::string& message, const std::vector<std::string>& written) {
     if (json_out) *json_out = configure_json(r, shown, message, written);
     log("%s: configure button %d: %s (%d shown)%s%s", module_name_.c_str(), req.slot,
@@ -942,24 +867,12 @@ ConfigureResult Ne16Lane::configure(const std::string& module_path, LaneContext&
         message.empty() ? "" : ": ", message.c_str());
     return r;
   };
-  // The control record of the slot must be a button (kind 4, ABI.md §2.10.2).
-  std::shared_ptr<loader::ne::Image> img;
-  try {
-    img = std::make_shared<loader::ne::Image>(loader::ne::Image::from_file(path));
-  } catch (const std::exception& e) {
-    return finish(ConfigureResult::failed, 0, std::string("not an NE module: ") + e.what(), {});
-  }
-  const auto* rec = req.slot >= 0 ? img->find_resource(loader::ResId::of(1000), loader::ResId::of(uint16_t(req.slot + 1)))
-                                  : nullptr;
-  if (!rec || u16(img->resource_data(*rec), 0) != 4) {
-    return finish(ConfigureResult::failed, 0, "control " + std::to_string(req.slot) + " is not a button", {});
-  }
-  bool bridge_auto = true;
-  BridgeKind forced = BridgeKind::oldmod16;
-  if (const std::string* b = env.get("ADNE16BRIDGE")) {
-    if (!parse_bridge_choice(*b, &bridge_auto, &forced)) bridge_auto = true;
-  }
-  bridge_kind_ = bridge_auto ? choose_bridge(layout_, file_exists) : forced;
+  // Whether the module has this button, before anything is loaded (AD3: the
+  // slot's control record is a button; IMX: slot 0).
+  std::string why;
+  proto_ = make_protocol_(layout_, env, &why);
+  if (!proto_) return finish(ConfigureResult::failed, 0, why, {});
+  if (!proto_->check_button(req.slot, &why)) return finish(ConfigureResult::failed, 0, why, {});
 
   win32::ConfigScript script;
   std::string script_error;
@@ -975,7 +888,8 @@ ConfigureResult Ne16Lane::configure(const std::string& module_path, LaneContext&
   opts.arena_size = uint32_t(std::clamp<uint64_t>(env_u64(env, "ADHEAPMB", 64), 16, 512) << 20);
   // No budget: the user may keep the dialog open as long as they like.
   opts.call_budget = UINT64_MAX / 2;
-  opts.desktop_palette = layout_.packaged && choose_bridge(layout_, file_exists) == BridgeKind::native;
+  // The protocol's choices and runtime options (AD3: the bridge, the palette).
+  proto_->configure_button_runtime(opts, env);
   if (env.get("ADDESKTOPPAL")) opts.desktop_palette = env.flag("ADDESKTOPPAL");
   ctx.clock.set_read_step_us(0);
   std::vector<std::string> written;
@@ -983,7 +897,7 @@ ConfigureResult Ne16Lane::configure(const std::string& module_path, LaneContext&
     rt_ = std::make_unique<Runtime16>(opts, ctx.clock, &ctx.input);
     Runtime16& rt = *rt_;
     win16::register_all16(rt);
-    mount_disk(rt, env, path, layout_);
+    proto_->mount(rt, env);
     rt.attach_display(ctx.screen);
     // Dialogs run on the wall clock (a module's timers tick while the user
     // looks); the core's realtime clock starts with its first frame.
@@ -992,52 +906,19 @@ ConfigureResult Ne16Lane::configure(const std::string& module_path, LaneContext&
     win16::enable_real_dialogs16(rt, &cfg);
     uint16_t owner16 = win16::real_hwnd16(rt, cfg.owner);
 
-    std::string ad_snd = layout_.engine_dir + "\\AD_SND.DLL", why;
-    if (bridge_kind_ == BridgeKind::oldmod16) {
-      if (!same_dir(layout_.module_dir, layout_.engine_dir) && file_exists(layout_.module_dir + "\\AD_SND.DLL") &&
-          file_exists(ad_snd)) {
-        uint16_t e = 0;
-        rt.modules().load_host(ad_snd, &e);
-      }
-      bridge_ = open_oldmod16_bridge(rt, layout_.engine_dir + "\\OLDMOD16.DLL", &why);
-    } else {
-      bridge_ = open_native_bridge(rt, opts.system_dir + "\\AD_SND.DLL", &why);
-    }
-    if (!bridge_) {
+    Protocol16::Button b = proto_->button(rt, req.slot, owner16, ctx);
+    if (!b.ran) {
+      proto_.reset();
       rt_.reset();
-      return finish(ConfigureResult::failed, 0, why, {});
+      return finish(ConfigureResult::failed, 0, b.message, {});
     }
-    uint16_t hb = rt.global().alloc(win16::GlobalHeap16::kZeroInit, scratch::kSize);
-    if (!hb) throw std::runtime_error("no guest memory for the scratch block");
-    scratch_ = uint32_t(hb) << 16;
-    for (int i = 0; i < 4; i++) {
-      int16_t def = 0;
-      if (const auto* r = img->find_resource(loader::ResId::of(1000), loader::ResId::of(uint16_t(i + 1)))) {
-        def = control_default16(img->resource_data(*r));
-      }
-      ctrl_[i] = int16_t(ctx.input.control(i, def));
-      rt.wr16(scratch_ + scratch::kCtrl + 2u * uint32_t(i), uint16_t(ctrl_[i]));
-    }
-    std::string guest = opts.guest_dir + "\\" + win16::upper16(module_name_);
-    rt.write_str(scratch_ + scratch::kPath, guest, 260);
-    trace("lane", "%s: BUTTONPUSHED16(%s, owner %04X, %d) through the %s bridge", module_name_.c_str(), guest.c_str(),
-          owner16, req.slot, bridge_name(bridge_kind_));
-    uint16_t r = bridge_->button(scratch_ + scratch::kPath, owner16, uint16_t(req.slot), scratch_ + scratch::kCtrl,
-                                 scratch_ + scratch::kError, scratch::kErrorSize, scratch_ + scratch::kErrId);
-    uint16_t err_id = rt.rd16(scratch_ + scratch::kErrId);
-    std::string err_text = rt.read_str(scratch_ + scratch::kError, scratch::kErrorSize);
-    trace("lane", "BUTTONPUSHED16 -> %u (errId %u, error \"%s\")", r, err_id, err_text.c_str());
-    bridge_->close();
+    proto_->close();
     rt.modules().free_all();
     written = rt.vfs().written();
-    bridge_.reset();
+    proto_.reset();
     rt_.reset();
-    if (err_id) {
-      return finish(ConfigureResult::failed, cfg.shown,
-                    err_id == 1 ? "cannot load AD_SND.DLL" : err_id == 2 ? "AD_SND.DLL is too old" : "AD_SND.DLL lacks an entry point",
-                    written);
-    }
-    std::string message = err_text;
+    if (!b.failure.empty()) return finish(ConfigureResult::failed, cfg.shown, b.failure, written);
+    std::string message = b.message;
     for (const std::string& n : cfg.notes) message += (message.empty() ? "" : "; ") + n;
     if (cfg.failed) return finish(ConfigureResult::failed, cfg.shown, message.empty() ? "a dialog failed" : message, written);
     return finish(cfg.shown ? ConfigureResult::shown : ConfigureResult::nothing, cfg.shown, message, written);
@@ -1046,13 +927,13 @@ ConfigureResult Ne16Lane::configure(const std::string& module_path, LaneContext&
     if (rt_) rt_->log_state("guest state");
     if (rt_) written = rt_->vfs().written();
     std::string what = e.what();
-    bridge_.reset();
+    proto_.reset();
     rt_.reset();
     return finish(ConfigureResult::failed, cfg.shown, what, written);
   } catch (const std::exception& e) {
     if (rt_) written = rt_->vfs().written();
     std::string what = e.what();
-    bridge_.reset();
+    proto_.reset();
     rt_.reset();
     return finish(ConfigureResult::failed, cfg.shown, what, written);
   }

@@ -1,8 +1,8 @@
 # Installing Long After Dark
 
 **Long After Dark** is a screen saver for Windows that runs the original
-Windows After Dark modules, unchanged, under x86 emulation. It knows five
-releases:
+modules of After Dark and of LucasArts' Star Wars Screen Entertainment,
+unchanged, under x86 emulation. It knows seven releases:
 
 | id | Release | Internet Archive download |
 |---|---|---|
@@ -11,6 +11,16 @@ releases:
 | `ad32` | After Dark 3.2 (1995) | CD image, 58.8 MB |
 | `tt` | Totally Twisted After Dark (1995) | CD image, 37.9 MB |
 | `simpsons` | The Simpsons Screen Saver (1994) | install files (ZIP), 2.6 MB |
+| `swse` | Star Wars Screen Entertainment (1994) | CD image, 6.9 MB |
+| `startrek` | Star Trek: The Screen Saver (1992) | two floppy images, 2.8 MB |
+
+Star Trek: The Screen Saver is After Dark 2.0 (version 2.0b) with 16 Star
+Trek modules, on two floppies.
+
+Star Wars Screen Entertainment is not an After Dark release, though it is
+sometimes listed as "After Dark Star Wars": its 14 modules were made for
+Delrina's Intermission screen saver engine, which Long After Dark stands in
+for as it does for After Dark's.
 
 Requirements: 64-bit Windows on an x64 PC. It was developed on Windows 11.
 
@@ -27,25 +37,29 @@ describes: `bash tools/package.sh` stages the same files in
 - **LongAfterDark.scr**: the screen saver and its settings window.
 - **adhostwin.exe**: the emulator. The screen saver starts one for each
   monitor.
-- **adimport.exe**: copies the After Dark modules from your discs.
+- **adimport.exe**: copies the modules from your discs.
 - **README.txt**: a short version of this page.
 - **LICENSE.txt** and the **licenses** folder: this project's licence and
   those of the code built into the programs.
 
 Keep the three programs in one folder: the screen saver looks for the other
-two next to itself. No After Dark files are included. You import them from
-your own copy (and are responsible for sourcing them legally).
+two next to itself. No After Dark or Star Wars Screen Entertainment files
+are included. You import them from your own copy (and are responsible for
+sourcing them legally).
 
-## 1. Import your After Dark releases
+## 1. Import your releases
 
 Double-click `adimport.exe`, or open the screen saver's settings and click
 **Import…**. Then pick a source:
 
 - **A disc or floppy image:** `.iso`, `.bin`, `.img`, `.ima`, `.vfd` or
-  `.flp`, or a `.zip` of the install files. If you have the two Simpsons
-  floppies as separate images, select both.
-- **A drive or folder:** the CD itself, or a folder copied from it.
-- **A download from the Internet Archive:** a list of the five releases
+  `.flp`, or a `.zip` of the install files, or of a release's floppy
+  images. If you have a release's floppies as separate images, select them
+  all, such as the Simpsons' two or Star Trek's two, or the ZIP they came
+  in.
+- **A drive or folder:** the CD itself, or a folder copied from it (for
+  floppies, one folder holding the files of every disk).
+- **A download from the Internet Archive:** a list of the seven releases
   with their sizes, plus one entry that fetches every release not imported
   yet. An interrupted download resumes, and each file is checked against its
   published MD5 before it is used.
@@ -54,13 +68,31 @@ The importer works out which release it was given, checks every file against
 that release's known MD5s, and installs it beside the releases already
 imported, which it leaves untouched. Import as many as you like.
 
+Star Wars Screen Entertainment verifies only as the build on its CD: the
+CD, its ISO or Redump BIN image, the ZIP of its files, or
+`adimport --download swse`. The floppy sets found online (the US five-disk
+set and the German edition) are other builds: they fail verification (exit
+code 3) unless imported with `adimport --no-verify` from a command prompt.
+
+Star Trek: The Screen Saver came on two floppies. Import both images
+together, in either order
+(`adimport --image disk1.img --image disk2.img`), or the ZIP they came in
+(such as the Internet Archive's `afterdark-20b_startrek.zip`), a folder
+holding both disks' files, or `adimport --download startrek`. One disk
+alone is refused: the importer says it needs every install disk (for disk 2
+alone, that the image is install disk 2 of 2). A folder
+where After Dark 2.0 was installed (`C:\AFTERDRK`) is no source: the
+importer needs the install disks.
+
 From a command prompt, with the ids from the table above:
 
 ```
 adimport --image "C:\Images\After Dark 3.2.iso"
 adimport --image disk1.img --image disk2.img
+adimport --image afterdark-20b_startrek.zip
 adimport --from E:\
 adimport --download ad10
+adimport --download swse
 adimport --download all
 adimport --list-packages
 adimport --remove tt
@@ -119,13 +151,41 @@ modules, Art Critic's **Pictures** and others. A button opens the module's
 own window, as the original control panels did. What you set there is saved
 by the module at once, so the settings window's **Cancel** does not undo it.
 
+Each Star Wars Screen Entertainment module has all its options behind one
+such button, **Configure...**, which opens the module's own settings window
+(sound, music, picture quality, text speed and the like). The modules keep
+those settings in their `SWSE.INI`, under `state\swse\WINDOWS\` in your
+data folder (see below); deleting `state\swse` brings back the disc's
+defaults. The **Resolution** setting does not apply to them: they compose
+their scenes for a 640×480 screen, so they always get one, scaled to fit
+your monitor in its 4:3 shape (with bars at the sides on a widescreen
+monitor, above and below on a 5:4 or portrait one).
+
+Several Star Trek modules compose their scenes for a 640×480 screen too,
+so the **Resolution** setting does not apply to any of them either: they
+always get 640×480, scaled to fit as the Star Wars modules are. Two of
+them have buttons. Communications' **Edit Custom...** edits your own
+message (choose "Custom" under **Message** to show it), and Sounder's
+**Sounds..** picks the folder of `.WAV` files Sounder plays: besides the
+module's own folder, its list of drives offers `[-h-]`, where your own
+drives are (`H:\C\...` is your `C:`, in short 8.3 names). The folder you
+pick is kept, drive and all, for every later run. Pick one near a drive's
+root: as in DOS, its short path after the drive letter must fit in 63
+characters. After Dark's Globe ("Map..." in After Dark 4.0 Deluxe and 3.2)
+reaches your drives the same way.
+
 **Sound** is on by default. Only the primary monitor's screen saver plays
-it, at After Dark's own volume (50): the modules' wave effects, their MIDI
+it, at the default volume (50): the modules' wave effects, their MIDI
 music (through Windows' MIDI synthesizer, normally the Microsoft GS
-Wavetable Synth) and the Simpsons' speech. In the settings window,
-**Sound** (Primary monitor / Off) and **Volume** (0–100) change that.
-**Preview** plays sound with the values you have not saved yet; the small
-live preview never does.
+Wavetable Synth), the Simpsons' speech and the Star Trek modules' sounds
+(which the original could also play on the PC speaker; here they always go
+through Windows' sound). In the settings window,
+**Sound** (Primary monitor / Off) and **Volume** (0–100) change that. For
+Star Wars Screen Entertainment, Volume reaches the effects through
+Intermission's own volume setting, and the music as the Windows mixer's
+synthesizer slider did, since Intermission itself set only the effects'
+volume. **Preview** plays sound with the values you have not saved yet; the
+small live preview never does.
 
 ## Ending it, and playing
 
@@ -143,6 +203,11 @@ once. Locking the computer (Win+L) ends the screen saver whether a game is
 playing or not. Only the primary monitor plays; the others keep running on
 their own.
 
+Num Lock never ends the screen saver either. In Star Trek's **Final Exam**
+it starts the Starfleet Academy exam: type the number of your answer (1 to
+4, on the top row or the keypad). Num Lock again stops the exam, and
+moving the mouse ends it, and the screen saver with it.
+
 ## Where your files are
 
 Everything is in `%LOCALAPPDATA%\LongAfterDark` (paste that into Explorer's
@@ -153,7 +218,7 @@ address bar):
 | `assets\win\` | the imported modules, one folder per release, the module list `catalog-win.json`, and the releases' box covers (`covers\`) |
 | `downloads\` | Internet Archive downloads, reused if you import the same release again |
 | `settings.ini` | the screen saver's settings |
-| `state\` | what the modules save themselves (message texts, chosen pictures, high scores), per release |
+| `state\` | what the modules save themselves (message texts, chosen pictures, high scores, the Star Wars modules' settings, Sounder's folder), per release |
 | `thumbs\` | the settings window's module pictures |
 | `logs\saver-last.log` | how the last screen saver run went and why it ended |
 

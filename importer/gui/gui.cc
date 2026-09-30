@@ -240,7 +240,7 @@ int run_screenshot(Session& s, const std::wstring& png) {
     pg = std::move(sp);
     if (!pg->open(nullptr)) return 1;
     if (kv[L"caution"] == L"1")
-      src->show_caution(L"That is not a known After Dark disc. D:\\Backup\\Screen savers: no known After Dark release is "
+      src->show_caution(L"That is not a disc Long After Dark knows. D:\\Backup\\Screen savers: no known release is "
                         L"there. Choose the CD drive itself (for example E:\\) or a copy of the disc or floppies.");
   } else if (page == L"downloads") {
     pg = std::make_unique<DownloadsPage>(s);

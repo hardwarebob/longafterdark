@@ -12,10 +12,13 @@
 // own rate"). Exits on QUIT, on stdin EOF after a GO, when a stdout write
 // fails, or after ADFRAMES frames.
 //
-// Interaction (INTERACTION.md §3): KEY/CAPS/MOUSE lines are numbered 1, 2, 3
-// … as the real host numbers them and logged ("input" lines). CAPS 1 makes
-// it interactive (CAPS 0 ends that) and KEY/MOUSE lines while interactive are
-// eaten. With ADSTATUSHANDLE it publishes the status record after every frame.
+// Interaction (INTERACTION.md §3): KEY/CAPS/NUMLOCK/MOUSE lines are numbered
+// 1, 2, 3 … as the real host numbers them and logged ("input" lines). CAPS 1
+// makes it interactive (CAPS 0 ends that) and KEY/MOUSE lines while
+// interactive are eaten; NUMLOCK only sets its toggle (ADNUMLOCK at start).
+// A line it doesn't know is ignored, unnumbered, and logged ("unknown"
+// lines), as the real host ignores one ("ignoring unrecognized input line").
+// With ADSTATUSHANDLE it publishes the status record after every frame.
 // ADSEEDIMG is opened as a host opens it and checked (a P6 of the screen size).
 //
 // Test levers (env):
@@ -34,6 +37,18 @@
 //                              module whose lane isn't built in (and --capabilities says so)
 //   FAKEHOST_CONFIGURE=<lanes> what --capabilities lists under configure= (default: the lanes;
 //                              "none" = no lane)
+//   FAKEHOST_ABIS=<abis>       what --capabilities lists under abis= (default
+//                              "afterdark,intermission", as today's host; "none" leaves the key
+//                              out, as a host from before module ABIs). Without "intermission"
+//                              an .IMX module exits 1 at once, as such a host fails to load one
+//   FAKEHOST_EXIT3_MODULE=<t>  a module whose path contains <t> (any case) exits 3 at once, as
+//                              the real host does for a module whose lane isn't built in,
+//                              whatever --capabilities listed (the front-end marks that one alone)
+//   FAKEHOST_CAPS_DELAY_MS=<ms> --capabilities answers only after this long (a cold or busy
+//                              host: the saver's wait for the answer can run out first)
+//   FAKEHOST_NUMLOCK=0         a host from before the Num Lock toggle: --capabilities leaves
+//                              numlock=1 out (today's host lists it) and a NUMLOCK line is
+//                              a line it doesn't know (logged "unknown", never numbered)
 //   FAKEHOST_IGNORE_QUIT=1     ignore QUIT (a module stuck in one long step): only
 //                              termination ends us, after the front-end's grace
 //   FAKEHOST_QUIT_DELAY_MS=<ms> take this long after QUIT before exiting (a host
@@ -112,10 +127,30 @@ unsigned long parent_pid() {
   return ppid;
 }
 
-bool in_classic_folder(std::string path) {
+std::string upper_path(std::string path) {
   for (char& c : path) c = (char)toupper((unsigned char)(c == '\\' ? '/' : c));
-  return path.find("/CLASSIC/") != std::string::npos;
+  return path;
 }
+
+bool in_classic_folder(const std::string& path) { return upper_path(path).find("/CLASSIC/") != std::string::npos; }
+
+// Star Wars Screen Entertainment's Intermission modules are *.IMX (the real
+// host tells them by their exports; the placeholders have none).
+bool imx_module(const std::string& path) {
+  const std::string p = upper_path(path);
+  return p.size() >= 4 && p.compare(p.size() - 4, 4, ".IMX") == 0;
+}
+
+// FAKEHOST_ABIS as --capabilities prints it ("" = the key left out).
+std::string abis_listed() {
+  if (!getenv("FAKEHOST_ABIS")) return "afterdark,intermission";
+  const std::string v = env("FAKEHOST_ABIS");
+  return v == "none" ? std::string() : v;
+}
+
+// This "build" keeps a Num Lock toggle (numlock=1), as today's host does,
+// unless FAKEHOST_NUMLOCK=0.
+bool keeps_numlock() { return env("FAKEHOST_NUMLOCK") != "0"; }
 
 std::set<int> vk_set(const std::string& list) {
   std::set<int> out;
@@ -138,6 +173,8 @@ struct Input {
   bool go_seen = false, quit = false, eof = false;
   std::vector<std::pair<int, int>> sets;
   int caps = 0;
+  int numlock = 0;
+  bool numlock_lines = true;       // NUMLOCK is a line it knows (keeps_numlock)
   // Interaction.
   uint64_t seq = 0;                // input lines read
   std::deque<uint64_t> go_seq;     // seq as each pending GO was read
@@ -185,6 +222,15 @@ void stdin_reader(Input* in) {
         if (in->interactive || (key && in->key_filter && in->eat_vks.count(a))) in->eaten = in->seq;
         log_event("input\tpid=" + std::to_string(GetCurrentProcessId()) + "\tseq=" + std::to_string(in->seq) +
                   "\tline=" + line + "\tinteractive=" + (in->interactive ? "1" : "0"));
+      } else if (in->numlock_lines && sscanf(line.c_str(), "NUMLOCK %d", &a) == 1) {
+        // Numbered like CAPS; it only sets the toggle (a module reads it).
+        in->numlock = a != 0;
+        ++in->seq;
+        log_event("input\tpid=" + std::to_string(GetCurrentProcessId()) + "\tseq=" + std::to_string(in->seq) +
+                  "\tline=" + line + "\tinteractive=" + (in->interactive ? "1" : "0"));
+      } else if (!line.empty()) {
+        // What a host does with a line it doesn't know: nothing, and no number.
+        log_event("unknown\tpid=" + std::to_string(GetCurrentProcessId()) + "\tline=" + line);
       }
       in->cv.notify_all();
     }
@@ -254,7 +300,7 @@ std::string check_seed(const std::string& path, int w, int h) {
 std::string env_fields() {
   std::string s;
   for (const char* k : {"ADSTREAM", "ADSCREENW", "ADSCREENH", "ADCVSET", "AD_ASSETS_DIR", "ADSTATE", "ADCAPS",
-                        "ADSEEDIMG", "ADSTATUSHANDLE", "ADSOUND", "ADVOLUME", "ADAUDIOOUT"}) {
+                        "ADNUMLOCK", "ADSEEDIMG", "ADSTATUSHANDLE", "ADSOUND", "ADVOLUME", "ADAUDIOOUT"}) {
     s += "\t";
     s += k;
     s += "=" + env(k);
@@ -264,13 +310,16 @@ std::string env_fields() {
 
 // --capabilities (INTERACTION.md §3.3).
 int capabilities() {
+  if (const int delay = atoi(env("FAKEHOST_CAPS_DELAY_MS").c_str()); delay > 0) Sleep((DWORD)delay);
   std::string lanes = env("FAKEHOST_LANES");
   if (lanes.empty()) lanes = "pe32,ne16";
   std::string configure = getenv("FAKEHOST_CONFIGURE") ? env("FAKEHOST_CONFIGURE") : lanes;
   if (configure == "none") configure.clear();
+  const std::string abis = abis_listed();
   log_event("capabilities\tpid=" + std::to_string(GetCurrentProcessId()) + "\tppid=" + std::to_string(parent_pid()) +
             env_fields());
-  printf("lanes=%s configure=%s status=1 state=1 seed=1\n", lanes.c_str(), configure.c_str());
+  printf("lanes=%s configure=%s%s status=1 state=1 seed=1%s\n", lanes.c_str(), configure.c_str(),
+         abis.empty() ? "" : (" abis=" + abis).c_str(), keeps_numlock() ? " numlock=1" : "");
   fflush(stdout);
   return 0;
 }
@@ -371,6 +420,17 @@ int main(int argc, char** argv) {
     log_event("exit\tpid=" + std::to_string(GetCurrentProcessId()) + "\tframes=0\treason=lane-missing");
     return 3;
   }
+  if (imx_module(argv[1]) && ("," + abis_listed() + ",").find(",intermission,") == std::string::npos) {
+    // A host from before the Intermission modules takes one for an After
+    // Dark module and fails to load it (exit 1 after 0 frames).
+    log_event("exit\tpid=" + std::to_string(GetCurrentProcessId()) + "\tframes=0\treason=abi-missing");
+    return 1;
+  }
+  if (const std::string t = env("FAKEHOST_EXIT3_MODULE");
+      !t.empty() && upper_path(argv[1]).find(upper_path(t)) != std::string::npos) {
+    log_event("exit\tpid=" + std::to_string(GetCurrentProcessId()) + "\tframes=0\treason=cant-run");
+    return 3;
+  }
   if (fail_start) {
     log_event("exit\tpid=" + std::to_string(GetCurrentProcessId()) + "\tframes=0\treason=fail-start");
     return (int)fail_start;
@@ -381,6 +441,8 @@ int main(int argc, char** argv) {
   in.key_filter = env("FAKEHOST_KEYFILTER") == "1";
   in.eat_vks = vk_set(env("FAKEHOST_EAT_VKS"));
   in.caps = env("ADCAPS") == "1";
+  in.numlock_lines = keeps_numlock();
+  in.numlock = in.numlock_lines && env("ADNUMLOCK") == "1";   // a host without the toggle never reads it
   std::thread(stdin_reader, &in).detach();
   HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
 
@@ -482,13 +544,16 @@ int main(int argc, char** argv) {
   }
   long long first_go_ms;
   uint64_t lines;
+  int numlock;
   {
     std::lock_guard lk(in.mu);
     first_go_ms = in.first_go_ms;
     lines = in.seq;
+    numlock = in.numlock;
   }
   line = "exit\tpid=" + std::to_string(GetCurrentProcessId()) + "\tframes=" + std::to_string(n) + "\treason=" + reason +
-         "\tfirst_go_ms=" + std::to_string(first_go_ms) + "\tinput_lines=" + std::to_string(lines);
+         "\tfirst_go_ms=" + std::to_string(first_go_ms) + "\tinput_lines=" + std::to_string(lines) +
+         "\tnumlock=" + std::to_string(numlock);
   log_event(line);
   fprintf(stderr, "[fakehost] %s\n", line.c_str());
   // The stdin reader may still be blocked in ReadFile; don't wait for it.

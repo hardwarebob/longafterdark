@@ -1,11 +1,13 @@
 // MMSYSTEM's sound half (sound16.hh, docs/AUDIO.md §8): sndPlaySound,
-// waveOut, midiOut/aux volumes, the MCI sequencer's command strings, and the
-// delivery of their callbacks, over the host audio engine. Every shim keeps
-// the silent device's answers, byte for byte, while no enabled engine is
-// attached (AUDIO.md §3 invariant 4); the calls the silent device never
-// answered (waveOutWrite & co., the rest of midiOut) are registered only
-// with an enabled engine, so they stay in the unimplemented census without
-// one.
+// waveOut, midiOut (volumes, and the raw port a self-sequencing guest plays
+// through), aux, the MCI sequencer's command strings, and the delivery of
+// their callbacks and of the multimedia timer events, over the host audio
+// engine. Every shim keeps the silent device's answers, byte for byte, while
+// no enabled engine is attached (AUDIO.md §3 invariant 4); the calls the
+// silent device never answered (waveOutWrite & co.) are registered only with
+// an enabled engine, so they stay in the unimplemented census without one —
+// except midiOut's, which fail honestly there (a signature-only midiOutOpen
+// returned 0, "success", without writing the handle).
 #include "win16/sound16.hh"
 
 #include <windows.h>
@@ -52,9 +54,24 @@ constexpr uint32_t kHdrData = 0, kHdrLength = 4, kHdrFlags = 16, kHdrSize = 32;
 constexpr uint32_t kWhdrDone = 0x01, kWhdrPrepared = 0x02, kWhdrBeginLoop = 0x04, kWhdrEndLoop = 0x08,
                    kWhdrInQueue = 0x10;
 static_assert(kWhdrInQueue == WHDR_INQUEUE && kWhdrPrepared == WHDR_PREPARED);
+// MIDIHDR (16-bit, 28 bytes): lpData, dwBufferLength, dwBytesRecorded, dwUser,
+// dwFlags, lpNext, reserved.
+constexpr uint32_t kMidiHdrData = 0, kMidiHdrLength = 4, kMidiHdrFlags = 16, kMidiHdrSize = 28;
+constexpr uint32_t kMhdrDone = 0x01, kMhdrPrepared = 0x02, kMhdrInQueue = 0x04;
+static_assert(kMhdrDone == MHDR_DONE && kMhdrPrepared == MHDR_PREPARED && kMhdrInQueue == MHDR_INQUEUE);
+constexpr uint16_t kMmAllocated = 4, kMidiUnprepared = 64, kMidiStillPlaying = 65;
+static_assert(kMmAllocated == MMSYSERR_ALLOCATED && kMidiUnprepared == MIDIERR_UNPREPARED &&
+              kMidiStillPlaying == MIDIERR_STILLPLAYING && kMmNoDriver == MMSYSERR_NODRIVER);
 // Messages and notify codes.
 constexpr uint16_t kMmMciNotify = 0x3B9, kMmWomOpen = 0x3BB, kMmWomClose = 0x3BC, kMmWomDone = 0x3BD;
 static_assert(kMmMciNotify == MM_MCINOTIFY && kMmWomOpen == MM_WOM_OPEN && kMmWomDone == MM_WOM_DONE);
+constexpr uint16_t kMmMomOpen = 0x3C7, kMmMomClose = 0x3C8, kMmMomDone = 0x3C9;
+static_assert(kMmMomOpen == MM_MOM_OPEN && kMmMomClose == MM_MOM_CLOSE && kMmMomDone == MM_MOM_DONE);
+// Multimedia timer events: at most 16 at once, the table Wine's winmm keeps
+// (dlls/winmm/time.c, timers[16]); a periodic event catches up at most this
+// much of its missed periods at one delivery point (at least the latest one).
+constexpr size_t kMaxTimers = 16;
+constexpr uint64_t kTimerMaxLagUs = 250000;
 constexpr uint16_t kNotifySuccessful = 1, kNotifySuperseded = 2, kNotifyAborted = 4;
 static_assert(kNotifySuperseded == MCI_NOTIFY_SUPERSEDED && kNotifyAborted == MCI_NOTIFY_ABORTED);
 // sndPlaySound's flags.
@@ -94,7 +111,29 @@ struct WaveOut16 {
   bool adpcm = false;
   uint32_t cb_type = 0, callback = 0, instance = 0;
   uint16_t ds = 0;             // CALLBACK_FUNCTION: its module's DGROUP
-  std::deque<uint32_t> queue;  // WAVEHDRs written and not done yet, in order
+  // WAVEHDRs written and not done yet, in order, each with the delivery
+  // (Sound16::deliveries) whose procedure wrote it; 0 = written outside one.
+  struct Queued {
+    uint32_t hdr = 0;
+    uint64_t delivery = 0;
+  };
+  std::deque<Queued> queue;
+};
+
+// An open midiOut handle: the one MIDI device's raw port (§8.3).
+struct MidiOut16 {
+  uint16_t device = 0;         // as opened: 0 or MIDI_MAPPER (midiOutGetID)
+  uint32_t cb_type = 0, callback = 0, instance = 0;
+  uint16_t ds = 0;             // CALLBACK_FUNCTION: its module's DGROUP
+};
+
+// A multimedia timer event (timeSetEvent, system16.cc).
+struct Timer16 {
+  uint32_t proc = 0, user = 0;
+  uint16_t ds = 0;             // the procedure's module's DGROUP
+  bool periodic = false;
+  uint64_t period = 0;         // µs
+  uint64_t due = 0, seq = 0;   // the next call: virtual µs, then issue order
 };
 
 struct Mci16 {
@@ -113,11 +152,21 @@ struct Sound16 : RuntimeState16 {
   bool on = false;             // an enabled engine is attached
   audio::VoiceId snd = 0;      // sndPlaySound's one voice
   std::map<uint16_t, WaveOut16> wave;
+  std::map<uint16_t, MidiOut16> midi;  // open midiOut handles: one at most (Win16's MIDI out had one client)
   std::map<uint16_t, Mci16> mci;  // by device id
+  std::map<uint16_t, Timer16> timers;  // by id; with or without an engine
+  uint32_t timers_created = 0;
   uint32_t wave_volume = 0xFFFFFFFF, midi_volume = 0xFFFFFFFF, cd_volume = 0xFFFFFFFF;
   std::vector<Callback16> pending;
   uint64_t seq = 0;
+  bool hooked = false;         // the runtime's delivery hook is in (an enabled engine, or a timer set)
   bool delivering = false;
+  uint64_t deliveries = 0;     // deliver() runs so far (while delivering: the running one's number)
+  uint64_t deliver_t = 0;      // … and the time it delivers up to
+  // The CALLBACK_FUNCTION or timer procedure running now, and its due time (cb_time).
+  bool in_callback = false;
+  uint64_t cb_due = 0, cb_start = 0;
+  uint64_t timer_calls = 0, timer_dropped = 0, timer_insns = 0;
   std::vector<audio::Event> events;
 };
 
@@ -131,15 +180,54 @@ std::string lower(std::string_view s) {
 
 // ---- callbacks (§8.6) ------------------------------------------------------------------------------------
 
-void update_due(Runtime16& rt, Sound16& s) {
-  if (!s.on) return;
+// The engine's next event, or a `play … to` stop, whichever comes first (UINT64_MAX: none).
+uint64_t engine_due(Sound16& s) {
+  if (!s.on) return UINT64_MAX;
   uint64_t due = UINT64_MAX;
   if (audio::Time n = s.engine->next_event_time()) due = n;
-  for (const Callback16& cb : s.pending) due = std::min(due, cb.at);
   for (const auto& [id, d] : s.mci) {
     if (d.to_at) due = std::min(due, d.to_at);
   }
+  return due;
+}
+
+void update_due(Runtime16& rt, Sound16& s) {
+  if (!s.hooked) return;
+  uint64_t due = engine_due(s);
+  for (const Callback16& cb : s.pending) due = std::min(due, cb.at);
+  for (const auto& [id, tm] : s.timers) due = std::min(due, tm.due);
   rt.set_audio_due(due);
+}
+
+// The guest time of an MMSYSTEM call made now. A CALLBACK_FUNCTION or timer
+// procedure ran at interrupt time on the original, at its event's time, and
+// here reaches the guest at the first safe point after it: the calls it makes
+// (MEMMIDI's midiOutShortMsg, a one-shot timer set again) are dated from its
+// due time plus the virtual time it has run since, so a procedure delivered
+// late still sounds, and schedules, on time. Neither deliver() nor the lane's
+// step end renders the engine past a due point before it is delivered (the
+// one takes it only as far as the events due, the other only up to
+// Runtime16::audio_due()), so those dates are not clamped to a later one the
+// engine has seen. MCI commands are dated at peek_us() even there
+// (mci_command). Everywhere else, and for every clock the guest reads, it is
+// peek_us().
+uint64_t cb_time(Runtime16& rt, const Sound16& s) {
+  uint64_t now = rt.peek_us();
+  return s.in_callback ? s.cb_due + (now - s.cb_start) : now;
+}
+
+// When a notification goes out: at `t`, its date — but one a procedure caused
+// while deliver() runs it (`by_procedure`: its device opened or closed, a long
+// MIDI message sent, a WAVEHDR written that the stream is done with within
+// the same delivery) waits for a later delivery point, whatever its date. A
+// procedure that answers each notification with a request whose own
+// notification is due at once (midiOutLongMsg from MM_MOM_DONE, an empty
+// WAVEHDR written from MM_WOM_DONE) then takes one step per delivery point,
+// instead of looping inside one delivery while its dates, and virtual time,
+// barely move (not at all with ADMIPS=0, or once the 1 s cap on the
+// instructions no clock read has charged yet is reached).
+uint64_t notify_at(const Sound16& s, uint64_t t, bool by_procedure) {
+  return by_procedure ? std::max(t, s.deliver_t + 1) : t;
 }
 
 void post_cb(Sound16& s, uint64_t at, uint16_t hwnd, uint16_t msg, uint16_t wp, uint32_t lp) {
@@ -153,11 +241,12 @@ void post_cb(Sound16& s, uint64_t at, uint16_t hwnd, uint16_t msg, uint16_t wp, 
   s.pending.push_back(cb);
 }
 
-// A waveOut device's MM_WOM_* in the form it asked for at open.
-void wave_notify(Sound16& s, uint16_t h, const WaveOut16& w, uint16_t msg, uint32_t p1, uint64_t at) {
-  switch (w.cb_type) {
+// A device's MM_WOM_* / MM_MOM_* in the form it asked for at open.
+void device_notify(Sound16& s, uint16_t h, uint32_t cb_type, uint32_t callback, uint32_t instance, uint16_t ds,
+                   uint16_t msg, uint32_t p1, uint64_t at) {
+  switch (cb_type) {
     case kCallbackWindow:
-      post_cb(s, at, uint16_t(w.callback), msg, h, p1);
+      post_cb(s, at, uint16_t(callback), msg, h, p1);
       break;
     case kCallbackTask:  // PostAppMessage: the task's queue, no window
       post_cb(s, at, 0, msg, h, p1);
@@ -167,18 +256,24 @@ void wave_notify(Sound16& s, uint16_t h, const WaveOut16& w, uint16_t msg, uint3
       cb.at = at;
       cb.seq = ++s.seq;
       cb.call = true;
-      cb.proc = w.callback;
+      cb.proc = callback;
       cb.handle = h;
       cb.msg = msg;
-      cb.instance = w.instance;
+      cb.instance = instance;
       cb.p1 = p1;
-      cb.ds = w.ds;
+      cb.ds = ds;
       s.pending.push_back(cb);
       break;
     }
     default:
       break;
   }
+}
+void wave_notify(Sound16& s, uint16_t h, const WaveOut16& w, uint16_t msg, uint32_t p1, uint64_t at) {
+  device_notify(s, h, w.cb_type, w.callback, w.instance, w.ds, msg, p1, at);
+}
+void midi_notify(Sound16& s, uint16_t h, const MidiOut16& m, uint16_t msg, uint32_t p1, uint64_t at) {
+  device_notify(s, h, m.cb_type, m.callback, m.instance, m.ds, msg, p1, at);
 }
 
 // Ends a play's pending notify: SUCCESSFUL, SUPERSEDED or ABORTED.
@@ -206,11 +301,13 @@ void apply_event(Runtime16& rt, Sound16& s, const audio::Event& ev) {
       for (auto& [h, w] : s.wave) {
         if (w.stream != ev.id) continue;
         uint32_t hdr = uint32_t(ev.cookie);
-        auto it = std::find(w.queue.begin(), w.queue.end(), hdr);
+        auto it = std::find_if(w.queue.begin(), w.queue.end(), [&](const auto& q) { return q.hdr == hdr; });
         if (it == w.queue.end()) break;
+        // Written by a procedure of the delivery running now (notify_at).
+        const bool fresh = s.delivering && it->delivery == s.deliveries;
         w.queue.erase(it);
         mark_done(rt, hdr);
-        wave_notify(s, h, w, kMmWomDone, hdr, ev.at);
+        wave_notify(s, h, w, kMmWomDone, hdr, notify_at(s, ev.at, fresh));
         break;
       }
       break;
@@ -272,41 +369,141 @@ struct Delivering {
   Sound16& s_;
 };
 
-// Delivers everything due by now, in (time, issue) order: messages posted to
-// the guest's queue, CALLBACK_FUNCTION procedures called. Never re-entered.
+// A procedure called for an event due at `due` (cb_time).
+struct InCallback {
+  InCallback(Runtime16& rt, Sound16& s, uint64_t due)
+      : s_(s), was_(s.in_callback), due_(s.cb_due), start_(s.cb_start) {
+    s.in_callback = true;
+    s.cb_due = due;
+    s.cb_start = rt.peek_us();
+  }
+  ~InCallback() {
+    s_.in_callback = was_;
+    s_.cb_due = due_;
+    s_.cb_start = start_;
+  }
+  Sound16& s_;
+  bool was_;
+  uint64_t due_, start_;
+};
+
+// A periodic timer event whose periods fell behind by more than
+// kTimerMaxLagUs (a streamed run's host held up, frames not stepped) drops the
+// oldest: at most that much of them — and at least the latest — is caught up
+// at once, on the event's own grid.
+void bound_lag(Sound16& s, uint16_t id, Timer16& tm, uint64_t t) {
+  if (!tm.periodic || tm.due > t) return;
+  uint64_t due_now = (t - tm.due) / tm.period + 1;
+  uint64_t keep = std::max<uint64_t>(1, kTimerMaxLagUs / tm.period);
+  if (due_now <= keep) return;
+  uint64_t skip = due_now - keep;
+  tm.due += skip * tm.period;
+  s.timer_dropped += skip;
+  trace("sound", "timer %u: %llu missed period(s) dropped, %llu caught up at %llu us", id, (unsigned long long)skip,
+        (unsigned long long)keep, (unsigned long long)t);
+}
+
+// Delivers everything due by now, in (time, issue) order: the engine's events
+// applied (WAVEHDRs done, notifies queued) as their times come, messages
+// posted to the guest's queue, CALLBACK_FUNCTION procedures and one timer
+// callback per period called, each dated at its due time (cb_time). The engine
+// is taken no further than the events it has due, so what a late procedure
+// sends keeps its date (the lane's step end renders no further than the next
+// due point either: Runtime16::audio_due). What the procedures cause waits for
+// a later delivery point (notify_at), and a timer event they set is dated no
+// more than kTimerMaxLagUs back, so every delivery ends. Never re-entered.
 void deliver(Runtime16& rt, Sound16& s) {
-  if (!s.on || s.delivering) return;
+  if (s.delivering) return;
   Delivering scope(s);
-  uint64_t t = rt.peek_us();
-  sync(rt, s, t);
+  const uint64_t t = rt.peek_us();
+  s.deliveries++;
+  s.deliver_t = t;
+  for (auto& [id, tm] : s.timers) bound_lag(s, id, tm, t);
   for (;;) {
-    auto best = s.pending.end();
+    uint64_t eng = engine_due(s);
+    auto cb = s.pending.end();
     for (auto it = s.pending.begin(); it != s.pending.end(); ++it) {
       if (it->at > t) continue;
-      if (best == s.pending.end() || it->at < best->at || (it->at == best->at && it->seq < best->seq)) best = it;
+      if (cb == s.pending.end() || it->at < cb->at || (it->at == cb->at && it->seq < cb->seq)) cb = it;
     }
-    if (best == s.pending.end()) break;
-    Callback16 cb = *best;
-    s.pending.erase(best);
-    if (!cb.call) {
-      user16_post_host(rt, cb.hwnd, cb.msg, cb.wparam, cb.lparam);
-      trace("sound", "msg %04X (%04X, %08X) posted to %04X at %llu us (due %llu)", cb.msg, cb.wparam, cb.lparam, cb.hwnd,
-            (unsigned long long)t, (unsigned long long)cb.at);
+    auto tm = s.timers.end();
+    for (auto it = s.timers.begin(); it != s.timers.end(); ++it) {
+      const Timer16& x = it->second;
+      if (x.due > t) continue;
+      if (tm == s.timers.end() || x.due < tm->second.due || (x.due == tm->second.due && x.seq < tm->second.seq)) tm = it;
+    }
+    const uint64_t cb_at = cb == s.pending.end() ? UINT64_MAX : cb->at;
+    const uint64_t tm_at = tm == s.timers.end() ? UINT64_MAX : tm->second.due;
+    if (eng <= t && eng <= cb_at && eng <= tm_at) {
+      sync(rt, s, eng);  // may queue callbacks at its time
       continue;
     }
-    trace("sound", "callback %04X:%04X(%04X, msg %04X, %08X, %08X) at %llu us (due %llu)", cb.proc >> 16,
-          cb.proc & 0xFFFF, cb.handle, cb.msg, cb.instance, cb.p1, (unsigned long long)t, (unsigned long long)cb.at);
+    if (cb_at == UINT64_MAX && tm_at == UINT64_MAX) break;
+    if (cb_at < tm_at || (cb_at == tm_at && cb->seq < tm->second.seq)) {
+      Callback16 c = *cb;
+      s.pending.erase(cb);
+      if (!c.call) {
+        user16_post_host(rt, c.hwnd, c.msg, c.wparam, c.lparam);
+        trace("sound", "msg %04X (%04X, %08X) posted to %04X at %llu us (due %llu)", c.msg, c.wparam, c.lparam, c.hwnd,
+              (unsigned long long)t, (unsigned long long)c.at);
+        continue;
+      }
+      trace("sound", "callback %04X:%04X(%04X, msg %04X, %08X, %08X) at %llu us (due %llu)", c.proc >> 16,
+            c.proc & 0xFFFF, c.handle, c.msg, c.instance, c.p1, (unsigned long long)t, (unsigned long long)c.at);
+      Regs16In in;
+      if (c.ds) in.ds = c.ds;
+      InCallback mark(rt, s, c.at);
+      rt.call_far(c.proc, {w16(c.handle), w16(c.msg), l16(c.instance), l16(c.p1), l16(c.p2)}, &in);
+      continue;
+    }
+    // One period of a timer event: TimeProc(wID, wMsg 0, dwUser, 0, 0), FAR
+    // PASCAL (MEMMIDI's MIDITIMERPROC pops 16 bytes, 1:1380). The event is
+    // rescheduled first, so the procedure may kill or set events itself.
+    const uint16_t id = tm->first;
+    const Timer16 ev = tm->second;
+    if (ev.periodic) {
+      tm->second.due += ev.period;
+      tm->second.seq = ++s.seq;
+    } else {
+      s.timers.erase(tm);
+    }
+    if (!rt.ldt().in_use(uint16_t(ev.proc >> 16))) {
+      // Its code was freed with the event still set (Windows would have
+      // faulted at interrupt time): the event goes, the guest goes on.
+      log("win16: MMSYSTEM: timer %u's procedure %04X:%04X is gone; the event is killed", id, ev.proc >> 16,
+          ev.proc & 0xFFFF);
+      s.timers.erase(id);
+      continue;
+    }
+    s.timer_calls++;
+    if (tracing("timer16")) {
+      trace("timer16", "timer %u: %04X:%04X(%04X, 0, %08X) due %llu us, at %llu us", id, ev.proc >> 16,
+            ev.proc & 0xFFFF, id, ev.user, (unsigned long long)ev.due, (unsigned long long)t);
+    }
     Regs16In in;
-    if (cb.ds) in.ds = cb.ds;
-    rt.call_far(cb.proc, {w16(cb.handle), w16(cb.msg), l16(cb.instance), l16(cb.p1), l16(cb.p2)}, &in);
+    if (ev.ds) in.ds = ev.ds;
+    InCallback mark(rt, s, ev.due);
+    const uint64_t i0 = rt.instructions();
+    rt.call_far(ev.proc, {w16(id), w16(0), l16(ev.user), l16(0), l16(0)}, &in);
+    s.timer_insns += rt.instructions() - i0;
   }
   update_due(rt, s);
 }
 
+// The runtime's delivery hook, once: an enabled engine, or the first timer event.
+void ensure_hook(Runtime16& rt, Sound16& s) {
+  if (s.hooked) return;
+  s.hooked = true;
+  rt.set_audio_hook([&rt] { deliver(rt, snd(rt)); });
+  rt.set_audio_due(UINT64_MAX);
+}
+
 // One audio shim with an enabled engine: the engine's events up to its time
-// first (so WAVEHDRs and notifies are current), the next due time after.
+// (cb_time, unless the shim dates itself) first, so WAVEHDRs and notifies are
+// current; the next due time after.
 struct Op {
-  Op(Runtime16& rt, Sound16& s) : rt_(rt), s_(s), t(rt.peek_us()), e(*s.engine) { sync(rt_, s_, t); }
+  Op(Runtime16& rt, Sound16& s) : Op(rt, s, cb_time(rt, s)) {}
+  Op(Runtime16& rt, Sound16& s, uint64_t at) : rt_(rt), s_(s), t(at), e(*s.engine) { sync(rt_, s_, t); }
   ~Op() { update_due(rt_, s_); }
   Runtime16& rt_;
   Sound16& s_;
@@ -475,13 +672,19 @@ WaveOut16* wave_of(Sound16& s, uint16_t h) {
   return it == s.wave.end() ? nullptr : &it->second;
 }
 
-uint16_t new_wave_handle(Sound16& s) {
+uint16_t new_device_handle(Sound16& s) {
   // Multiples of 4 above the real-window range (0xC000–0xDFFC): no selector,
   // GDI object, icon or window has one.
   for (uint16_t h = 0xE000; h < 0xFFFC; h += 4) {
-    if (!s.wave.count(h)) return h;
+    if (!s.wave.count(h) && !s.midi.count(h)) return h;
   }
   return 0;
+}
+
+MidiOut16* midi_of(Sound16& s, uint16_t h) {
+  if (!s.on) return nullptr;
+  auto it = s.midi.find(h);
+  return it == s.midi.end() ? nullptr : &it->second;
 }
 
 void write_caps_name(uint8_t* p, const char* name) { memcpy(p, name, strlen(name) + 1); }
@@ -699,11 +902,18 @@ uint32_t mci_set(MciCall& m, Mci16& d) {
   return 0;
 }
 
-uint32_t mci_command(Runtime16& rt, Sound16& s, const std::string& text, uint16_t callback, std::string* ret) {
+// A command string at `t`, which mciSendString makes peek_us() even when a
+// procedure sends it, not its dated time (cb_time): MCI was no interrupt-time
+// API on Win16 (a procedure could not call it), and peek_us() is never behind
+// a time the engine has already taken, so a song starts at the command's own
+// time and a `play … to` stop, and the notify at it, are reckoned from when
+// the song really starts.
+uint32_t mci_command(Runtime16& rt, Sound16& s, uint64_t t, const std::string& text, uint16_t callback,
+                     std::string* ret) {
   std::vector<std::string> w;
   if (!mci_words(text, &w)) return kMciNoClosingQuote;
   if (w.empty()) return kMciMissingCommandString;
-  MciCall m{rt, s, *s.engine, rt.peek_us(), callback};
+  MciCall m{rt, s, *s.engine, t, callback};
   std::string verb = lower(w[0]);
   uint32_t err = 0;
   if (verb == "open") {
@@ -785,7 +995,7 @@ void register_enabled_only(Runtime16& rt) {
     op.e.close_stream(w->stream, op.t);
     WaveOut16 closed = *w;
     s.wave.erase(h);
-    wave_notify(s, h, closed, kMmWomClose, 0, op.t);
+    wave_notify(s, h, closed, kMmWomClose, 0, notify_at(s, op.t, s.in_callback));
     trace("sound", "waveOutClose(%04X) at %llu us", h, (unsigned long long)op.t);
     c.ret(kMmOk);
   });
@@ -836,7 +1046,7 @@ void register_enabled_only(Runtime16& rt) {
       bytes.resize(bytes.size() - bytes.size() % std::max<size_t>(w->pcm.block_align, 1));
     }
     c.rt.wr32(hdr + kHdrFlags, (f | kWhdrInQueue) & ~kWhdrDone);
-    w->queue.push_back(hdr);
+    w->queue.push_back({hdr, s.in_callback ? s.deliveries : 0});
     op.e.stream_write(w->stream, bytes, hdr, op.t);
     c.ret(kMmOk);
   });
@@ -893,12 +1103,166 @@ void register_enabled_only(Runtime16& rt) {
     c.rt.wr32(p + 2, uint32_t(v));
     c.ret(kMmOk);
   });
-  // MIDI output is the engine's sequencer's alone (§8.3): no open devices.
-  for (const char* n : {"midiOutOpen", "midiOutClose", "midiOutPrepareHeader", "midiOutUnprepareHeader",
-                        "midiOutShortMsg", "midiOutLongMsg", "midiOutReset", "midiOutCachePatches",
-                        "midiOutCacheDrumPatches", "midiOutGetID", "midiOutMessage"}) {
-    r.impl(M, n, [](Call16& c) { c.ret(kMmNotSupported); });
+}
+
+// ---- midiOut: the MIDI device's raw port (§8.3), for a guest that sequences itself ------------------------
+//
+// SWSE opens it (midiOutOpen(MIDI_MAPPER, CALLBACK_NULL)) and MEMMIDI plays
+// the song through it from a 4 ms timer event (timeSetEvent, system16.cc).
+// Without an enabled engine there is no MIDI device (midiOutGetNumDevs 0):
+// midiOutOpen fails honestly — MMSYSERR_NODRIVER for the mapper, BADDEVICEID
+// for a device — with *lphMidiOut zeroed, never a success that leaves it
+// unwritten, and every handle is invalid.
+void register_midi_out(Runtime16& rt) {
+  Shim16Registry& r = rt.shims();
+  // midiOutOpen(lphMidiOut, uDeviceID, dwCallback, dwInstance, dwFlags).
+  r.impl(M, "midiOutOpen", [](Call16& c) {
+    uint32_t phmo = c.ptr();
+    uint16_t dev = c.w();
+    uint32_t callback = c.l(), instance = c.l(), flags = c.l();
+    Sound16& s = snd(c.rt);
+    if (phmo) c.rt.wr16(phmo, 0);  // a bad pointer faults, as MMSYSTEM's write would have
+    if (!s.on) {
+      trace("sound", "midiOutOpen(%04X): no MIDI device", dev);
+      return c.ret(dev == kMapper ? kMmNoDriver : kMmBadDeviceId);
+    }
+    Op op(c.rt, s);
+    if (dev != 0 && dev != kMapper) return c.ret(kMmBadDeviceId);
+    uint32_t cb = flags & kCallbackMask;
+    if (cb != 0 && cb != kCallbackWindow && cb != kCallbackTask && cb != kCallbackFunction) return c.ret(kMmInvalFlag);
+    if (!phmo || (cb == kCallbackWindow && !user16_window_exists(c.rt, uint16_t(callback))) ||
+        (cb == kCallbackFunction && !callback)) {
+      return c.ret(kMmInvalParam);
+    }
+    // A Win16 MIDI output device (the mapper too) had one client at a time.
+    if (!s.midi.empty()) return c.ret(kMmAllocated);
+    uint16_t h = new_device_handle(s);
+    if (!h) return c.ret(kMmNoMem);
+    MidiOut16 m;
+    m.device = dev;
+    m.cb_type = cb;
+    m.callback = callback;
+    m.instance = instance;
+    if (cb == kCallbackFunction) {
+      Module16* mod = c.rt.modules().containing(uint16_t(callback >> 16));
+      m.ds = mod && mod->dgroup ? mod->dgroup : caller_ds(c);
+    }
+    s.midi[h] = m;
+    c.rt.wr16(phmo, h);
+    midi_notify(s, h, m, kMmMomOpen, 0, notify_at(s, op.t, s.in_callback));
+    trace("sound", "midiOutOpen(%04X, flags %08X) = %04X at %llu us", dev, flags, h, (unsigned long long)op.t);
+    c.ret(kMmOk);
+  });
+  r.impl(M, "midiOutClose", [](Call16& c) {
+    uint16_t h = c.w();
+    Sound16& s = snd(c.rt);
+    if (!midi_of(s, h)) return c.ret(kMmInvalHandle);
+    Op op(c.rt, s);
+    // Long messages are done when midiOutLongMsg returns: none can be pending
+    // (MIDIERR_STILLPLAYING), and closing sends nothing to the synth.
+    MidiOut16 closed = s.midi.at(h);
+    s.midi.erase(h);
+    midi_notify(s, h, closed, kMmMomClose, 0, notify_at(s, op.t, s.in_callback));
+    trace("sound", "midiOutClose(%04X) at %llu us", h, (unsigned long long)op.t);
+    c.ret(kMmOk);
+  });
+  r.impl(M, "midiOutPrepareHeader", [](Call16& c) {
+    uint16_t h = c.w();
+    uint32_t hdr = c.ptr();
+    uint16_t size = c.w();
+    Sound16& s = snd(c.rt);
+    if (!midi_of(s, h)) return c.ret(kMmInvalHandle);
+    if (!hdr || size < kMidiHdrSize || !c.rt.rd32(hdr + kMidiHdrData)) return c.ret(kMmInvalParam);
+    c.rt.wr32(hdr + kMidiHdrFlags, c.rt.rd32(hdr + kMidiHdrFlags) | kMhdrPrepared);
+    c.ret(kMmOk);
+  });
+  r.impl(M, "midiOutUnprepareHeader", [](Call16& c) {
+    uint16_t h = c.w();
+    uint32_t hdr = c.ptr();
+    uint16_t size = c.w();
+    Sound16& s = snd(c.rt);
+    if (!midi_of(s, h)) return c.ret(kMmInvalHandle);
+    if (!hdr || size < kMidiHdrSize) return c.ret(kMmInvalParam);
+    uint32_t f = c.rt.rd32(hdr + kMidiHdrFlags);
+    if (f & kMhdrInQueue) return c.ret(kMidiStillPlaying);
+    c.rt.wr32(hdr + kMidiHdrFlags, f & ~kMhdrPrepared);
+    c.ret(kMmOk);
+  });
+  // midiOutShortMsg(hMidiOut, dwMsg): MEMMIDI's timer procedure sends every song event through it.
+  r.impl(M, "midiOutShortMsg", [](Call16& c) {
+    uint16_t h = c.w();
+    uint32_t msg = c.l();
+    Sound16& s = snd(c.rt);
+    if (!midi_of(s, h)) return c.ret(kMmInvalHandle);
+    Op op(c.rt, s);
+    op.e.midi_short(msg, op.t);
+    if (tracing("midi16")) trace("midi16", "midiOutShortMsg(%04X, %08X) at %llu us", h, msg, (unsigned long long)op.t);
+    c.ret(kMmOk);
+  });
+  // midiOutLongMsg(hMidiOut, lpMidiOutHdr, uSize): the synth takes the buffer
+  // at once (copied at the call), so MHDR_DONE is set when the call returns
+  // and MM_MOM_DONE goes out at the next delivery point — from inside a
+  // procedure, a later one than the delivery running it (notify_at).
+  r.impl(M, "midiOutLongMsg", [](Call16& c) {
+    uint16_t h = c.w();
+    uint32_t hdr = c.ptr();
+    uint16_t size = c.w();
+    Sound16& s = snd(c.rt);
+    MidiOut16* m = midi_of(s, h);
+    if (!m) return c.ret(kMmInvalHandle);
+    Op op(c.rt, s);
+    if (!hdr || size < kMidiHdrSize) return c.ret(kMmInvalParam);
+    uint32_t f = c.rt.rd32(hdr + kMidiHdrFlags);
+    if (!(f & kMhdrPrepared)) return c.ret(kMidiUnprepared);
+    if (f & kMhdrInQueue) return c.ret(kMidiStillPlaying);
+    uint32_t data = c.rt.rd32(hdr + kMidiHdrData), len = c.rt.rd32(hdr + kMidiHdrLength);
+    if (len) c.rt.linear(data, len);  // a buffer past its segment faults, as MMSYSTEM's read would have
+    std::vector<uint8_t> bytes(len);
+    if (len) c.rt.read_bytes(data, bytes.data(), len);
+    op.e.midi_long(bytes, op.t);
+    c.rt.wr32(hdr + kMidiHdrFlags, (f | kMhdrDone) & ~kMhdrInQueue);
+    midi_notify(s, h, *m, kMmMomDone, hdr, notify_at(s, op.t, s.in_callback));
+    trace("sound", "midiOutLongMsg(%04X, %u bytes) at %llu us", h, len, (unsigned long long)op.t);
+    c.ret(kMmOk);
+  });
+  // midiOutReset: the engine turns off every note left on (and sustain), MEMMIDI's
+  // note-offs having gone before (SWSE ENDSONG 1:67de).
+  r.impl(M, "midiOutReset", [](Call16& c) {
+    uint16_t h = c.w();
+    Sound16& s = snd(c.rt);
+    if (!midi_of(s, h)) return c.ret(kMmInvalHandle);
+    Op op(c.rt, s);
+    op.e.midi_reset(op.t);
+    trace("sound", "midiOutReset(%04X) at %llu us", h, (unsigned long long)op.t);
+    c.ret(kMmOk);
+  });
+  // Patch caching: the device reports no MIDICAPS_CACHE (midiOutGetDevCaps), so
+  // MEMMIDI never asks (1:01bf); asked anyway, MMSYSERR_NOTSUPPORTED, the answer
+  // of every device without it (MODM_CACHEPATCHES: "must return
+  // MMSYSERR_NOTSUPPORTED" unless an internal synth caches; the mapper, Wine's
+  // midimap too, passes no cache support on).
+  for (const char* n : {"midiOutCachePatches", "midiOutCacheDrumPatches"}) {
+    r.impl(M, n, [](Call16& c) {
+      uint16_t h = c.w();
+      if (!midi_of(snd(c.rt), h)) return c.ret(kMmInvalHandle);
+      c.ret(kMmNotSupported);
+    });
   }
+  // midiOutGetID(hMidiOut, lpuDeviceID): the id it was opened with (MIDI_MAPPER stays -1).
+  r.impl(M, "midiOutGetID", [](Call16& c) {
+    uint16_t h = c.w();
+    uint32_t p = c.ptr();
+    MidiOut16* m = midi_of(snd(c.rt), h);
+    if (!m) return c.ret(kMmInvalHandle);
+    if (!p) return c.ret(kMmInvalParam);
+    c.rt.wr16(p, m->device);
+    c.ret(kMmOk);
+  });
+  r.impl(M, "midiOutMessage", [](Call16& c) {
+    uint16_t h = c.w();
+    if (!midi_of(snd(c.rt), h)) return c.ret32(kMmInvalHandle);
+    c.ret32(kMmNotSupported);
+  });
 }
 
 }  // namespace
@@ -933,8 +1297,7 @@ void attach_audio16(Runtime16& rt, audio::Engine* engine) {
   // this again" has it true already, and then they write nothing: so no
   // SYSTEM.INI lands in a persistent state directory on every song.
   profiles16(rt).add_seed(rt.options().windows_dir + "\\SYSTEM.INI", "mciseq.drv", "disablewarning", "true");
-  rt.set_audio_hook([&rt] { deliver(rt, snd(rt)); });
-  rt.set_audio_due(UINT64_MAX);
+  ensure_hook(rt, s);
   trace("sound", "MMSYSTEM: the host audio engine is on (volume %d)", engine->config().volume);
 }
 
@@ -942,13 +1305,16 @@ bool audio16_enabled(Runtime16& rt) { return snd(rt).on; }
 
 void audio16_pump(Runtime16& rt) {
   Sound16& s = snd(rt);
-  if (!s.on) return;
+  if (!s.hooked) return;  // sound off and no timer event ever set: nothing can be due
   if (rt.peek_us() >= rt.audio_due()) deliver(rt, s);
-  user16_dispatch_host(rt);
+  if (s.on) user16_dispatch_host(rt);
 }
 
 void audio16_close(Runtime16& rt) {
   Sound16& s = snd(rt);
+  s.timers.clear();
+  s.midi.clear();
+  if (s.hooked) rt.set_audio_due(UINT64_MAX);
   if (!s.on) return;
   uint64_t t = rt.peek_us();
   audio::Engine& e = *s.engine;
@@ -963,10 +1329,57 @@ void audio16_close(Runtime16& rt) {
   rt.set_audio_due(UINT64_MAX);
 }
 
+// ---- multimedia timer events -----------------------------------------------------------------------------
+
+uint16_t timer16_set(Runtime16& rt, uint16_t delay_ms, uint32_t proc, uint32_t user, bool periodic, uint16_t ds) {
+  Sound16& s = snd(rt);
+  if (!delay_ms || !proc || s.timers.size() >= kMaxTimers) return 0;
+  uint16_t id;
+  do {
+    id = uint16_t(++s.timers_created);
+  } while (!id || s.timers.count(id));
+  Timer16 tm;
+  tm.proc = proc;
+  tm.user = user;
+  tm.ds = ds;
+  tm.periodic = periodic;
+  tm.period = uint64_t(delay_ms) * 1000;
+  // Set from a procedure: from its due time, so a one-shot event set again
+  // each time keeps its schedule — but, as a periodic event's periods are, no
+  // more than kTimerMaxLagUs behind (a chain after a long stall).
+  const uint64_t now = rt.peek_us();
+  uint64_t t = cb_time(rt, s);
+  if (now - t > kTimerMaxLagUs) t = now - kTimerMaxLagUs;
+  tm.due = t + tm.period;
+  tm.seq = ++s.seq;
+  s.timers[id] = tm;
+  ensure_hook(rt, s);
+  update_due(rt, s);
+  trace("sound", "timeSetEvent(%u ms, %04X:%04X, %08X, %s) = %u at %llu us", delay_ms, proc >> 16, proc & 0xFFFF, user,
+        periodic ? "TIME_PERIODIC" : "TIME_ONESHOT", id, (unsigned long long)t);
+  return id;
+}
+
+bool timer16_kill(Runtime16& rt, uint16_t id) {
+  Sound16& s = snd(rt);
+  auto it = s.timers.find(id);
+  if (it == s.timers.end()) return false;
+  s.timers.erase(it);
+  update_due(rt, s);
+  trace("sound", "timeKillEvent(%u) at %llu us", id, (unsigned long long)rt.peek_us());
+  return true;
+}
+
+Timer16Stats timer16_stats(Runtime16& rt) {
+  Sound16& s = snd(rt);
+  return Timer16Stats{s.timers.size(), s.timer_calls, s.timer_dropped, s.timer_insns};
+}
+
 // ---- MMSYSTEM --------------------------------------------------------------------------------------------
 
 void register_sound16(Runtime16& rt) {
   Shim16Registry& r = rt.shims();
+  register_midi_out(rt);
 
   // sndPlaySound(lpszSound, wFlags).
   r.impl(M, "sndPlaySound", [](Call16& c) {
@@ -1042,7 +1455,7 @@ void register_sound16(Runtime16& rt) {
         (cb == kCallbackFunction && !callback)) {
       return c.ret(kMmInvalParam);
     }
-    uint16_t h = new_wave_handle(s);
+    uint16_t h = new_device_handle(s);
     if (!h) return c.ret(kMmNoMem);
     WaveOut16 w;
     w.src = f;
@@ -1059,7 +1472,7 @@ void register_sound16(Runtime16& rt) {
     }
     s.wave[h] = w;
     c.rt.wr16(phwo, h);
-    wave_notify(s, h, w, kMmWomOpen, 0, op.t);
+    wave_notify(s, h, w, kMmWomOpen, 0, notify_at(s, op.t, s.in_callback));
     c.ret(kMmOk);
   });
   r.impl(M, "waveOutGetVolume", [](Call16& c) {
@@ -1188,9 +1601,9 @@ void register_sound16(Runtime16& rt) {
       trace("sound", "mciSendString(\"%s\") refused: no MCI devices", cmd.c_str());
       return c.ret32(kMciDeviceNotInstalled);
     }
-    Op op(c.rt, s);
+    Op op(c.rt, s, c.rt.peek_us());  // not cb_time: mci_command
     std::string ret;
-    uint32_t err = mci_command(c.rt, s, cmd, callback, &ret);
+    uint32_t err = mci_command(c.rt, s, op.t, cmd, callback, &ret);
     if (!err && ret.size() >= ret_len && ret_fp && ret_len) err = kMciParamOverflow;
     if (ret_fp && ret_len) c.rt.write_str(ret_fp, err && err != kMciParamOverflow ? "" : ret, ret_len);
     if (err == kMciUnrecognizedCommand || err == kMciUnsupportedFunction) {

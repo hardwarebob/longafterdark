@@ -95,18 +95,24 @@ RECT frame_screen_rect(const RECT& window, const RectI& fit);
 
 std::string key_line(int vk, bool down);
 std::string caps_line(bool on);
+// The Num Lock toggle (INTERACTION.md §3.2), numbered like CAPS; only for a
+// host whose --capabilities says numlock=1 (dialog_support.h:
+// HostCapabilities::takes_numlock_lines).
+std::string numlock_line(bool on);
 std::string mouse_line(int x, int y, uint32_t buttons);
 
 // ---- AD_SCR_TEST_INPUT -----------------------------------------------------------
 // Synthetic input for the smoke tests, fed through the same handlers as real
-// messages (real input is ignored while a script runs), with a synthetic Caps
-// Lock toggle so a test never touches the real one. One command per line;
-// '#' starts a comment:
+// messages (real input is ignored while a script runs), with synthetic Caps
+// Lock and Num Lock toggles (both off at the start) so a test never touches
+// the real ones. One command per line; '#' starts a comment:
 //   WAIT <ms>              pause
 //   FRAMES <n>             wait until the owner window has shown n more frames
-//   KEY <vk> <0|1>         WM_KEYDOWN / WM_KEYUP (KEY 20 1 flips the synthetic Caps Lock)
+//   KEY <vk> <0|1>         WM_KEYDOWN / WM_KEYUP (KEY 20 1 flips the synthetic Caps Lock,
+//                          KEY 144 1 the synthetic Num Lock, as Windows flips a toggle on the down)
 //   SYSKEY <vk> <0|1>      WM_SYSKEYDOWN / WM_SYSKEYUP
-//   CAPSSTATE <0|1>        set the synthetic toggle without a key
+//   CAPSSTATE <0|1>        set the synthetic Caps Lock without a key
+//   NUMLOCKSTATE <0|1>     set the synthetic Num Lock without a key (the saver notices within 250 ms)
 //   BUTTON <1|2|4> <0|1>   left / right / middle button down / up
 //   WHEEL                  WM_MOUSEWHEEL
 //   MOVE <dx> <dy>         move the synthetic cursor by (dx, dy) physical px
@@ -116,8 +122,8 @@ std::string mouse_line(int x, int y, uint32_t buttons);
 //   STATUSLOG              log the owner's status record
 //   LOG <text>             a marker line in the saver's log
 struct TestStep {
-  enum class Op { wait, frames, key, syskey, caps_state, button, wheel, move, deactivate, display_change, clip_log,
-                  status_log, log };
+  enum class Op { wait, frames, key, syskey, caps_state, numlock_state, button, wheel, move, deactivate, display_change,
+                  clip_log, status_log, log };
   Op op = Op::wait;
   int a = 0, b = 0;
   std::string text;

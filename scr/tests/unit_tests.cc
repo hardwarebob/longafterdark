@@ -9,6 +9,7 @@
 #include <phosg/JSON.hh>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -481,6 +482,7 @@ void test_catalog() {
     CHECK_EQ(r->controls[1].clamp(7), 1);
     CHECK_EQ(r->controls[2].clamp(9), 2);
     CHECK(r->control(2) == &r->controls[2] && r->control(9) == nullptr);
+    CHECK_EQ(r->abi, std::string("afterdark"));   // no "abi": After Dark's
   }
   const Module* s = c.find("test.stripes");
   CHECK(s && s->controls.size() == 2 && s->controls[1].type == ControlType::unknown &&
@@ -549,6 +551,100 @@ void test_catalog() {
   // Display name falls back to the id; control default is clamped.
   CHECK(parse_catalog(R"({"modules":[{"id":"x","path":"p","controls":[{"index":0,"type":"slider","min":10,"max":20,"default":99}]}]})", c, &err));
   CHECK(c.modules.size() == 1 && c.modules[0].display_name == "x" && c.modules[0].controls[0].def == 20);
+  // The module ABI (PACKAGES.md §6): "abi" only when it is not After Dark's
+  // (adimport writes it last); absent, empty or not a string is "afterdark".
+  CHECK(parse_catalog(R"({"modules":[{"id":"a","path":"A.IMX","lane":"ne16","abi":"intermission"},
+      {"id":"b","path":"B.AD","lane":"ne16"},{"id":"c","path":"C.AD","abi":""},{"id":"d","path":"D.AD","abi":7},
+      {"id":"e","path":"E.AD","lane":"pe32","abi":"someday"}]})", c, &err));
+  CHECK(c.modules.size() == 5);
+  if (c.modules.size() == 5) {
+    CHECK(c.modules[0].abi == "intermission" && c.modules[0].lane == "ne16");
+    CHECK(c.modules[1].abi == kAfterDarkAbi && c.modules[2].abi == kAfterDarkAbi && c.modules[3].abi == kAfterDarkAbi);
+    CHECK_EQ(c.modules[4].abi, std::string("someday"));   // kept as written: a host decides whether it runs it
+  }
+  // A module's own screen (PACKAGES.md §6): "screen": "WxH" for a module shown
+  // at a fixed size (Star Trek: The Screen Saver's, "640x480"). Absent, not a string, not "<w>x<h>" with 1 to 5 decimal
+  // digits either side, an axis outside 1..8192 or more than 4096x4096
+  // pixels (no frame the saver reads back, frame_parser.h) is none: {0, 0},
+  // and the ABI decides. Five digits hold every size allowed ("00640x0480"
+  // is 640x480); an axis of six or more is none whatever its value
+  // ("000640x480"), so no axis can overflow an int: 2^32 + 640 would wrap
+  // to 640 ("4294967936x480", and 2^32 + 480 for the height).
+  CHECK(parse_catalog(R"({"modules":[{"id":"a","path":"A.AD","lane":"ne16","screen":"640x480"},
+      {"id":"b","path":"B.AD"},{"id":"c","path":"C.AD","screen":""},{"id":"d","path":"D.AD","screen":640},
+      {"id":"e","path":"E.AD","screen":"800X600"},{"id":"f","path":"F.AD","screen":"8192x2048"},
+      {"id":"g","path":"G.AD","screen":"4096x4097"},{"id":"h","path":"H.AD","screen":"8193x100"},
+      {"id":"i","path":"I.AD","screen":"0x480"},{"id":"j","path":"J.AD","screen":"640x480 "},
+      {"id":"k","path":"K.AD","screen":"640*480"},{"id":"l","path":"L.AD","screen":"-640x480"},
+      {"id":"m","path":"M.AD","screen":"x480"},{"id":"n","path":"N.AD","screen":"640x"},
+      {"id":"o","path":"O.AD","screen":"1x1"},{"id":"p","path":"P.AD","screen":"00640x0480"},
+      {"id":"q","path":"Q.AD","screen":"123456x480"},{"id":"r","path":"R.IMX","lane":"ne16","abi":"intermission","screen":"800x600"},
+      {"id":"s","path":"S.AD","screen":"640x480x2"},{"id":"t","path":"T.IMX","lane":"ne16","abi":"intermission"},
+      {"id":"u","path":"U.AD","screen":"4294967936x480"},{"id":"v","path":"V.AD","screen":"640x4294967776"},
+      {"id":"w","path":"W.AD","screen":"000640x480"},{"id":"x","path":"X.AD","screen":"640x000480"}]})",
+                      c, &err));
+  CHECK_EQ(c.modules.size(), (size_t)24);
+  if (c.modules.size() == 24) {
+    const std::map<std::string, SizeI> want = {
+        {"a", {640, 480}}, {"b", {}},  {"c", {}},  {"d", {}},  {"e", {800, 600}}, {"f", {8192, 2048}}, {"g", {}},
+        {"h", {}},         {"i", {}},  {"j", {}},  {"k", {}},  {"l", {}},         {"m", {}},           {"n", {}},
+        {"o", {1, 1}},     {"p", {640, 480}},     {"q", {}},  {"r", {800, 600}}, {"s", {}},           {"t", {}},
+        {"u", {}},         {"v", {}},  {"w", {}},  {"x", {}}};
+    for (const Module& m : c.modules) {
+      if (!want.count(m.id) || m.screen == want.at(m.id)) continue;
+      fprintf(stderr, "catalog: \"screen\" of %s reads %dx%d\n", m.id.c_str(), m.screen.w, m.screen.h);
+      CHECK(false);
+    }
+    CHECK(c.modules[0].abi == kAfterDarkAbi);   // a screen of its own changes nothing else about it
+    // Its own screen: the catalog's word first, then the ABI's (Intermission's 640x480).
+    CHECK((own_screen(c.modules[0].abi, c.modules[0].screen) == SizeI{640, 480}));
+    CHECK((own_screen(c.modules[1].abi, c.modules[1].screen) == SizeI{}));
+    CHECK((own_screen(c.modules[17].abi, c.modules[17].screen) == SizeI{800, 600}));
+    CHECK((own_screen(c.modules[19].abi, c.modules[19].screen) == SizeI{640, 480}));
+  }
+  // The six-release fixture: Star Wars Screen Entertainment's 14 Intermission
+  // modules (lane ne16, abi intermission), each with one Configure... button,
+  // beside the five After Dark releases' entries.
+  CHECK(parse_catalog(fixture("catalog-six.json"), c, &err));
+  CHECK_EQ(c.modules.size(), (size_t)32);
+  size_t imx = 0;
+  for (const Module& m : c.modules) {
+    if (m.package != "swse") {
+      CHECK(m.abi == kAfterDarkAbi);
+      continue;
+    }
+    ++imx;
+    CHECK(m.abi == "intermission" && m.lane == "ne16" && m.about.empty() && m.credits.empty());
+    CHECK(m.path.rfind("packages/swse/SAVER/", 0) == 0 && m.id.rfind("swse.", 0) == 0);
+    CHECK(m.controls.size() == 1 && m.controls[0].index == 0 && m.controls[0].name == "Configure..." &&
+          m.controls[0].type == ControlType::button && !m.controls[0].settable());
+    CHECK(m.name == m.module_name && !m.name.empty());
+  }
+  CHECK_EQ(imx, (size_t)14);
+  const Module* vader = c.find("swse.vader");
+  CHECK(vader && vader->name == "Darth Vader" && vader->package_title == "Star Wars Screen Entertainment");
+  for (const Module& m : c.modules) CHECK((m.screen == SizeI{}));   // no "screen" anywhere: the ABI decides
+  // The seven-release fixture: Star Trek: The Screen Saver's modules (After
+  // Dark 2.0b: lane ne16, After Dark's ABI) each with "screen": "640x480",
+  // after the six releases' entries (registry order).
+  CHECK(parse_catalog(fixture("catalog-seven.json"), c, &err));
+  CHECK_EQ(c.modules.size(), (size_t)36);
+  size_t trek = 0;
+  for (const Module& m : c.modules) {
+    if (m.package != "startrek") {
+      CHECK((m.screen == SizeI{}));
+      continue;
+    }
+    ++trek;
+    CHECK((m.screen == SizeI{640, 480}) && m.abi == kAfterDarkAbi && m.lane == "ne16");
+    CHECK(m.path.rfind("packages/startrek/AFTERDRK/", 0) == 0 && m.id.rfind("startrek.", 0) == 0);
+    CHECK(m.name == m.module_name && m.package_title == "Star Trek: The Screen Saver");
+  }
+  CHECK_EQ(trek, (size_t)4);
+  CHECK(c.modules.size() == 36 && c.modules[32].id == "startrek.comms");
+  const Module* comms = c.find("startrek.comms");
+  CHECK(comms && comms->controls.size() == 1 && comms->controls[0].type == ControlType::button &&
+        comms->controls[0].index == 3);
 
   CHECK(resolve_module_path(L"C:\\a\\win", "FILES/AD40/X.AD") == L"C:\\a\\win\\FILES\\AD40\\X.AD");
   CHECK(resolve_module_path(L"C:\\a\\win\\", "/FILES/X.AD") == L"C:\\a\\win\\FILES\\X.AD");
@@ -573,6 +669,9 @@ void test_catalog() {
   for (size_t i = 0; i < std::min(real.modules.size(), mods.size()); ++i) {
     const Module& m = real.modules[i];
     CHECK(m.lane == "pe32" || m.lane == "ne16");
+    // After Dark's module ABI, or Intermission's (Star Wars Screen
+    // Entertainment's IMX modules, on the 16-bit lane).
+    CHECK(m.abi == kAfterDarkAbi || (m.abi == "intermission" && m.lane == "ne16"));
     CHECK(!m.display_name.empty() && !m.path.empty());
     const auto& ctls = mods[i]->at("controls").as_list();
     CHECK_EQ(m.controls.size(), ctls.size());
@@ -619,6 +718,173 @@ void test_geometry() {
   CHECK((fit_rect(640, 480, 640, 480) == RectI{0, 0, 640, 480}));
   CHECK((fit_rect(640, 480, 1080, 1920) == RectI{0, 555, 1080, 810}));
   CHECK((fit_rect(0, 480, 100, 100) == RectI{0, 0, 100, 100}));
+
+  // A module's emulated screen (module_screen), the one rule every host
+  // started for it goes by: an After Dark module's is the Resolution setting
+  // widened to the display, exactly emulated_screen_size's; an Intermission
+  // module's is its own 640x480 on every display at every setting.
+  for (double a : {4.0 / 3.0, 1920.0 / 1080.0, 2560.0 / 1600.0, 3440.0 / 1440.0, 5120.0 / 1440.0, 1080.0 / 1920.0,
+                   1280.0 / 1024.0, 0.0}) {
+    for (double sc : {1.0, 1.5, 2.0, 0.0}) {
+      const ModuleScreen ad = module_screen(kAfterDarkAbi, a, sc), imx = module_screen(kIntermissionAbi, a, sc);
+      CHECK(ad.emu == emulated_screen_size(a, sc) && !ad.fixed);
+      CHECK((imx.emu == SizeI{640, 480}) && imx.fixed);
+      // Only "intermission" has a size of its own: another ABI's modules follow the display.
+      CHECK(module_screen("", a, sc) == ad && module_screen("someday", a, sc) == ad);
+      // A catalog "screen" (own_screen) gives any module one: Star Trek: The
+      // Screen Saver's After Dark 2.0b modules get their 640x480 exactly as
+      // an Intermission module gets its own by its ABI, and any other size is
+      // kept as given. Without one, the rule is the ABI's, as before.
+      const ModuleScreen trek = module_screen(own_screen(kAfterDarkAbi, {640, 480}), a, sc);
+      CHECK(trek == imx);
+      const ModuleScreen other = module_screen(own_screen(kAfterDarkAbi, {1024, 640}), a, sc);
+      CHECK((other.emu == SizeI{1024, 640}) && other.fixed);
+      CHECK(module_screen(own_screen(kIntermissionAbi, {1024, 640}), a, sc) == other);   // the catalog's word first
+      CHECK(module_screen(own_screen(kAfterDarkAbi), a, sc) == ad && module_screen(SizeI{}, a, sc) == ad);
+      CHECK(module_screen(own_screen(kIntermissionAbi), a, sc) == imx);
+    }
+  }
+  // own_screen alone: the catalog's size when it has both axes, else the ABI's.
+  CHECK((own_screen(kAfterDarkAbi) == SizeI{}) && (own_screen(kIntermissionAbi) == SizeI{640, 480}));
+  CHECK((own_screen("someday") == SizeI{}) && (own_screen("") == SizeI{}));
+  CHECK((own_screen(kAfterDarkAbi, {640, 480}) == SizeI{640, 480}));
+  CHECK((own_screen(kAfterDarkAbi, {0, 480}) == SizeI{}) && (own_screen(kIntermissionAbi, {640, 0}) == SizeI{640, 480}));
+  // The user's case: the 720-line setting on a 1920x1080 monitor. An After
+  // Dark module gets 1280x720; an Intermission module 640x480, whose 4:3
+  // frame the letterbox scales to the monitor's full height, side bars only
+  // (at 1280x720 its 640x480 scene sat in the middle, bars all round).
+  CHECK((module_screen(kAfterDarkAbi, 1920.0 / 1080.0, 1.5).emu == SizeI{1280, 720}));
+  const ModuleScreen imx = module_screen(kIntermissionAbi, 1920.0 / 1080.0, 1.5);
+  CHECK((fit_rect(imx.emu.w, imx.emu.h, 1920, 1080) == RectI{240, 0, 1440, 1080}));
+  CHECK((fit_rect(imx.emu.w, imx.emu.h, 1024, 768) == RectI{0, 0, 1024, 768}));    // a 4:3 monitor: no bars
+  CHECK((fit_rect(imx.emu.w, imx.emu.h, 2560, 1080) == RectI{560, 0, 1440, 1080}));
+  // Their desktop seeds: the whole monitor shrunk to an After Dark screen, as
+  // before; the part an Intermission module's frame covers, so the desktop
+  // shows where it was.
+  CHECK((seed_source(module_screen(kAfterDarkAbi, 1920.0 / 1080.0, 1.0), 1920, 1080) == RectI{0, 0, 1920, 1080}));
+  CHECK((seed_source(module_screen(kAfterDarkAbi, 1280.0 / 1024.0, 1.0), 1280, 1024) == RectI{0, 0, 1280, 1024}));
+  CHECK((seed_source(imx, 1920, 1080) == RectI{240, 0, 1440, 1080}));
+  CHECK((seed_source(imx, 1280, 1024) == RectI{0, 32, 1280, 960}));
+  CHECK((seed_source(imx, 640, 480) == RectI{0, 0, 640, 480}));
+  CHECK((seed_source(imx, 1080, 1920) == RectI{0, 555, 1080, 810}));
+  // A Star Trek module at the 720-line setting on a 16:9 monitor: its
+  // 640x480 at the monitor's full height, bars at the sides only (at
+  // 1280x720 The Mission's scene sat at the top left beside a grey band, and
+  // Final Exam's small in the middle), seeded from that part of the monitor.
+  const ModuleScreen trek = module_screen(own_screen(kAfterDarkAbi, {640, 480}), 1920.0 / 1080.0, 1.5);
+  CHECK((trek.emu == SizeI{640, 480}) && trek.fixed);
+  CHECK((fit_rect(trek.emu.w, trek.emu.h, 1920, 1080) == RectI{240, 0, 1440, 1080}));
+  CHECK((seed_source(trek, 1920, 1080) == RectI{240, 0, 1440, 1080}));
+  // A 16:10 screen of its own on the same monitor: its full height too.
+  const ModuleScreen wide = module_screen(SizeI{1024, 640}, 1920.0 / 1080.0, 1.5);
+  CHECK((fit_rect(wide.emu.w, wide.emu.h, 1920, 1080) == RectI{96, 0, 1728, 1080}));
+  CHECK((seed_source(wide, 1920, 1080) == RectI{96, 0, 1728, 1080}));
+
+  // A window's desktop seeds (plan_seed_shots): a picture for each screen its
+  // first host may be given, After Dark's first, whatever order the screens
+  // come in and however often; one the same as an earlier picture shares its
+  // file (`same`, that picture's index).
+  {
+    using Plan = std::vector<SeedShotPlan>;
+    auto screen_for = [](const char* abi, int w, int h, double scale) {
+      return module_screen(abi, (double)w / h, scale);
+    };
+    // 16:9 at 720 lines, a window that may start with either kind: two
+    // pictures, the whole monitor at 1280x720 and the frame's part at 640x480.
+    const ModuleScreen ad_169 = screen_for(kAfterDarkAbi, 1920, 1080, 1.5);
+    Plan p = plan_seed_shots({imx, ad_169, imx}, 1920, 1080);
+    CHECK((p == Plan{{ad_169, {0, 0, 1920, 1080}, -1}, {imx, {240, 0, 1440, 1080}, -1}}));
+    CHECK((ad_169.emu == SizeI{1280, 720}));
+    // 4:3 at 480 lines: both pictures are the whole monitor at 640x480, so
+    // the Intermission one is the After Dark one's file.
+    const ModuleScreen ad_43 = screen_for(kAfterDarkAbi, 1024, 768, 1.0);
+    p = plan_seed_shots({imx, ad_43}, 1024, 768);
+    CHECK((p == Plan{{ad_43, {0, 0, 1024, 768}, -1}, {imx, {0, 0, 1024, 768}, 0}}));
+    CHECK((ad_43.emu == SizeI{640, 480}) && !ad_43.fixed);
+    // ...but at 720 lines the same part is two sizes: two files.
+    const ModuleScreen ad_43_720 = screen_for(kAfterDarkAbi, 1024, 768, 1.5);
+    p = plan_seed_shots({ad_43_720, imx}, 1024, 768);
+    CHECK((p == Plan{{ad_43_720, {0, 0, 1024, 768}, -1}, {imx, {0, 0, 1024, 768}, -1}}));
+    // An Intermission module alone (Module=<its id>, or Star Wars Screen
+    // Entertainment the only release imported): the frame's part only, no
+    // picture of the whole monitor.
+    p = plan_seed_shots({imx}, 1920, 1080);
+    CHECK((p == Plan{{imx, {240, 0, 1440, 1080}, -1}}));
+    // After Dark modules alone: the whole monitor, as before.
+    p = plan_seed_shots({ad_169, ad_169}, 1920, 1080);
+    CHECK((p == Plan{{ad_169, {0, 0, 1920, 1080}, -1}}));
+    // 5:4 and portrait: the same 640x480 either kind, but the frame covers
+    // the full width only (bars above and below), so two pictures.
+    const ModuleScreen ad_54 = screen_for(kAfterDarkAbi, 1280, 1024, 1.0);
+    p = plan_seed_shots({imx, ad_54}, 1280, 1024);
+    CHECK((p == Plan{{ad_54, {0, 0, 1280, 1024}, -1}, {imx, {0, 32, 1280, 960}, -1}}));
+    CHECK((ad_54.emu == SizeI{640, 480}));
+    const ModuleScreen ad_portrait = screen_for(kAfterDarkAbi, 1080, 1920, 1.0);
+    p = plan_seed_shots({imx, ad_portrait}, 1080, 1920);
+    CHECK((p == Plan{{ad_portrait, {0, 0, 1080, 1920}, -1}, {imx, {0, 555, 1080, 810}, -1}}));
+    CHECK((ad_portrait.emu == SizeI{640, 480}));
+    CHECK(plan_seed_shots({}, 1920, 1080).empty());
+    // A Star Trek module (its catalog's 640x480) and an Intermission module
+    // (its ABI's) have one screen: one picture of the frame's part, beside
+    // After Dark's whole monitor, whichever of them a window may start with.
+    CHECK(trek == imx);
+    p = plan_seed_shots({trek, ad_169}, 1920, 1080);
+    CHECK((p == Plan{{ad_169, {0, 0, 1920, 1080}, -1}, {trek, {240, 0, 1440, 1080}, -1}}));
+    p = plan_seed_shots({trek, imx}, 1920, 1080);
+    CHECK((p == Plan{{trek, {240, 0, 1440, 1080}, -1}}));
+    // On a 4:3 monitor at 480 lines it is After Dark's own picture's file.
+    const ModuleScreen trek_43 = module_screen(own_screen(kAfterDarkAbi, {640, 480}), 1024.0 / 768.0, 1.0);
+    p = plan_seed_shots({trek_43, ad_43}, 1024, 768);
+    CHECK((p == Plan{{ad_43, {0, 0, 1024, 768}, -1}, {trek_43, {0, 0, 1024, 768}, 0}}));
+    // A screen of another size of its own is a picture of its own, after
+    // After Dark's and 640x480, whatever order the screens came in.
+    const Plan three{{ad_169, {0, 0, 1920, 1080}, -1}, {trek, {240, 0, 1440, 1080}, -1}, {wide, {96, 0, 1728, 1080}, -1}};
+    size_t left = 99;
+    p = plan_seed_shots({trek, wide, ad_169}, 1920, 1080, &left);
+    CHECK(p == three && left == 0);
+    CHECK(plan_seed_shots({wide, ad_169, trek}, 1920, 1080) == three);
+    // However many screens of their own come (a catalog may give every
+    // module one, each up to 4096x4096, a P6 of 48 MB), three pictures at
+    // most: the one that follows the display, 640x480 (even beside smaller
+    // ones), then the smallest of the others (the fewest bytes); `left_out`
+    // counts the rest, whose first hosts start on black. In any order, and
+    // each screen however often.
+    const ModuleScreen qvga = module_screen(SizeI{320, 240}, 1920.0 / 1080.0, 1.5),
+                       q400 = module_screen(SizeI{400, 300}, 1920.0 / 1080.0, 1.5);
+    const Plan most{{ad_169, {0, 0, 1920, 1080}, -1}, {trek, {240, 0, 1440, 1080}, -1}, {qvga, {240, 0, 1440, 1080}, -1}};
+    std::vector<ModuleScreen> many;
+    for (int i = 0; i < 64; ++i) many.push_back(module_screen(SizeI{4096, 4096 - 8 * i}, 1920.0 / 1080.0, 1.5));
+    many.insert(many.begin() + 20, {wide, ad_169, trek, wide});
+    p = plan_seed_shots(many, 1920, 1080, &left);
+    CHECK(p == three && left == 64);
+    many.insert(many.begin() + 40, {q400, qvga, q400});
+    p = plan_seed_shots(many, 1920, 1080, &left);
+    CHECK(p == most && left == 66);
+    std::reverse(many.begin(), many.end());
+    CHECK(plan_seed_shots(many, 1920, 1080, &left) == most && left == 66);
+    std::shuffle(many.begin(), many.end(), std::mt19937(7));
+    CHECK(plan_seed_shots(many, 1920, 1080, &left) == most && left == 66);
+    // Without 640x480 the two smallest (of one size, the narrower first);
+    // without one that follows the display, those two alone.
+    const ModuleScreen svga = module_screen(SizeI{800, 600}, 1920.0 / 1080.0, 1.5),
+                       tall = module_screen(SizeI{600, 800}, 1920.0 / 1080.0, 1.5);
+    many.erase(std::remove_if(many.begin(), many.end(),
+                              [&](const ModuleScreen& ms) { return ms == trek || ms == wide || ms == qvga || ms == q400; }),
+               many.end());
+    many.push_back(svga);
+    many.push_back(tall);
+    p = plan_seed_shots(many, 1920, 1080, &left);
+    CHECK(p.size() == 3 && left == 64);
+    if (p.size() == 3) CHECK(p[0].screen == ad_169 && p[1].screen == tall && p[2].screen == svga);
+    many.erase(std::remove(many.begin(), many.end(), ad_169), many.end());
+    p = plan_seed_shots(many, 1920, 1080, &left);
+    CHECK(p.size() == 2 && left == 64);
+    if (p.size() == 2) CHECK(p[0].screen == tall && p[1].screen == svga && p[0].same < 0 && p[1].same < 0);
+    // One that follows the display at most, the first given (a window has one).
+    p = plan_seed_shots({ad_169, ad_43, trek}, 1920, 1080, &left);
+    CHECK(p.size() == 2 && left == 1);
+    if (p.size() == 2) CHECK(p[0].screen == ad_169 && p[1].screen == trek);
+  }
 }
 
 // ---- monitor topology changes (plan_relayout) ---------------------------------------
@@ -678,6 +944,63 @@ void test_layout() {
   p = plan_relayout(two, {});
   CHECK(p.retired == 2 && p.reuse.empty() && (p.retire == Bools{true, true}));
   CHECK(plan_relayout({}, {}).unchanged());
+
+  // A window whose host runs an Intermission module (its own 640x480,
+  // `fixed`: module_screen) keeps that host wherever it goes: a new aspect
+  // moves it, where an After Dark module's host is replaced (above).
+  auto imx_slot = [&](int x, int y, int w, int h) {
+    ScreenSlot s = slot(x, y, w, h);
+    const ModuleScreen ms = module_screen(kIntermissionAbi, (double)w / h, 1.5);
+    s.emu = ms.emu;
+    s.fixed = ms.fixed;
+    return s;
+  };
+  p = plan_relayout({imx_slot(0, 0, 1920, 1080)}, {slot(0, 0, 1920, 1200)});
+  CHECK(p.moved == 1 && p.created == 0 && p.retired == 0 && (p.reuse == Ints{0}));
+  p = plan_relayout({imx_slot(0, 0, 1920, 1080)}, {slot(0, 0, 1080, 1920)});   // turned portrait
+  CHECK(p.moved == 1 && p.created == 0 && p.retired == 0);
+  p = plan_relayout({imx_slot(0, 0, 1920, 1080)}, {slot(0, 0, 1920, 1080)});   // nothing changed
+  CHECK(p.kept == 1 && p.unchanged());
+  // A window of the slot's size is matched before one that fits anywhere, so
+  // neither host restarts: the 16:9 slot takes the After Dark window, the 5:4
+  // one the Intermission window (taken in order, the fixed window, first,
+  // would have left the After Dark one without a slot of its size).
+  p = plan_relayout({imx_slot(0, 0, 1920, 1080), slot(1920, 0, 1920, 1080)},
+                    {slot(3840, 0, 1920, 1080), slot(0, 0, 1280, 1024)});
+  CHECK(p.moved == 2 && p.created == 0 && p.retired == 0 && (p.reuse == Ints{1, 0}));
+  // ...and an After Dark window of the right size is kept or moved as before
+  // beside one that fits anywhere.
+  p = plan_relayout({slot(0, 0, 1280, 1024), imx_slot(1280, 0, 1920, 1080)},
+                    {slot(0, 0, 1280, 1024), slot(1280, 0, 2560, 1080)});
+  CHECK(p.kept == 1 && p.moved == 1 && p.created == 0 && (p.reuse == Ints{0, 1}));
+  // Roles still come first: its host never stands in for a black window.
+  p = plan_relayout({imx_slot(0, 0, 1920, 1080)}, {slot(0, 0, 1920, 1080, false)});
+  CHECK(p.created == 1 && p.retired == 1);
+  // A window whose host runs a module with a screen of its own from its
+  // catalog (a Star Trek module's "screen": "640x480", SaverWindow::slot)
+  // is kept the same way: moved wherever the monitors go, never restarted,
+  // and matched after the windows of a monitor's own size.
+  auto trek_slot = [&](int x, int y, int w, int h) {
+    ScreenSlot s = slot(x, y, w, h);
+    const ModuleScreen ms = module_screen(own_screen(kAfterDarkAbi, {640, 480}), (double)w / h, 1.5);
+    s.emu = ms.emu;
+    s.fixed = ms.fixed;
+    return s;
+  };
+  CHECK(trek_slot(0, 0, 1920, 1080).fixed && (trek_slot(0, 0, 1920, 1080).emu == SizeI{640, 480}));
+  p = plan_relayout({trek_slot(0, 0, 1920, 1080)}, {slot(0, 0, 1920, 1200)});
+  CHECK(p.moved == 1 && p.created == 0 && p.retired == 0 && (p.reuse == Ints{0}));
+  p = plan_relayout({trek_slot(0, 0, 1920, 1080)}, {slot(0, 0, 1080, 1920)});   // turned portrait
+  CHECK(p.moved == 1 && p.created == 0 && p.retired == 0);
+  p = plan_relayout({trek_slot(0, 0, 1920, 1080)}, {slot(0, 0, 1920, 1080)});
+  CHECK(p.kept == 1 && p.unchanged());
+  p = plan_relayout({trek_slot(0, 0, 1920, 1080), slot(1920, 0, 1920, 1080)},
+                    {slot(3840, 0, 1920, 1080), slot(0, 0, 1280, 1024)});
+  CHECK(p.moved == 2 && p.created == 0 && p.retired == 0 && (p.reuse == Ints{1, 0}));
+  // Beside an Intermission module's window, the two are alike: either takes either slot.
+  p = plan_relayout({trek_slot(0, 0, 1920, 1080), imx_slot(1920, 0, 1920, 1080)},
+                    {slot(0, 0, 1280, 1024), slot(1280, 0, 1024, 768)});
+  CHECK(p.moved == 2 && p.created == 0 && p.retired == 0 && (p.reuse == Ints{0, 1}));
 }
 
 // ---- rotation ----------------------------------------------------------------------
@@ -721,6 +1044,53 @@ void test_rotation() {
   CHECK(after.count("z") == 0 && after["a"] == 50 && after["b"] == 50);
   Rotation lead_only({}, 3, "z");
   CHECK(!lead_only.empty() && lead_only.current() == "z" && lead_only.next() == "z");
+
+  // A rotation switching between an After Dark module and one with a screen
+  // of its own (an Intermission module's by its ABI, a Star Trek module's by
+  // its catalog "screen") on a 16:9 monitor at 720 lines, host by host as
+  // the saver does it (SaverWindow::spawn: each switch is a new host with its
+  // module's screen, module_screen over own_screen; SaverWindow::slot: the
+  // window's slot is its host's): the sizes alternate, 1280x720 and the
+  // module's own 640x480. A monitor change of aspect meanwhile keeps the
+  // host of the one with its own screen (its window moves) and replaces the
+  // After Dark one, and the host after the move gets its module's size on
+  // the new monitor.
+  for (const char* own : {R"("abi":"intermission")", R"("screen":"640x480")"}) {
+    Catalog c;
+    CHECK(parse_catalog(std::string(R"({"modules":[{"id":"ad","path":"A.AD","lane":"pe32"},
+                                       {"id":"imx","path":"B.IMX","lane":"ne16",)") + own + "}]}",
+                        c, nullptr));
+    Rotation mixed({"ad", "imx"}, 11);
+    std::map<std::string, int> hosts;
+    std::string last;
+    for (int i = 0; i < 8; ++i) {
+      const std::string id = i == 0 ? mixed.current() : mixed.next();
+      const Module* m = c.find(id);
+      CHECK(m != nullptr);
+      if (!m) break;
+      CHECK(id != last);   // two modules: every switch changes the module, and the size with it
+      last = id;
+      ++hosts[id];
+      const ModuleScreen ms = module_screen(own_screen(m->abi, m->screen), 1920.0 / 1080.0, 1.5);
+      if (id == "imx") CHECK((ms.emu == SizeI{640, 480}) && ms.fixed);
+      else CHECK((ms.emu == SizeI{1280, 720}) && !ms.fixed);
+      ScreenSlot now, next;
+      now.rc = {0, 0, 1920, 1080};
+      now.runs_host = true;
+      now.emu = ms.emu;
+      now.fixed = ms.fixed;
+      next.rc = {0, 0, 1280, 1024};
+      next.runs_host = true;
+      next.emu = emulated_screen_size(1280.0 / 1024.0, 1.5);   // the new slot: its monitor's size
+      const RelayoutPlan p = plan_relayout({now}, {next});
+      if (ms.fixed) CHECK(p.moved == 1 && p.created == 0 && p.retired == 0);
+      else CHECK(p.created == 1 && p.retired == 1);
+      const ModuleScreen after = module_screen(own_screen(m->abi, m->screen), 1280.0 / 1024.0, 1.5);
+      if (ms.fixed) CHECK(after == ms);
+      else CHECK((after.emu == SizeI{960, 720}) && !after.fixed);
+    }
+    CHECK(hosts["ad"] == 4 && hosts["imx"] == 4);
+  }
 }
 
 // ---- frame conversion ----------------------------------------------------------------
@@ -782,6 +1152,30 @@ void test_env() {
   CHECK_EQ(hits, 1);
   CHECK(m.count(L"AdScrUnitAdd") && m[L"AdScrUnitAdd"] == L"1");
   CHECK(!m[L"PATH"].empty() || !m[L"Path"].empty());   // the rest of our environment is inherited
+
+  // ADNUMLOCK (INTERACTION.md §3.2; dialog_support.h numlock_env): the Num
+  // Lock toggle a host starts with, for a host that keeps one (numlock=1), or
+  // one that hasn't answered yet (the saver's first hosts start before the
+  // answer unless the rotation waits for it, App::caps_gate, and a host
+  // without the toggle ignores the variable); a host that answered without
+  // numlock=1 gets none, and nothing inherited reaches it.
+  const HostCapabilities none_yet, keeps = parse_capabilities("lanes=pe32,ne16 numlock=1"),
+                                   lacks = parse_capabilities("lanes=pe32,ne16 abis=afterdark,intermission");
+  CHECK(numlock_env(none_yet, true) == (std::pair<std::wstring, std::wstring>{L"ADNUMLOCK", L"1"}));
+  CHECK(numlock_env(keeps, false) == (std::pair<std::wstring, std::wstring>{L"ADNUMLOCK", L"0"}));
+  CHECK(numlock_env(keeps, true) == (std::pair<std::wstring, std::wstring>{L"ADNUMLOCK", L"1"}));
+  CHECK(numlock_env(lacks, true) == (std::pair<std::wstring, std::wstring>{L"ADNUMLOCK", L""}));
+  SetEnvironmentVariableW(L"ADNUMLOCK", L"1");   // hostile: inherited from whoever started the saver
+  auto numlock_in = [&](const HostCapabilities& caps, bool on) {
+    auto block = parse_block(build_environment_block({numlock_env(caps, on)}));
+    for (auto& [k, v] : block) {
+      if (CompareStringOrdinal(k.c_str(), -1, L"ADNUMLOCK", -1, TRUE) == CSTR_EQUAL) return v;
+    }
+    return std::wstring(L"(none)");
+  };
+  CHECK(numlock_in(keeps, false) == L"0" && numlock_in(none_yet, false) == L"0");
+  CHECK(numlock_in(lacks, false) == L"(none)" && numlock_in(lacks, true) == L"(none)");
+  SetEnvironmentVariableW(L"ADNUMLOCK", nullptr);
 
   CHECK(quote_arg(L"plain") == L"plain");
   CHECK(quote_arg(L"a b") == L"\"a b\"");
@@ -1140,11 +1534,14 @@ void test_ui() {
   }
 
   // Status text: no closing full stop (the releases' own line is checked in
-  // the releases suite).
-  CHECK(assets_summary({}) == L"After Dark isn\u2019t imported yet");
+  // the releases suite). Not every release is After Dark's: the words fit all seven.
+  CHECK(assets_summary({}) == L"Nothing imported yet");
   // The not-imported welcome: what importing does.
-  CHECK(welcome_text().find(L"The screen saver runs the original After Dark modules from your own discs.\n\n"
-                            L"Import them from any of your After Dark discs") == 0);
+  CHECK(welcome_text().find(L"The screen saver runs the original modules of After Dark and Star Wars Screen "
+                            L"Entertainment from your own discs.\n\n"
+                            L"Import them from any of your discs (seven releases are supported), a disc image, or the "
+                            L"Internet Archive download.") == 0);
+  CHECK(welcome_text().find(L"After Dark discs") == std::wstring::npos);
   Catalog c;
   CHECK(parse_catalog(fixture("catalog-win.json"), c, nullptr));
   AssetCounts a = count_assets(c, {true, true, true, true, false});
@@ -1196,6 +1593,115 @@ void test_ui() {
     CHECK(two.module_title.h == 44 && L96.module_title.h == 28);
     CHECK(two.module_badge.y >= two.module_title.bottom() && two.panel.y == L96.panel.y + 20);
     check_layout(two, kDesignClientW, kDesignClientH, true);
+  }
+
+  // The footer's credit (layout_footer_credit), measured in the real caption face,
+  // at 100-250%, at the first-open, the minimum and a large size, beside the
+  // assets line's texts (the welcome's starting where Import is): whenever it
+  // shows, its box lies in the footer clear of the assets line's text and of
+  // Preview by the footer's gap, as far from one as from the other, on the
+  // buttons' centre line, holding the phrase on one line (the lead, a space,
+  // the name) a link's padding in from its ends, over nothing else; when it
+  // doesn't show, there was no room for it.
+  {
+    HDC dc = CreateCompatibleDC(nullptr);
+    // The seven releases' line, "232 modules from 7 releases", has as many
+    // characters as the six's had ("216 modules from 6 releases"), but its
+    // digits are wider in the caption face, Segoe UI Variable Small (2-5 px
+    // at 100-250%; the same width in Segoe UI).
+    const wchar_t* texts[] = {L"Nothing imported yet", L"232 modules from 7 releases",
+                              L"84 modules from After Dark 4.0 Deluxe",
+                              L"232 modules from 7 releases · 2 missing — import again to restore"};
+    int shown = 0, hidden = 0, min_seven = 0;
+    std::string min_seven_at;   // the scales it fits the narrowest window at
+    for (int dpi = 96; dpi <= 240; dpi += 24) {
+      adw::ui::Theme t;
+      t.set_dpi(dpi);
+      auto width = [&](const std::wstring& s) { return (int)adw::ui::measure_text(dc, s, t.fonts.caption).cx; };
+      FooterCreditInput in;
+      in.lead_w = width(kFooterCreditLead);
+      in.space_w = width(L"a b") - width(L"ab");
+      in.name_w = width(kFooterCreditName);
+      in.line_h = (int)adw::ui::measure_text(dc, kFooterCreditName, t.fonts.caption).cy;
+      CHECK(in.lead_w > 0 && in.space_w > 0 && in.name_w > 0 && in.line_h > 0);
+      const int gap = dip(kCreditGapDip, dpi), pad = dip(kLinkPad, dpi);
+      const int box_w = pad + in.lead_w + in.space_w + in.name_w + pad;
+      struct Size {
+        int w, h, tiles;
+      };
+      for (const Size& sz : {Size{kDesignClientW, kDesignClientHStrip, 6}, Size{kMinClientW, kMinClientHStrip, 6},
+                             Size{kMinClientW, kMinClientH, 0}, Size{1600, 1000, 6}}) {
+        LayoutInput li{dip(sz.w, dpi), dip(sz.h, dpi), dpi, true};
+        li.strip_tiles = sz.tiles;
+        const WindowLayout L = layout_window(li);
+        for (const wchar_t* text : texts) {
+          const bool welcome_line = std::wstring(text) == L"Nothing imported yet";
+          // The assets line as the dialog sets it (place_assets_status):
+          // wrapped in its box, which starts where Import is in the welcome.
+          const int ax = welcome_line ? L.import.x : L.assets.x, aw = L.assets.right() - ax;
+          RECT m{0, 0, aw, 0};
+          HGDIOBJ old = SelectObject(dc, t.fonts.caption);
+          DrawTextW(dc, text, -1, &m, DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+          SelectObject(dc, old);
+          in.assets_right = ax + std::min<int>(aw, m.right - m.left);
+          const FooterCreditLayout C = layout_footer_credit(L, in);
+          const int room = L.preview_button.x - in.assets_right - 2 * gap;
+          if (!C.shown) {
+            ++hidden;
+            if (room >= box_w) fprintf(stderr, "credit @%d %dx%d \"%ls\": hidden with %d px of room for %d\n", dpi, sz.w,
+                                       sz.h, text, room, box_w);
+            CHECK(room < box_w);
+            continue;
+          }
+          ++shown;
+          CHECK(room >= box_w && C.box.w == box_w && C.box.h == dip(kCreditLinkHDip, dpi));
+          CHECK(L.footer.contains(C.box));
+          CHECK(C.box.x >= in.assets_right + gap && C.box.right() <= L.preview_button.x - gap);
+          CHECK(std::abs((C.box.x - in.assets_right) - (L.preview_button.x - C.box.right())) <= 1);
+          const int cy = L.preview_button.y + L.preview_button.h / 2;
+          CHECK(std::abs(C.box.y + C.box.h / 2 - cy) <= 1 && std::abs(C.lead.y + C.lead.h / 2 - cy) <= 1);
+          CHECK(C.lead.y == C.name.y && C.lead.h == in.line_h && C.name.h == in.line_h);
+          CHECK(C.lead.w == in.lead_w && C.name.w == in.name_w);
+          CHECK(C.lead.x == C.box.x + pad && C.name.x == C.lead.right() + in.space_w && C.name.right() + pad == C.box.right());
+          CHECK(C.box.y <= C.lead.y && C.lead.bottom() <= C.box.bottom());
+          for (const Rc& r : {L.import, L.preview_button, L.ok, L.cancel}) CHECK(!C.box.overlaps(r));
+          // The status line it sits beside is never under it.
+          CHECK(C.box.x > in.assets_right);
+        }
+        // Where it matters: with seven releases it shows at the first-open size
+        // (with room to spare) at every scale; one release's long title and
+        // the assets line at its longest (files missing) leave it no room in
+        // the minimum window. (In the minimum window beside "232 modules from
+        // 7 releases" it fits at some scales only: in Segoe UI Variable at 5
+        // of 7 on Windows 11, not at 150% or 200%, where it fit beside the
+        // six's line at all 7. So that case is only reported: whether it
+        // shows there depends on the face, and where it has no room it
+        // hides, as it should, never clipped.)
+        auto credit_for = [&](const wchar_t* text) {
+          RECT m{0, 0, L.assets.w, 0};
+          HGDIOBJ old = SelectObject(dc, t.fonts.caption);
+          DrawTextW(dc, text, -1, &m, DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+          SelectObject(dc, old);
+          FooterCreditInput i2 = in;
+          i2.assets_right = L.assets.x + std::min<int>(L.assets.w, m.right - m.left);
+          return layout_footer_credit(L, i2);
+        };
+        if (sz.w == kDesignClientW) CHECK(credit_for(L"232 modules from 7 releases").shown);
+        if (sz.w == kMinClientW) {
+          CHECK(!credit_for(texts[2]).shown && !credit_for(texts[3]).shown);
+          if (sz.h == kMinClientHStrip && credit_for(L"232 modules from 7 releases").shown) {
+            ++min_seven;
+            min_seven_at += (min_seven_at.empty() ? "" : ",") + std::to_string(dpi * 100 / 96) + "%";
+          }
+        }
+      }
+    }
+    printf("ui: the credit fits beside \"232 modules from 7 releases\" in the narrowest window at %d of 7 scales (%s)\n",
+           min_seven, min_seven_at.c_str());
+    CHECK(shown > 0 && hidden > 0);
+    DeleteDC(dc);
+    // Degenerate input: nothing measured, no credit.
+    CHECK(!layout_footer_credit(layout_window({kDesignClientW, kDesignClientH, 96, true}), FooterCreditInput{}).shown);
   }
 
   // The settings panel: rows top to bottom, then "Restore defaults".
@@ -1351,6 +1857,73 @@ void test_ui() {
     CHECK(!parse_capabilities("").known);
     CHECK(!parse_capabilities("adhostwin: cannot open --capabilities").known);   // an older host
     CHECK(!probe_capabilities(L"C:\\no\\such\\adhostwin.exe").known);
+    // The module ABIs it runs (PLAN: abis=). Without the key, a host from
+    // before them: After Dark's alone, so an Intermission module doesn't run.
+    CHECK((c.abis == std::vector<std::string>{"afterdark"}) && c.has_abi("afterdark") && !c.has_abi("intermission"));
+    CHECK(c.runs("pe32", "afterdark") && c.runs("ne16", "") && !c.runs("ne16", "intermission") && !c.runs("x", "afterdark"));
+    HostCapabilities imx =
+        parse_capabilities("lanes=pe32,ne16 configure=pe32,ne16 abis=afterdark,intermission status=1 state=1 seed=1 audio=1");
+    CHECK(imx.known && (imx.abis == std::vector<std::string>{"afterdark", "intermission"}));
+    CHECK(imx.runs("ne16", "intermission") && imx.runs("pe32", "afterdark") && !imx.runs("pe32x", "intermission"));
+    CHECK(!imx.runs("ne16", "someday"));
+    // Listed as it stands: "abis=" alone runs no module ABI at all.
+    HostCapabilities no_abi = parse_capabilities("lanes=pe32,ne16 abis=");
+    CHECK(no_abi.known && no_abi.abis.empty() && !no_abi.runs("pe32", "afterdark"));
+    // A host that didn't answer is taken to run everything (a module whose
+    // lane it lacks exits 3 there, and the dialog marks that one).
+    CHECK(HostCapabilities{}.runs("ne16", "intermission") && HostCapabilities{}.runs("anything", "someday"));
+    // Num Lock (INTERACTION.md §3.2): numlock=1, and only that, is a host
+    // that keeps the toggle. NUMLOCK lines go only to one that said so
+    // (another doesn't number them); ADNUMLOCK to every host but one that
+    // answered without it.
+    HostCapabilities nl = parse_capabilities(
+        "lanes=pe32,ne16 configure=pe32,ne16 abis=afterdark,intermission status=1 state=1 seed=1 audio=1 numlock=1");
+    CHECK(nl.known && nl.numlock && nl.takes_numlock_lines() && nl.takes_numlock_env());
+    CHECK(nl.runs("ne16", "intermission") && nl.status && nl.seed);   // the other keys as before
+    for (const char* line : {"lanes=pe32,ne16 status=1 state=1 seed=1 audio=1", "lanes=pe32 numlock=0",
+                             "lanes=pe32 numlock=", "lanes=pe32 numlock=yes", "lanes=pe32 NUMLOCK=1"}) {
+      HostCapabilities no = parse_capabilities(line);
+      CHECK(no.known && !no.numlock && !no.takes_numlock_lines() && !no.takes_numlock_env());
+    }
+    CHECK((parse_capabilities("numlock=1 lanes=pe32").numlock));   // wherever it is on the line
+    CHECK(!HostCapabilities{}.takes_numlock_lines() && HostCapabilities{}.takes_numlock_env());   // no answer (yet)
+    CHECK(!parse_capabilities("numlock=1").known);   // no lanes=: not an answer, whatever else it says
+  }
+  // What the dialog does with a module (module_run): it waits while the host
+  // is asked; "Coming soon" when the host doesn't list its lane or its ABI,
+  // or when a run of that very module exited 3 -- which never spreads to the
+  // other modules of its lane or ABI (an exit 3 used to turn every Classic
+  // module "Coming soon").
+  {
+    Catalog six;
+    CHECK(parse_catalog(fixture("catalog-six.json"), six, nullptr));
+    const Module* vader = six.find("swse.vader");
+    const Module* beta = six.find("classic.beta");
+    const Module* alpha = six.find("ad40.alpha");
+    CHECK(vader && beta && alpha);
+    if (vader && beta && alpha) {
+      const HostCapabilities old_host = parse_capabilities("lanes=pe32,ne16 configure=pe32,ne16 status=1 state=1 seed=1");
+      const HostCapabilities new_host =
+          parse_capabilities("lanes=pe32,ne16 configure=pe32,ne16 abis=afterdark,intermission status=1");
+      const HostCapabilities no_ne16 = parse_capabilities("lanes=pe32 configure=pe32 abis=afterdark,intermission");
+      const HostCapabilities silent;   // no answer
+      CHECK(module_run(*vader, old_host, true, false) == ModuleRun::waiting);
+      CHECK(module_run(*alpha, new_host, true, false) == ModuleRun::waiting);   // every lane waits for the answer
+      CHECK(module_run(*vader, old_host, false, false) == ModuleRun::coming_soon);
+      CHECK(module_run(*beta, old_host, false, false) == ModuleRun::runs);
+      CHECK(module_run(*vader, new_host, false, false) == ModuleRun::runs);
+      CHECK(module_run(*vader, no_ne16, false, false) == ModuleRun::coming_soon);
+      CHECK(module_run(*beta, no_ne16, false, false) == ModuleRun::coming_soon);
+      CHECK(module_run(*alpha, no_ne16, false, false) == ModuleRun::runs);
+      CHECK(module_run(*vader, silent, false, false) == ModuleRun::runs);
+      // An exit 3 marks that module, even on a host that lists everything...
+      CHECK(module_run(*vader, new_host, false, true) == ModuleRun::coming_soon);
+      CHECK(module_run(*vader, silent, true, true) == ModuleRun::coming_soon);
+      // ...and nothing else: the other Intermission and Classic modules run.
+      for (const Module& m : six.modules) {
+        if (&m != vader) CHECK(module_run(m, new_host, false, false) == ModuleRun::runs);
+      }
+    }
   }
   if (!g_fakehost.empty()) {
     SetEnvironmentVariableW(L"FAKEHOST_LOG", nullptr);
@@ -1362,6 +1935,55 @@ void test_ui() {
     c = probe_capabilities(g_fakehost);
     CHECK(c.known && c.has_lane("pe32") && c.has_lane("ne16") && !c.can_configure("pe32") && c.can_configure("ne16"));
     SetEnvironmentVariableW(L"FAKEHOST_CONFIGURE", nullptr);
+    // fakehost's abis=: today's host's by default, or left out (an older host).
+    CHECK(c.runs("ne16", "intermission") && c.line.find(" abis=afterdark,intermission ") != std::string::npos);
+    SetEnvironmentVariableW(L"FAKEHOST_ABIS", L"none");
+    c = probe_capabilities(g_fakehost);
+    CHECK(c.known && c.line.find("abis=") == std::string::npos && !c.runs("ne16", "intermission") && c.runs("ne16", ""));
+    SetEnvironmentVariableW(L"FAKEHOST_ABIS", L"afterdark");
+    c = probe_capabilities(g_fakehost);
+    CHECK(c.known && (c.abis == std::vector<std::string>{"afterdark"}) && !c.runs("ne16", "intermission"));
+    SetEnvironmentVariableW(L"FAKEHOST_ABIS", nullptr);
+    // fakehost's numlock=1: today's host's by default; FAKEHOST_NUMLOCK=0 a host from before it.
+    c = probe_capabilities(g_fakehost);
+    CHECK(c.known && c.numlock && c.takes_numlock_lines() && c.line.find(" numlock=1") != std::string::npos);
+    SetEnvironmentVariableW(L"FAKEHOST_NUMLOCK", L"0");
+    c = probe_capabilities(g_fakehost);
+    CHECK(c.known && !c.numlock && !c.takes_numlock_env() && c.line.find("numlock") == std::string::npos);
+    SetEnvironmentVariableW(L"FAKEHOST_NUMLOCK", nullptr);
+  }
+
+  // A group header in the module list (layout_group_header): the count and
+  // the "Coming soon" pill always show whole; the title gives way, ellipsized.
+  {
+    auto eight = [](const std::wstring& s) { return (int)s.size() * 8; };   // 8 px a character
+    CHECK(ellipsize(L"Short", 100, eight) == L"Short");
+    // The longest start that fits with its ellipsis ("Star Wars" and the ellipsis: 80 px).
+    CHECK(ellipsize(L"Star Wars Screen Entertainment", 80, eight) == std::wstring(L"Star Wars") + L'\u2026');
+    CHECK(ellipsize(L"Star Wars Screen Entertainment", 95, eight) == std::wstring(L"Star Wars") + L'\u2026');
+    CHECK(ellipsize(L"Star Wars Screen Entertainment", 104, eight) == std::wstring(L"Star Wars Sc") + L'\u2026');
+    CHECK(ellipsize(L"Star Wars", 48, eight) == L"Star\u2026");     // the space before the ellipsis goes
+    CHECK(ellipsize(L"Star Wars", 7, eight).empty());               // not even the ellipsis fits
+    CHECK(ellipsize(L"", 0, eight).empty());
+    GroupHeaderInput in;
+    in.title = L"Star Wars Screen Entertainment";   // 240 px
+    in.left = 48;
+    in.right = 330;
+    in.count_w = 16;
+    in.gap = 8;
+    GroupHeaderLayout L = layout_group_header(in, eight);
+    CHECK(!L.ellipsized && L.title == in.title && L.title_w == 240 && L.count_x == 48 + 240 + 8);
+    in.right = 300;   // 48 + 240 + 8 + 16 = 312: no longer fits
+    L = layout_group_header(in, eight);
+    CHECK(L.ellipsized && L.count_x + in.count_w <= in.right && L.count_x == in.left + L.title_w + in.gap);
+    CHECK(L.title.back() == L'\u2026' && L.title_w <= 300 - 48 - 8 - 16);
+    in.pill_w = 96;   // "Coming soon", at the right
+    in.pill_right = 320;
+    L = layout_group_header(in, eight);
+    CHECK(L.pill_x == 320 - 96 && L.count_x + in.count_w + in.gap <= L.pill_x && L.ellipsized);
+    in.title = L"Deluxe";
+    L = layout_group_header(in, eight);
+    CHECK(!L.ellipsized && L.title == L"Deluxe" && L.count_x == 48 + 48 + 8);
   }
 
   // A module button's outcome note (§6.3).
@@ -1908,7 +2530,8 @@ void test_releases_layout() {
     CHECK(strip_caption_size(80, eight_per_dip) == 10);
     CHECK(strip_caption_size(10, eight_per_dip) == 10);   // nothing fits: the smallest, ellipsized
     CHECK(strip_caption_room(96, 96) == 102 && strip_caption_room(120, 120) == 128);
-    const char* titles[] = {"Deluxe", "10th Anniversary", "After Dark 3.2", "Totally Twisted", "Simpsons"};
+    const char* titles[] = {"Deluxe",   "10th Anniversary", "After Dark 3.2", "Totally Twisted",
+                            "Simpsons", "Star Wars",        "Star Trek"};
     HDC dc = CreateCompatibleDC(nullptr);
     for (int dpi : {96, 120, 144, 168, 192, 216, 240}) {
       adw::ui::Theme t;
@@ -1926,12 +2549,411 @@ void test_releases_layout() {
   }
 }
 
+// Six releases (catalog-six.json): the five After Dark ones and Star Wars
+// Screen Entertainment, whose 14 Intermission modules (abi intermission) a
+// host too old for them can't run. The list, what Random plays with and
+// without them, when the saver has to ask the host first and what it then
+// leaves out, and the list's group header for the longest title, measured in
+// the real faces.
+void test_releases_six() {
+  using Strs = std::vector<std::string>;
+  Catalog c;
+  std::string err;
+  CHECK(parse_catalog(fixture("catalog-six.json"), c, &err));
+  CHECK_EQ(c.releases.size(), (size_t)6);
+  if (c.releases.size() != 6) return;
+  Strs ids, shorts;
+  for (const Release& r : c.releases) {
+    ids.push_back(r.id);
+    shorts.push_back(r.short_title);
+  }
+  // Oldest first, as adimport orders them: the Star Wars release (1994-08)
+  // after the Simpsons (1994-08) by registry order on the tie.
+  CHECK((ids == Strs{"simpsons", "swse", "ad32", "tt", "deluxe", "ad10"}));
+  CHECK((shorts == Strs{"Simpsons", "Star Wars", "After Dark 3.2", "Totally Twisted", "Deluxe", "10th Anniversary"}));
+  CHECK(c.releases[1].title == "Star Wars Screen Entertainment" && c.releases[1].modules == 14 && c.releases[1].cover.generated());
+  CHECK(c.modules_in(1) == 14 && strip_shown(c));
+  ListModel all = build_list(c, {});
+  CHECK(all.shown == 32 && all.groups.size() == 6);
+  if (all.groups.size() == 6) {
+    CHECK_EQ(all.groups[1].release, 1);
+    CHECK((labels_of(all.groups[1]) ==
+           Strs{"Blueprints", "Cantina", "Character Biographies", "Darth Vader", "Death Star Trench", "Hyperspace",
+                "Imperial Clock", "Jawas", "Lightsaber Duel", "Poster Art", "Rebel Clock", "Scrolling Text", "Space Battles",
+                "Storyboards"}));
+  }
+  CHECK(assets_summary(count_assets(c, std::vector<bool>(32, true))) == L"32 modules from 6 releases");
+  CHECK(tile_name(c.releases[1], 14) == L"Star Wars Screen Entertainment, 14 screen savers");
+  CHECK(strip_status(1, 6) == L"Showing 1 of 6 releases");
+
+  // Random: every module, the 14 Intermission ones included, one per sameAs set.
+  Settings s;
+  RotationPlan p = effective_rotation(s, c);
+  CHECK_EQ(p.ids.size(), (size_t)27);   // 13 After Dark (as with five releases) + 14
+  CHECK(std::count(p.ids.begin(), p.ids.end(), "swse.vader") == 1);
+  // What Random may play on a host too old for them (saver.cc: App::may_rotate
+  // over its --capabilities): none of them, and a named lead of theirs goes too.
+  const HostCapabilities old_host = parse_capabilities("lanes=pe32,ne16 configure=pe32,ne16 status=1 state=1 seed=1");
+  auto playable = [&](const std::string& id) {
+    const Module* m = c.find(id);
+    return m && old_host.runs(m->lane, m->abi);
+  };
+  p = effective_rotation(s, c, playable);
+  CHECK_EQ(p.ids.size(), (size_t)13);
+  CHECK(std::none_of(p.ids.begin(), p.ids.end(), [](const std::string& id) { return id.rfind("swse.", 0) == 0; }));
+  Settings lead;
+  lead.module = "swse.vader";
+  lead.randomize = {"swse.vader", "ad40.alpha", "tt.foxtrot"};
+  CHECK(effective_rotation(lead, c).lead == "swse.vader");
+  p = effective_rotation(lead, c, playable);
+  CHECK(p.lead.empty() && (p.ids == Strs{"ad40.alpha", "tt.foxtrot"}));
+  // A list of theirs alone falls back to every module the host can run.
+  Settings only;
+  only.randomize = {"swse.vader", "swse.jawas"};
+  CHECK_EQ(effective_rotation(only, c, playable).ids.size(), (size_t)13);
+  // When the saver must ask the host first: its rotation holds one of them.
+  CHECK(rotation_needs_capabilities(s, c));
+  CHECK(rotation_needs_capabilities(lead, c) && rotation_needs_capabilities(only, c));
+  Settings simpsons;
+  simpsons.collections = {"simpsons"};
+  CHECK(!rotation_needs_capabilities(simpsons, c));
+  simpsons.collections = {"simpsons", "swse"};
+  CHECK(rotation_needs_capabilities(simpsons, c));
+  Settings ad;
+  ad.randomize = {"ad40.alpha", "tt.beta"};
+  CHECK(!rotation_needs_capabilities(ad, c));
+  ad.module = "swse.vader";   // a lead of theirs in front of an After Dark list
+  CHECK(rotation_needs_capabilities(ad, c));
+  Settings single;
+  single.module = "swse.vader";   // one module, no rotation: it is simply tried
+  CHECK(!single.rotates() && !rotation_needs_capabilities(single, c));
+  // Their files missing: nothing of theirs can rotate, nothing to ask.
+  CHECK(!rotation_needs_capabilities(s, c, [](const std::string& id) { return id.rfind("swse.", 0) != 0; }));
+  Catalog five;
+  CHECK(parse_catalog(fixture("catalog-releases.json"), five, nullptr));
+  CHECK(!rotation_needs_capabilities(s, five));
+  // What the saver plays with the host's answer (rotation_for_host), and how
+  // many modules its log says it left out: those the rotation would have
+  // held without the answer (a list of two loses at most two), and nothing
+  // at all to play when the host can run none of the modules available.
+  HostRotation hr = rotation_for_host(s, c, nullptr, playable);
+  CHECK(hr.plan.ids.size() == 13 && hr.left_out == 14);
+  hr = rotation_for_host(only, c, nullptr, playable);
+  CHECK(hr.plan.ids.size() == 13 && hr.left_out == 2);   // the list's two; the rest plays instead
+  Settings pair;
+  pair.randomize = {"swse.vader", "ad40.alpha"};
+  hr = rotation_for_host(pair, c, nullptr, playable);
+  CHECK((hr.plan.ids == Strs{"ad40.alpha"}) && hr.left_out == 1);
+  hr = rotation_for_host(lead, c, nullptr, playable);   // the lead, in its own list too: counted once
+  CHECK(hr.plan.lead.empty() && (hr.plan.ids == Strs{"ad40.alpha", "tt.foxtrot"}) && hr.left_out == 1);
+  hr = rotation_for_host(ad, c, nullptr, playable);     // a lead of theirs in front of an After Dark list
+  CHECK(hr.plan.lead.empty() && (hr.plan.ids == Strs{"ad40.alpha", "tt.beta"}) && hr.left_out == 1);
+  auto theirs = [](const std::string& id) { return id.rfind("swse.", 0) == 0; };
+  hr = rotation_for_host(s, c, theirs, playable);       // theirs alone imported
+  CHECK(hr.plan.ids.empty() && hr.plan.lead.empty() && hr.left_out == 14);
+  hr = rotation_for_host(only, c, theirs, playable);
+  CHECK(hr.plan.ids.empty() && hr.left_out == 2);
+  // Today's host, or no answer asked for: the rotation as it stands.
+  const HostCapabilities new_host = parse_capabilities("lanes=pe32,ne16 configure=pe32,ne16 abis=afterdark,intermission");
+  auto runs_on = [&](const HostCapabilities& h) {
+    return [&c, h](const std::string& id) {
+      const Module* m = c.find(id);
+      return m && h.runs(m->lane, m->abi);
+    };
+  };
+  hr = rotation_for_host(s, c, nullptr, runs_on(new_host));
+  CHECK(hr.plan.ids.size() == 27 && hr.left_out == 0);
+  hr = rotation_for_host(s, c, theirs, nullptr);
+  CHECK(hr.plan.ids.size() == 14 && hr.left_out == 0);
+  // A host without the Classic lane: the pe32 modules alone, one per sameAs set.
+  hr = rotation_for_host(s, c, nullptr, runs_on(parse_capabilities("lanes=pe32 configure=pe32 abis=afterdark,intermission")));
+  CHECK((hr.plan.ids == Strs{"ad40.alpha", "ad40.twin", "ad10.gamma"}) && hr.left_out == 24);
+  // A host that didn't answer is taken to run everything: nothing is left out.
+  hr = rotation_for_host(s, c, nullptr, runs_on(HostCapabilities{}));
+  CHECK(hr.plan.ids.size() == 27 && hr.left_out == 0);
+
+  // The own screens a window's first module may have (first_module_screens:
+  // {0, 0} for After Dark's, which follow the display; an Intermission
+  // module's 640x480): the saver takes the desktop seed at each one's
+  // screen, before it knows the module. (As the ABIs were, one for one: this
+  // catalog gives no module a "screen".)
+  {
+    using Screens = std::set<SizeI>;
+    const Screens both{SizeI{}, SizeI{640, 480}}, ad_only{SizeI{}}, imx_only{SizeI{640, 480}};
+    Settings one;
+    one.module = "swse.vader";   // alone: its own
+    CHECK(first_module_screens(one, c) == imx_only);
+    one.module = "ad40.alpha";
+    CHECK(first_module_screens(one, c) == ad_only);
+    one.module = "gone.module";   // gone: the saver shows any of those there are
+    CHECK(first_module_screens(one, c) == both);
+    CHECK(first_module_screens(one, c, [](const std::string& id) { return id.rfind("swse.", 0) != 0; }) == ad_only);
+    CHECK(first_module_screens(s, c) == both);              // Random, every module
+    CHECK(first_module_screens(ad, c) == both);             // a lead of theirs in front of an After Dark list
+    ad.module = "random";
+    CHECK(first_module_screens(ad, c) == ad_only);          // an After Dark list alone
+    CHECK(first_module_screens(simpsons, c) == both);       // Simpsons and Star Wars selected
+    simpsons.collections = {"simpsons"};
+    CHECK(first_module_screens(simpsons, c) == ad_only);
+    // A list of theirs alone: a host too old for them plays every module it
+    // can run instead, so an After Dark module may come first too.
+    CHECK(first_module_screens(only, c) == both);
+    CHECK(first_module_screens(only, c, theirs) == imx_only);   // theirs alone imported
+    CHECK(first_module_screens(s, c, [](const std::string&) { return false; }).empty());
+  }
+
+  // The group header of "Star Wars Screen Entertainment" at the minimum
+  // window, in Random (the group checkbox takes room at the left), at
+  // 100-250%: the count ("14") shows whole, and so does "Coming soon" when
+  // the release can't run, the title ellipsized for them; the other titles
+  // are ellipsized only to make room for the pill.
+  HDC dc = CreateCompatibleDC(nullptr);
+  for (int dpi = 96; dpi <= 240; dpi += 24) {
+    adw::ui::Theme t;
+    t.set_dpi(dpi);
+    LayoutInput in{dip(kMinClientW, dpi), dip(kMinClientHStrip, dpi), dpi, true};
+    in.strip_tiles = 6;
+    const WindowLayout L = layout_window(in);
+    CHECK(!L.tiles.overflow);   // six covers fit the narrowest window without scrolling
+    auto title_w = [&](const std::wstring& s) { return (int)adw::ui::measure_text(dc, s, t.fonts.body_strong).cx; };
+    const int count_w = (int)adw::ui::measure_text(dc, L"14", t.fonts.caption).cx;
+    const int pill_w = (int)adw::ui::measure_text(dc, L"Coming soon", t.fonts.caption).cx + t.px(16);
+    for (bool scrolls : {false, true}) {
+      for (bool pill : {false, true}) {
+        // The frame draw_group_headers uses, across the list's width.
+        GroupHeaderInput h = group_header_frame(L.list.w, dpi, true, scrolls);
+        CHECK(h.left == t.px(16) + t.px(kListBoxDip) + t.px(12) && h.right == L.list.w - t.px(16) && h.gap == t.px(8));
+        h.count_w = count_w;
+        h.pill_w = pill ? pill_w : 0;
+        for (const Release& r : c.releases) {
+          h.title = widen(r.title);
+          const GroupHeaderLayout g = layout_group_header(h, title_w);
+          const int count_end = g.count_x + count_w;
+          if (count_end > h.right || (pill && count_end + h.gap > g.pill_x) || g.title.empty()) {
+            fprintf(stderr, "group header \"%s\" @%d%s%s: count ends at %d, right %d, pill at %d, title \"%s\"\n",
+                    r.title.c_str(), dpi, pill ? " (pill)" : "", scrolls ? " (scrolls)" : "", count_end, h.right, g.pill_x,
+                    narrow(g.title).c_str());
+            ++g_failures;
+          }
+          // Without a pill, only the Star Wars title is too long for the
+          // narrowest list; every After Dark title keeps fitting whole.
+          if (!pill && r.id != "swse" && g.ellipsized) {
+            fprintf(stderr, "group header \"%s\" @%d ellipsized without a pill\n", r.title.c_str(), dpi);
+            ++g_failures;
+          }
+          if (!pill && r.id == "swse" && dpi == 96) CHECK(g.ellipsized);   // the survey's render F: "…Entertainment 1"
+        }
+      }
+    }
+  }
+  // At the first-open size the Star Wars title fits whole beside its count.
+  {
+    adw::ui::Theme t;
+    t.set_dpi(96);
+    LayoutInput in{kDesignClientW, kDesignClientHStrip, 96, true};
+    in.strip_tiles = 6;
+    const WindowLayout L = layout_window(in);
+    GroupHeaderInput h = group_header_frame(L.list.w, 96, true, true);
+    h.title = L"Star Wars Screen Entertainment";
+    h.count_w = (int)adw::ui::measure_text(dc, L"14", t.fonts.caption).cx;
+    CHECK(!layout_group_header(h, [&](const std::wstring& s) { return (int)adw::ui::measure_text(dc, s, t.fonts.body_strong).cx; })
+               .ellipsized);
+  }
+  DeleteDC(dc);
+}
+
+// Seven releases (catalog-seven.json): Star Trek: The Screen Saver first
+// (1992-11, the oldest), whose four modules (After Dark 2.0b: lane ne16,
+// After Dark's ABI) each have "screen": "640x480", then the six. The list
+// and its words, Random, what the saver seeds a window's first host with,
+// and seven covers in the strip.
+void test_releases_seven() {
+  using Strs = std::vector<std::string>;
+  Catalog c;
+  std::string err;
+  CHECK(parse_catalog(fixture("catalog-seven.json"), c, &err));
+  CHECK_EQ(c.releases.size(), (size_t)7);
+  if (c.releases.size() != 7) return;
+  Strs ids, shorts;
+  for (const Release& r : c.releases) {
+    ids.push_back(r.id);
+    shorts.push_back(r.short_title);
+  }
+  // Oldest first, as adimport orders them: the release of 1992 before the rest.
+  CHECK((ids == Strs{"startrek", "simpsons", "swse", "ad32", "tt", "deluxe", "ad10"}));
+  CHECK((shorts ==
+         Strs{"Star Trek", "Simpsons", "Star Wars", "After Dark 3.2", "Totally Twisted", "Deluxe", "10th Anniversary"}));
+  CHECK(c.releases[0].title == "Star Trek: The Screen Saver" && c.releases[0].modules == 4 &&
+        c.releases[0].cover.generated());
+  CHECK(c.modules_in(0) == 4 && strip_shown(c));
+  ListModel all = build_list(c, {});
+  CHECK(all.shown == 36 && all.groups.size() == 7);
+  if (all.groups.size() == 7) {
+    CHECK_EQ(all.groups[0].release, 0);
+    CHECK((labels_of(all.groups[0]) == Strs{"Communications", "Final Exam", "The Mission", "Tribbles"}));
+  }
+  CHECK(assets_summary(count_assets(c, std::vector<bool>(36, true))) == L"36 modules from 7 releases");
+  CHECK(tile_name(c.releases[0], 4) == L"Star Trek: The Screen Saver, 4 screen savers");
+  CHECK(strip_status(1, 7) == L"Showing 1 of 7 releases" && strip_status(7, 7) == L"Showing all 7 releases");
+  // Random: every module, theirs included; they are After Dark's ABI, so no
+  // rotation waits for the host's answer on their account.
+  Settings s;
+  CHECK_EQ(effective_rotation(s, c).ids.size(), (size_t)31);   // 27 as with six releases, and their 4
+  Settings trek;
+  trek.collections = {"startrek"};
+  CHECK(!rotation_needs_capabilities(trek, c) && effective_rotation(trek, c).ids.size() == 4);
+  // Their screen: their own 640x480 on a 16:9 monitor at 720 lines, as the
+  // Intermission modules' (module_screen over own_screen); the rest 1280x720.
+  for (const Module& m : c.modules) {
+    const ModuleScreen ms = module_screen(own_screen(m.abi, m.screen), 1920.0 / 1080.0, 1.5);
+    if (m.package == "startrek" || m.package == "swse") CHECK((ms.emu == SizeI{640, 480}) && ms.fixed);
+    else CHECK((ms.emu == SizeI{1280, 720}) && !ms.fixed);
+  }
+  // The screens a window's first host may be given (first_module_screens):
+  // theirs and the Intermission modules' are one, 640x480, so a window that
+  // may start with either gets one picture of the frame's part.
+  {
+    using Screens = std::set<SizeI>;
+    const Screens both{SizeI{}, SizeI{640, 480}}, display{SizeI{}}, own{SizeI{640, 480}};
+    Settings one;
+    one.module = "startrek.final";
+    CHECK(first_module_screens(one, c) == own);
+    one.module = "ad40.alpha";
+    CHECK(first_module_screens(one, c) == display);
+    CHECK(first_module_screens(trek, c) == own);   // Star Trek alone selected
+    trek.collections = {"startrek", "simpsons"};
+    CHECK(first_module_screens(trek, c) == both);
+    // With Star Wars selected, what Random plays waits on the host's answer
+    // (rotation_needs_capabilities), so every module available may come
+    // first; a Star Trek and a Star Wars module chosen alone share one screen.
+    trek.collections = {"startrek", "swse"};
+    CHECK(rotation_needs_capabilities(trek, c) && first_module_screens(trek, c) == both);
+    one.module = "swse.vader";
+    CHECK(first_module_screens(one, c) == own);
+    Settings list;
+    list.randomize = {"startrek.final", "startrek.tribble"};
+    CHECK(first_module_screens(list, c) == own);
+    list.randomize = {"startrek.final", "ad40.alpha"};
+    CHECK(first_module_screens(list, c) == both);
+    list.module = "startrek.comms";   // a lead of theirs in front of an After Dark list
+    list.randomize = {"ad40.alpha", "tt.beta"};
+    CHECK(first_module_screens(list, c) == both);
+    CHECK(first_module_screens(s, c) == both);   // Random, every module
+    auto theirs = [](const std::string& id) { return id.rfind("startrek.", 0) == 0; };
+    CHECK(first_module_screens(s, c, theirs) == own);   // theirs alone imported
+    // A monitor's pictures (plan_seed_shots): After Dark's whole monitor, and
+    // one of the frame's part for theirs and Star Wars' alike.
+    std::vector<ModuleScreen> screens;
+    for (const SizeI& o : first_module_screens(s, c)) screens.push_back(module_screen(o, 1920.0 / 1080.0, 1.5));
+    const std::vector<SeedShotPlan> plan = plan_seed_shots(screens, 1920, 1080);
+    CHECK(plan.size() == 2);
+    if (plan.size() == 2) {
+      CHECK(!plan[0].screen.fixed && (plan[0].src == RectI{0, 0, 1920, 1080}));
+      CHECK((plan[1].screen.emu == SizeI{640, 480}) && plan[1].screen.fixed && (plan[1].src == RectI{240, 0, 1440, 1080}));
+    }
+  }
+  // Seven covers (COVERS.md §1.2): they fit the first-open window, and the
+  // smallest one with its compact covers, at every scale without scrolling;
+  // a window as narrow but 760 DIP or more tall has regular covers and shows
+  // six (the sixth's art clear of the right chevron, though its cell's focus
+  // margin is not, so `whole` counts five): its row scrolls, by two tiles at
+  // most, to the third cover, and shows five at each stop after the first.
+  auto shown = [](const StripLayout& t) {
+    return (int)std::count_if(t.arts.begin(), t.arts.end(), [&](const Rc& a) { return t.view.contains(a); });
+  };
+  auto whole = [](const StripLayout& t) { return (int)std::count(t.whole.begin(), t.whole.end(), true); };
+  for (int dpi = 96; dpi <= 240; dpi += 24) {
+    auto strip_at = [&](int w, int h, int scrolled = 0) {
+      LayoutInput in{dip(w, dpi), dip(h, dpi), dpi, true};
+      in.strip_tiles = 7;
+      in.strip_first = scrolled;
+      return layout_window(in);
+    };
+    const WindowLayout first = strip_at(kDesignClientW, kDesignClientHStrip);
+    const WindowLayout small = strip_at(kMinClientW, kMinClientHStrip);
+    const WindowLayout tall = strip_at(kMinClientW, kDesignClientHStrip);
+    CHECK(first.strip_mode == StripMode::regular && first.tiles.cells.size() == 7 && !first.tiles.overflow);
+    CHECK(small.strip_mode == StripMode::compact && small.tiles.cells.size() == 7 && !small.tiles.overflow);
+    CHECK(tall.strip_mode == StripMode::regular && tall.tiles.overflow);
+    CHECK(tall.tiles.max_first == 2 && shown(tall.tiles) == 6 && whole(tall.tiles) == 5);
+    for (int stop : {1, 2}) {
+      const StripLayout t = strip_at(kMinClientW, kDesignClientHStrip, stop).tiles;
+      CHECK(t.first == stop && shown(t) == 5 && whole(t) == 5);
+    }
+    if (dpi == 96) {
+      printf("releases: seven regular covers in a 900 DIP window: %d shown, scrolling by %d tiles at most (to cover %d)\n",
+             shown(tall.tiles), tall.tiles.max_first, tall.tiles.max_first + 1);
+    }
+  }
+}
+
+// A catalog whose modules each give a "screen" of their own (a hand-edited
+// or tampered one: adimport writes "640x480" alone), all naming one module
+// file: each is a screen a window's first module may have
+// (first_module_screens), but the window's desktop seeds stay three pictures
+// (plan_seed_shots): the one that follows the display, 640x480, and the
+// smallest of the others. A first module whose screen got none starts on
+// black.
+void test_releases_many_screens() {
+  std::string mods;
+  auto add = [&](const std::string& id, const std::string& screen) {
+    mods += std::string(mods.empty() ? "" : ",") + "{\"id\":\"x." + id +
+            "\",\"path\":\"packages/x/ONE.AD\",\"lane\":\"ne16\",\"displayName\":\"" + id +
+            "\",\"package\":\"x\",\"packageTitle\":\"X\",\"moduleName\":\"" + id + "\"" +
+            (screen.empty() ? "" : ",\"screen\":\"" + screen + "\"") + "}";
+  };
+  for (int i = 0; i < 64; ++i) add("m" + std::to_string(i), "4096x" + std::to_string(4096 - 8 * i));
+  add("vga", "640x480");
+  add("plain", "");
+  Catalog c;
+  std::string err;
+  CHECK(parse_catalog("{\"version\":1,\"packages\":[{\"id\":\"x\",\"title\":\"X\",\"shortTitle\":\"X\","
+                      "\"modules\":66}],\"modules\":[" + mods + "]}",
+                      c, &err));
+  CHECK_EQ(c.modules.size(), (size_t)66);
+  auto plan_of = [&](const Settings& s, size_t* left) {
+    std::vector<ModuleScreen> screens;
+    for (const SizeI& own : first_module_screens(s, c)) screens.push_back(module_screen(own, 1920.0 / 1080.0, s.scale));
+    return plan_seed_shots(screens, 1920, 1080, left);
+  };
+  Settings s;   // Random, every module
+  CHECK_EQ(first_module_screens(s, c).size(), (size_t)66);
+  size_t left = 0;
+  std::vector<SeedShotPlan> plan = plan_of(s, &left);
+  CHECK(plan.size() == 3 && left == 63);
+  if (plan.size() == 3) {
+    CHECK(!plan[0].screen.fixed && (plan[0].screen.emu == SizeI{856, 480}) && (plan[0].src == RectI{0, 0, 1920, 1080}));
+    CHECK(plan[1].screen.fixed && (plan[1].screen.emu == SizeI{640, 480}) && (plan[1].src == RectI{240, 0, 1440, 1080}));
+    CHECK(plan[2].screen.fixed && (plan[2].screen.emu == SizeI{4096, 3592}));
+  }
+  // The largest leading a list of all the rest: its screen is one of those
+  // left out, so its first host starts on black.
+  Settings lead;
+  lead.module = "x.m0";
+  for (const Module& m : c.modules) {
+    if (m.id != lead.module) lead.randomize.push_back(m.id);
+  }
+  CHECK(first_module_screens(lead, c).count(SizeI{4096, 4096}) == 1);
+  plan = plan_of(lead, &left);
+  CHECK(plan.size() == 3 && left == 63);
+  for (const SeedShotPlan& p : plan) CHECK(!(p.screen.emu == SizeI{4096, 4096}));
+  // Chosen alone, it has its own picture.
+  Settings one;
+  one.module = "x.m0";
+  plan = plan_of(one, &left);
+  CHECK(plan.size() == 1 && left == 0);
+  if (plan.size() == 1) CHECK(plan[0].screen.fixed && (plan[0].screen.emu == SizeI{4096, 4096}));
+}
+
 void test_releases() {
   test_releases_catalog();
   test_releases_settings();
   test_releases_rotation();
   test_releases_list();
   test_releases_layout();
+  test_releases_six();
+  test_releases_seven();
+  test_releases_many_screens();
 }
 
 // ---- input rules (INTERACTION.md §4) ------------------------------------------------
@@ -2050,6 +3072,10 @@ void test_input() {
   CHECK(fr.left == 100 + fit.x && fr.right == 100 + fit.x + fit.w && fr.top == 50 + fit.y);
   CHECK(key_line(65, true) == "KEY 65 1" && key_line(20, false) == "KEY 20 0");
   CHECK(caps_line(true) == "CAPS 1" && mouse_line(3, 4, 5) == "MOUSE 3 4 5" && mouse_line(3, 4, 9) == "MOUSE 3 4 1");
+  // Num Lock (INTERACTION.md §3.2): its own line, as CAPS has, for a host
+  // that keeps the toggle; its key is exempt above (it never wakes).
+  CHECK(numlock_line(true) == "NUMLOCK 1" && numlock_line(false) == "NUMLOCK 0");
+  CHECK(key_line(VK_NUMLOCK, true) == "KEY 144 1");
 
   // AD_SCR_TEST_INPUT scripts.
   std::vector<TestStep> steps;
@@ -2075,6 +3101,14 @@ void test_input() {
   CHECK(!parse_test_script("JUMP\n", steps, &err));
   CHECK(parse_test_script("DISPLAYCHANGE\nMOVE 400 300\n", steps, &err) && steps.size() == 2 &&
         steps[0].op == TestStep::Op::display_change);
+  // The synthetic Num Lock: set without a key, or flipped by KEY 144 1 (saver.cc).
+  CHECK(parse_test_script("NUMLOCKSTATE 1\nnumlockstate 0\nNUMLOCKSTATE 7\nKEY 144 1\n", steps, &err) && steps.size() == 4);
+  if (steps.size() == 4) {
+    CHECK(steps[0].op == TestStep::Op::numlock_state && steps[0].a == 1 && steps[1].a == 0 && steps[2].a == 1);
+    CHECK(steps[3].op == TestStep::Op::key && steps[3].a == VK_NUMLOCK && steps[3].b == 1);
+  }
+  CHECK(!parse_test_script("NUMLOCKSTATE\n", steps, &err) && err.find("NUMLOCKSTATE <0|1>") != std::string::npos);
+  CHECK(!parse_test_script("NUMLOCKSTATE 1 1\n", steps, &err));
 }
 
 // ---- desktop seed, last-exit log, input lines ----------------------------------------
@@ -2101,6 +3135,10 @@ void test_seed() {
   // opens it), gone when the handle closes, whatever happens.
   std::wstring path = seed_file_path(GetCurrentProcessId(), 7);
   CHECK(path.find(L"LongAfterDark-seed-" + std::to_wstring(GetCurrentProcessId()) + L"-7.ppm") != std::wstring::npos);
+  // The capture for an Intermission module's own screen, beside it.
+  const std::wstring sized = seed_file_path(GetCurrentProcessId(), 7, L"640x480");
+  CHECK(sized.size() > path.size() && sized.substr(0, path.size() - 4) == path.substr(0, path.size() - 4) &&
+        sized.compare(sized.size() - 12, 12, L"-640x480.ppm") == 0);
   std::wstring err;
   HANDLE f = write_seed_file(path, p6, &err);
   CHECK(f != INVALID_HANDLE_VALUE);
@@ -2128,6 +3166,107 @@ void test_seed() {
   if (!shot.empty()) {   // (no desktop in some CI sessions)
     const std::string sh = "P6\n64 48\n255\n";
     CHECK(shot.size() == sh.size() + 64 * 48 * 3 && memcmp(shot.data(), sh.data(), sh.size()) == 0);
+  }
+  // Every shot's picture, taken as it comes: in order, one call each.
+  std::vector<size_t> order;
+  auto collect = [&order](std::vector<std::vector<uint8_t>>& into) {
+    order.clear();
+    into.clear();
+    return [&order, &into](size_t shot, const std::vector<uint8_t>& p6) {
+      order.push_back(shot);
+      into.push_back(p6);
+    };
+  };
+  // The parts, from a picture of known colours (no desktop needed): 64x32,
+  // its left half red and its right half blue. The whole at 8x4 keeps red on
+  // the left and blue on the right; the right half alone is all blue; a part
+  // that leaves the picture, and a shot without a size, get none.
+  {
+    HDC mem = CreateCompatibleDC(nullptr);
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = 64;
+    bi.bmiHeader.biHeight = -32;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bmp = mem ? CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
+    CHECK(bmp != nullptr);
+    if (bmp) {
+      auto paint = [&](uint32_t left, uint32_t right) {   // BGRX
+        GdiFlush();
+        auto* px = static_cast<uint32_t*>(bits);
+        for (int y = 0; y < 32; ++y)
+          for (int x = 0; x < 64; ++x) px[y * 64 + x] = x < 32 ? left : right;
+      };
+      const uint32_t kRed = 0x00FF0000u, kBlue = 0x000000FFu, kGreen = 0x0000FF00u;
+      paint(kRed, kBlue);
+      HGDIOBJ old = SelectObject(mem, bmp);
+      std::vector<std::vector<uint8_t>> parts;
+      shrink_parts(mem, 64, 32,
+                   {{{0, 0, 64, 32}, {8, 4}}, {{32, 0, 32, 32}, {4, 4}}, {{40, 0, 32, 32}, {4, 4}}, {{0, 0, 64, 32}, {}}},
+                   collect(parts));
+      CHECK((order == std::vector<size_t>{0, 1, 2, 3}) && parts.size() == 4 && parts[2].empty() && parts[3].empty());
+      const std::string h0 = "P6\n8 4\n255\n", h1 = "P6\n4 4\n255\n";
+      auto rgb = [](const std::vector<uint8_t>& p6, size_t head, int w, int x, int y) {
+        const uint8_t* c = p6.data() + head + (size_t(y) * w + x) * 3;
+        return std::array<int, 3>{c[0], c[1], c[2]};
+      };
+      auto red = [](std::array<int, 3> c) { return c[0] > 200 && c[1] < 50 && c[2] < 50; };
+      auto blue = [](std::array<int, 3> c) { return c[0] < 50 && c[1] < 50 && c[2] > 200; };
+      auto green = [](std::array<int, 3> c) { return c[0] < 50 && c[1] > 200 && c[2] < 50; };
+      if (parts.size() == 4 && parts[0].size() == h0.size() + 8 * 4 * 3 && parts[1].size() == h1.size() + 4 * 4 * 3) {
+        CHECK(memcmp(parts[0].data(), h0.data(), h0.size()) == 0 && memcmp(parts[1].data(), h1.data(), h1.size()) == 0);
+        CHECK(red(rgb(parts[0], h0.size(), 8, 0, 0)) && red(rgb(parts[0], h0.size(), 8, 2, 3)));
+        CHECK(blue(rgb(parts[0], h0.size(), 8, 7, 0)) && blue(rgb(parts[0], h0.size(), 8, 5, 3)));
+        bool all_blue = true;
+        for (int y = 0; y < 4; ++y)
+          for (int x = 0; x < 4; ++x) all_blue &= blue(rgb(parts[1], h1.size(), 4, x, y));
+        CHECK(all_blue);
+      } else {
+        CHECK(false);   // the sizes are wrong
+      }
+      // One picture at a time (App::capture_seeds writes each before the
+      // next is made): the next is made only once the one before is taken,
+      // so a picture turned green while the first is taken makes the second
+      // green, where pictures made together would both be red and blue.
+      std::vector<std::vector<uint8_t>> seq;
+      shrink_parts(mem, 64, 32, {{{0, 0, 64, 32}, {8, 4}}, {{0, 0, 64, 32}, {8, 4}}},
+                   [&](size_t shot, const std::vector<uint8_t>& p6) {
+                     seq.push_back(p6);
+                     if (shot == 0) paint(kGreen, kGreen);
+                   });
+      CHECK(seq.size() == 2);
+      if (seq.size() == 2 && seq[0].size() == h0.size() + 8 * 4 * 3 && seq[1].size() == seq[0].size()) {
+        CHECK(red(rgb(seq[0], h0.size(), 8, 0, 0)) && blue(rgb(seq[0], h0.size(), 8, 7, 3)));
+        CHECK(green(rgb(seq[1], h0.size(), 8, 0, 0)) && green(rgb(seq[1], h0.size(), 8, 7, 3)));
+      } else {
+        CHECK(false);   // the sizes are wrong
+      }
+      SelectObject(mem, old);
+      DeleteObject(bmp);
+    }
+    if (mem) DeleteDC(mem);
+  }
+  // One capture, several pictures: each its part of the monitor at its own
+  // size (an Intermission frame's part beside the whole), and a part that
+  // leaves the monitor none; a capture that can't be made takes every shot,
+  // each without a picture (the saver logs each).
+  {
+    const int cw = mon.right, ch = mon.bottom;
+    std::vector<std::vector<uint8_t>> shots;
+    capture_monitor_shots(
+        mon, {{{0, 0, cw, ch}, {64, 48}}, {{cw / 4, 0, cw / 2, ch}, {32, 48}}, {{cw / 2, 0, cw, ch}, {16, 16}}},
+        collect(shots));
+    CHECK((order == std::vector<size_t>{0, 1, 2}) && shots.size() == 3 && shots[2].empty());
+    if (shots.size() == 3 && !shots[0].empty()) {
+      const std::string h0 = "P6\n64 48\n255\n", h1 = "P6\n32 48\n255\n";
+      CHECK(shots[0].size() == h0.size() + 64 * 48 * 3 && memcmp(shots[0].data(), h0.data(), h0.size()) == 0);
+      CHECK(shots[1].size() == h1.size() + 32 * 48 * 3 && memcmp(shots[1].data(), h1.data(), h1.size()) == 0);
+    }
+    capture_monitor_shots(RECT{0, 0, 0, 0}, {{{0, 0, 1, 1}, {1, 1}}, {{0, 0, 1, 1}, {1, 1}}}, collect(shots));
+    CHECK((order == std::vector<size_t>{0, 1}) && shots.size() == 2 && shots[0].empty() && shots[1].empty());
   }
 
   // The last-exit log: rewritten per run, capped, first and last lines kept.

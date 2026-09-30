@@ -1,11 +1,18 @@
 // --download of every package from its Internet Archive copies (packages.h
 // `downloads`), against a loopback server serving synthetic sources shaped
 // like the real ones (tests/pkg_fixture.h; no After Dark bytes):
-//   images    Deluxe, 10th Anniversary, 3.2 and Totally Twisted as ISOs whose
-//             md5 is the package's known image: verified "image"
+//   images    Deluxe, 10th Anniversary, 3.2, Totally Twisted and Star Wars
+//             Screen Entertainment as ISOs whose md5 is the package's known
+//             image: verified "image"; Star Trek: The Screen Saver as a copy
+//             of two floppy images (both parts fetched and checked, progress
+//             over the pair, a copy used only when both parts verify, a
+//             partly downloaded copy completed), a known set of install
+//             disks: verified "image"
 //   zip       the Simpsons as a flat ZIP of its install files, read as the
-//             install folder: verified "files"; the same ZIP given as an
-//             image; ZIPs that nest the files or are password-protected
+//             install folder: verified "files" (and Star Wars Screen
+//             Entertainment's flat ZIP when its disc image is gone); the same
+//             ZIP given as an image; ZIPs that nest the files or are
+//             password-protected
 //   copies    a 404, a wrong size (refused before a byte is written, the
 //             .part kept for the next copy to resume) and a wrong md5 each
 //             fall back to the next copy; when every copy fails: 3 for a
@@ -14,10 +21,14 @@
 //             downloaded from any copy is used without a request
 //   records   import.json's download record (version 1 and 2)
 //   custom    --url with and without --package, --md5 over the registry's
+//             (over a floppy set's copies: each copy's first image's md5
+//             only)
 //   all       import_downloads over every package; a cancel stops it
 //   registry  the built-in copies: https://archive.org/download/ URLs, the
 //             known image md5s and sizes, file names per content, the
-//             verified Simpsons ZIPs
+//             verified Simpsons ZIPs, Star Wars Screen Entertainment's ISO,
+//             Redump BIN and ZIP, Star Trek: The Screen Saver's two pairs of
+//             disk images (each pair a complete known disk set)
 //   adimport  --download <id> / all, their conflicts, --list-packages sizes
 //
 //   test_import_pkg_download <adimport.exe> <scratch>
@@ -157,10 +168,16 @@ int main(int argc, char** argv) {
   WSAStartup(MAKEWORD(2, 2), &wsa);
 
   const test::PkgFixture deluxe = test::deluxe_fixture(), ad10 = test::ad10_fixture(), ad32 = test::ad32_fixture(),
-                         tt = test::tt_fixture(), simpsons = test::simpsons_fixture();
+                         tt = test::tt_fixture(), simpsons = test::simpsons_fixture(), swse = test::swse_fixture(),
+                         startrek = test::startrek_fixture();
   test::TestRegistry reg;
-  for (auto& [id, f] : std::map<std::string, const test::PkgFixture*>{
-           {"deluxe", &deluxe}, {"ad10", &ad10}, {"ad32", &ad32}, {"tt", &tt}, {"simpsons", &simpsons}})
+  for (auto& [id, f] : std::map<std::string, const test::PkgFixture*>{{"deluxe", &deluxe},
+                                                                     {"ad10", &ad10},
+                                                                     {"ad32", &ad32},
+                                                                     {"tt", &tt},
+                                                                     {"simpsons", &simpsons},
+                                                                     {"swse", &swse},
+                                                                     {"startrek", &startrek}})
     reg.manifest(id, test::manifest_of(f->expect));
 
   // What the server publishes. The disc images' md5s are their packages'
@@ -168,11 +185,26 @@ int main(int argc, char** argv) {
   const auto deluxe_iso = test::iso_of(deluxe, true, "AD_DELUXE"), ad10_iso = test::iso_of(ad10, true, "AD10TH"),
              ad32_iso = test::iso_of(ad32, false, "ADW320_C"), tt_iso = test::iso_of(tt, false, "TTW320CD");
   const auto simp_zip = flat_zip(simpsons.source), simp_zip94 = flat_zip(simpsons.source, 0x1C58);
+  const auto swse_iso = test::iso_of(swse, false, "SWSE"), swse_zip = flat_zip(swse.source);
   reg.image("deluxe", md5_of(deluxe_iso), deluxe_iso.size());
   reg.image("ad10", md5_of(ad10_iso), ad10_iso.size());
   reg.image("ad32", md5_of(ad32_iso), ad32_iso.size());
   reg.image("tt", md5_of(tt_iso), tt_iso.size());
+  reg.image("swse", md5_of(swse_iso), swse_iso.size());
   CHECK(md5_of(simp_zip) != md5_of(simp_zip94));
+  // Star Trek: The Screen Saver's two install floppies, and the same disks
+  // as another copy wrote them (other bytes, the same files): four known
+  // disk images.
+  auto st_disk = [&](int k, const std::string& label) {
+    test::FatBuilder b = test::FatBuilder::floppy144();
+    b.label = label;
+    return test::fat_of(startrek.source, k, "", test::startrek_disk, std::move(b));
+  };
+  const auto st1 = st_disk(1, ""), st2 = st_disk(2, ""), st1b = st_disk(1, "WIN9XCOPY"), st2b = st_disk(2, "WIN9XCOPY");
+  reg.disk_images("startrek", {{md5_of(st1), st1.size(), 1},
+                               {md5_of(st2), st2.size(), 2},
+                               {md5_of(st1b), st1b.size(), 1},
+                               {md5_of(st2b), st2b.size(), 2}});
 
   test::Server srv(test::pattern(1000, 1));
   srv.serve("/deluxe.iso", deluxe_iso);
@@ -181,6 +213,15 @@ int main(int argc, char** argv) {
   srv.serve("/tt.iso", tt_iso);
   srv.serve("/SIMPSONS.zip", simp_zip);
   srv.serve("/simpsons-1994.zip", simp_zip94);
+  srv.serve("/AfterDarkStarWars.iso", swse_iso);
+  srv.serve("/SWSE.zip", swse_zip);
+  srv.serve("/st1.img", st1);
+  srv.serve("/st2.img", st2);
+  srv.serve("/st1b.img", st1b);
+  srv.serve("/st2b.img", st2b);
+  auto st2_bad = st2;
+  st2_bad[st2_bad.size() / 2] ^= 0xFF;
+  srv.serve("/st2-bad.img", st2_bad);
   auto tt_short = tt_iso;
   tt_short.resize(tt_short.size() - 2048);  // another size: refused before the transfer
   srv.serve("/tt-short.iso", tt_short);
@@ -198,6 +239,13 @@ int main(int argc, char** argv) {
   const Copy simp_copy{srv.url("/r/SIMPSONS.zip"), L"SIMPSONS.zip", simp_zip.size(), md5_of(simp_zip), "zip"};
   const Copy simp94_copy{srv.url("/r/simpsons-1994.zip"), L"simpsons-1994.zip", simp_zip94.size(), md5_of(simp_zip94),
                          "zip"};
+  const Copy swse_copy{srv.url("/r/AfterDarkStarWars.iso"), L"AfterDarkStarWars.iso", swse_iso.size(), md5_of(swse_iso)};
+  const Copy swse_zip_copy{srv.url("/r/SWSE.zip"), L"SWSE.zip", swse_zip.size(), md5_of(swse_zip), "zip"};
+  // Two copies of two parts each, as the Internet Archive's two items are.
+  const Copy st_copy{srv.url("/r/st1.img"), L"st1.img", st1.size(), md5_of(st1), "image",
+                     {{srv.url("/r/st2.img"), L"st2.img", st2.size(), md5_of(st2)}}};
+  const Copy st_copy_b{srv.url("/r/st1b.img"), L"st1b.img", st1b.size(), md5_of(st1b), "image",
+                       {{srv.url("/r/st2b.img"), L"st2b.img", st2b.size(), md5_of(st2b)}}};
   // Shaped like the real registry: archive.org's hop to a storage node, and
   // a dead first copy for ad32 (its later copies are the fallbacks).
   auto good_registry = [&] {
@@ -206,6 +254,8 @@ int main(int argc, char** argv) {
     reg.downloads("ad32", {ad32_gone, ad32_copy});
     reg.downloads("tt", {tt_copy});
     reg.downloads("simpsons", {simp_copy, simp94_copy});
+    reg.downloads("swse", {swse_copy, swse_zip_copy});
+    reg.downloads("startrek", {st_copy, st_copy_b});
   };
   good_registry();
 
@@ -226,6 +276,8 @@ int main(int argc, char** argv) {
            {"ad32", &ad32, "packages/ad32", L"ad32.iso", "/ad32.iso", "image", "iso9660"},
            {"tt", &tt, "packages/tt", L"TTW320CD.ISO", "/tt.iso", "image", "iso9660"},
            {"simpsons", &simpsons, "packages/simpsons", L"SIMPSONS.zip", "/SIMPSONS.zip", "files", "zip"},
+           {"swse", &swse, "packages/swse", L"AfterDarkStarWars.iso", "/AfterDarkStarWars.iso", "image", "iso9660"},
+           {"startrek", &startrek, "packages/startrek", L"st1.img", "/st1.img", "image", "fat12"},
        }) {
     fs::path root = dir / (L"alone-" + to_wide(o.id));
     srv.clear();
@@ -243,11 +295,13 @@ int main(int argc, char** argv) {
     CHECK_EQ(r.final_url, srv.url(o.served));
     CHECK(r.download_md5_checked);
     const std::string id = o.id;
-    const std::string want_url = id == "deluxe" ? deluxe_copy.url
-                                 : id == "ad10" ? ad10_copy.url
-                                 : id == "ad32" ? ad32_copy.url
-                                 : id == "tt"   ? tt_copy.url
-                                                : simp_copy.url;
+    const std::string want_url = id == "deluxe"     ? deluxe_copy.url
+                                 : id == "ad10"     ? ad10_copy.url
+                                 : id == "ad32"     ? ad32_copy.url
+                                 : id == "tt"       ? tt_copy.url
+                                 : id == "swse"     ? swse_copy.url
+                                 : id == "startrek" ? st_copy.url
+                                                    : simp_copy.url;
     CHECK_EQ(r.url, want_url);
     if (id == "deluxe") {
       // Deluxe's record stays version 1: kind download, the URL fetched, where it led.
@@ -266,9 +320,19 @@ int main(int argc, char** argv) {
       CHECK_EQ(s.get_string("url"), want_url);
       CHECK_EQ(s.get_string("finalUrl"), srv.url(o.served));
       CHECK_EQ(s.get_bool("md5Checked"), true);
-      CHECK_EQ(s.get_string("imageMd5"), md5_file_hex(dl / o.file));
       CHECK_EQ(s.get_bool("imageMd5Known"), id != "simpsons");
       CHECK_EQ(j.get_string("verified"), std::string(o.verified));
+      if (id == "startrek") {
+        // Both disks' images, one part each; the record's URL is the first's.
+        CHECK(!s.contains("imageMd5"));
+        const auto& parts = s.at("parts").as_list();
+        CHECK(parts.size() == 2 && parts[0]->get_string("md5") == md5_of(st1) &&
+              parts[1]->get_string("md5") == md5_of(st2));
+        CHECK(test::read_bytes(dl / L"st2.img") == st2);
+        CHECK(!fs::exists(with_suffix(dl / L"st2.img", L".part")));
+      } else {
+        CHECK_EQ(s.get_string("imageMd5"), md5_file_hex(dl / o.file));
+      }
     }
     if (id == "ad32") {
       // The first copy is gone (404): the second one is used.
@@ -287,6 +351,119 @@ int main(int argc, char** argv) {
       // The installer archives' password is still never written or logged.
       for (auto& l : g_log) CHECK(l.find(test::kTestZipPassword) == std::string::npos);
       CHECK(test::read_text(r.import_json).find(test::kTestZipPassword) == std::string::npos);
+    }
+  }
+
+  // ---- Star Wars Screen Entertainment from its flat ZIP when the disc image is gone ----------
+  {
+    const Copy gone{srv.url("/r/gone-swse.iso"), L"AfterDarkStarWars.iso", swse_iso.size(), md5_of(swse_iso)};
+    reg.downloads("swse", {gone, swse_zip_copy});
+    fs::path dlz = dir / L"downloads-swse-zip", root = dir / L"swse-zip";
+    g_log.clear();
+    ImportResult r = run("swse, image gone: the ZIP", download(dlz, "swse"), opts_for(root, reg), Status::ok);
+    CHECK_EQ(r.url, swse_zip_copy.url);
+    CHECK_EQ(r.verified, std::string("files"));
+    CHECK_EQ(r.format, std::string("zip"));
+    CHECK(logged("a ZIP of install files"));
+    check_installed(root / L"win", swse, "packages/swse");
+    CHECK(catalog_ids(root / L"win") == swse.ids);
+    phosg::JSON j = json_at(r.import_json);
+    CHECK_EQ(j.at("source").get_string("kind"), std::string("download"));
+    CHECK_EQ(j.at("source").get_bool("imageMd5Known"), false);
+    CHECK_EQ(j.at("package").get_string("recipe"), std::string("intermission"));
+    good_registry();
+  }
+
+  // ---- Star Trek: The Screen Saver: copies of two images each ---------------------------------
+  {
+    const uint64_t pair = st1.size() + st2.size();
+    // Progress runs over the whole pair: the second part's bytes come after
+    // the first's, out of both parts' published sizes.
+    {
+      fs::path dlp = dir / L"downloads-st-progress";
+      uint64_t last_done = 0, max_total = 0, min_total = UINT64_MAX;
+      bool backwards = false;
+      ImportOptions o = opts_for(dir / L"st-progress", reg);
+      o.progress = [&](const Progress& p) {
+        if (p.phase != Progress::Phase::download) return true;
+        backwards = backwards || p.done < last_done;
+        last_done = p.done;
+        max_total = std::max(max_total, p.total);
+        min_total = std::min(min_total, p.total);
+        return true;
+      };
+      ImportResult r = run("startrek, progress over both parts", download(dlp, "startrek"), o, Status::ok);
+      CHECK(!backwards);
+      CHECK_EQ(last_done, pair);
+      CHECK(min_total == pair && max_total == pair);
+      CHECK_EQ(r.verified, std::string("image"));
+    }
+    // A copy is used only when every part verifies: a second part gone (404)
+    // or with other bytes moves on to the next copy, both of whose parts are
+    // then fetched.
+    for (const auto& [what, second] : std::vector<std::pair<std::string, std::string>>{
+             {"second part gone", "/r/st2-gone.img"}, {"second part damaged", "/r/st2-bad.img"}}) {
+      Copy broken = st_copy;
+      broken.more[0].url = srv.url(second);
+      reg.downloads("startrek", {broken, st_copy_b});
+      fs::path dlb = dir / to_wide("downloads-st-" + what);
+      srv.clear();
+      g_log.clear();
+      ImportResult r = run("startrek, " + what, download(dlb, "startrek"), opts_for(dir / to_wide("st-" + what), reg),
+                           Status::ok);
+      CHECK_EQ(r.url, st_copy_b.url);
+      CHECK(logged("trying another copy: " + st_copy_b.url));
+      CHECK_EQ(r.verified, std::string("image"));
+      CHECK(test::read_bytes(dlb / L"st1b.img") == st1b && test::read_bytes(dlb / L"st2b.img") == st2b);
+      check_installed(dir / to_wide("st-" + what) / L"win", startrek, "packages/startrek");
+      auto p = paths(srv);
+      CHECK(std::find(p.begin(), p.end(), "/st1.img") != p.end());  // the first part was fetched, the pair refused
+    }
+    good_registry();
+    // Both parts already here: nothing is requested. Only the first part
+    // here: the copy is completed (the first part reused, not fetched again).
+    {
+      fs::path dlr = dir / L"downloads-st-reuse";
+      test::write_bytes(dlr / L"st1.img", st1);
+      test::write_bytes(dlr / L"st2.img", st2);
+      srv.clear();
+      ImportResult r = run("startrek, both parts on disk", download(dlr, "startrek"), opts_for(dir / L"st-reuse", reg),
+                           Status::ok);
+      CHECK(srv.requests().empty());
+      CHECK(r.final_url.empty());
+      fs::path dlh = dir / L"downloads-st-half";
+      test::write_bytes(dlh / L"st1.img", st1);
+      srv.clear();
+      r = run("startrek, one part on disk", download(dlh, "startrek"), opts_for(dir / L"st-half", reg), Status::ok);
+      auto p = paths(srv);
+      CHECK(std::find(p.begin(), p.end(), "/st1.img") == p.end() && std::find(p.begin(), p.end(), "/st2.img") != p.end());
+      CHECK(r.final_url.empty());  // the first part's, which was reused
+      CHECK_EQ(r.verified, std::string("image"));
+      // The other copy's pair on disk is preferred to fetching the first —
+      // also over a first copy of which only one part is here.
+      fs::path dlo = dir / L"downloads-st-other";
+      test::write_bytes(dlo / L"st1b.img", st1b);
+      test::write_bytes(dlo / L"st2b.img", st2b);
+      test::write_bytes(dlo / L"st1.img", st1);
+      srv.clear();
+      r = run("startrek, the other copy on disk", download(dlo, "startrek"), opts_for(dir / L"st-other", reg),
+              Status::ok);
+      CHECK(srv.requests().empty());
+      CHECK_EQ(r.url, st_copy_b.url);
+    }
+    // Every copy fails: 4, and nothing is imported.
+    {
+      Copy gone = st_copy, gone_b = st_copy_b;
+      gone.more[0].url = srv.url("/r/nope1.img");
+      gone_b.more[0].url = srv.url("/r/nope2.img");
+      reg.downloads("startrek", {gone, gone_b});
+      fs::path root = dir / L"st-fail";
+      ImportResult r = run("startrek, no complete copy", download(dir / L"downloads-st-fail", "startrek"),
+                           opts_for(root, reg), Status::network);
+      CHECK(r.message.find("none of the 2 copies") != std::string::npos);
+      CHECK(r.message.find("Star Trek: The Screen Saver from its disc with --image or --from") != std::string::npos);
+      CHECK(!fs::exists(root / L"win" / L"packages" / L"startrek"));
+      good_registry();
     }
   }
 
@@ -396,6 +573,50 @@ int main(int argc, char** argv) {
     r = run("--md5 over the registry", download(dir / L"downloads-md5-override", "tt", "", md5_of(tt_iso)),
             opts_for(dir / L"custom-md5", reg), Status::ok);
     CHECK_EQ(r.url, tt_copy.url);
+    // Over a floppy set's copy it replaces the first image's md5 (and size)
+    // only: the second image is still checked against its own.
+    r = run("--md5 over a floppy set", download(dir / L"downloads-st-md5", "startrek", "", md5_of(st1)),
+            opts_for(dir / L"custom-st-md5", reg), Status::ok);
+    CHECK_EQ(r.url, st_copy.url);
+    CHECK_EQ(r.verified, std::string("image"));
+    CHECK(r.download_md5_checked);
+    {
+      phosg::JSON j = json_at(r.import_json);
+      const phosg::JSON& s = j.at("source");
+      CHECK_EQ(s.get_bool("md5Checked"), true);
+      const auto& parts = s.at("parts").as_list();
+      CHECK(parts.size() == 2 && parts[0]->get_string("md5") == md5_of(st1) &&
+            parts[1]->get_string("md5") == md5_of(st2));
+    }
+    check_installed(dir / L"custom-st-md5" / L"win", startrek, "packages/startrek");
+    // The other copy's disk 1 named by --md5: the first copy's first image is
+    // then refused, and the second copy used (its second image still checked
+    // against its own md5).
+    g_log.clear();
+    r = run("--md5 of the other copy's disk 1", download(dir / L"downloads-st-md5b", "startrek", "", md5_of(st1b)),
+            opts_for(dir / L"custom-st-md5b", reg), Status::ok);
+    CHECK_EQ(r.url, st_copy_b.url);
+    CHECK(logged("trying another copy: " + st_copy_b.url));
+    CHECK_EQ(r.verified, std::string("image"));
+    {
+      phosg::JSON j = json_at(r.import_json);
+      const auto& parts = j.at("source").at("parts").as_list();
+      CHECK(parts.size() == 2 && parts[0]->get_string("md5") == md5_of(st1b) &&
+            parts[1]->get_string("md5") == md5_of(st2b));
+    }
+    // ...and its size: with the first image published 512 bytes longer than
+    // the server's, the copy is refused as served, and --md5 takes it.
+    {
+      Copy resized = st_copy;
+      resized.size += 512;
+      reg.downloads("startrek", {resized});
+      r = run("a floppy set's first image, another size published", download(dir / L"downloads-st-size", "startrek"),
+              opts_for(dir / L"custom-st-size", reg), Status::verify_failed);
+      r = run("--md5 over that size", download(dir / L"downloads-st-size2", "startrek", "", md5_of(st1)),
+              opts_for(dir / L"custom-st-size2", reg), Status::ok);
+      CHECK_EQ(r.verified, std::string("image"));
+      good_registry();
+    }
   }
 
   // ---- ZIPs given as images ----------------------------------------------------------------
@@ -423,18 +644,20 @@ int main(int argc, char** argv) {
   // ---- --download all -----------------------------------------------------------------------
   {
     const std::vector<std::string> ids = downloadable_packages(reg.span());
-    CHECK(ids == std::vector<std::string>({"deluxe", "ad10", "ad32", "tt", "simpsons"}));
+    CHECK(ids == std::vector<std::string>({"deluxe", "ad10", "ad32", "tt", "simpsons", "swse", "startrek"}));
     fs::path root = dir / L"all";
     std::vector<size_t> started;
     Source base = download(dir / L"downloads-all", "");
     std::vector<ImportResult> rs = import_downloads(ids, base, opts_for(root, reg), [&](size_t i) { started.push_back(i); });
-    CHECK_EQ(rs.size(), size_t(5));
+    CHECK_EQ(rs.size(), size_t(7));
     for (auto& r : rs) CHECK_EQ(r.status, Status::ok);
-    CHECK(started == std::vector<size_t>({0, 1, 2, 3, 4}));
+    CHECK(started == std::vector<size_t>({0, 1, 2, 3, 4, 5, 6}));
     std::vector<std::string> want;
-    for (const auto* f : {&deluxe, &ad10, &ad32, &tt, &simpsons}) want.insert(want.end(), f->ids.begin(), f->ids.end());
+    for (const auto* f : {&deluxe, &ad10, &ad32, &tt, &simpsons, &swse, &startrek})
+      want.insert(want.end(), f->ids.begin(), f->ids.end());
     CHECK(catalog_ids(root / L"win") == want);
-    CHECK_EQ(rs.back().installed.size(), size_t(5));
+    CHECK_EQ(rs.back().installed.size(), size_t(7));
+    CHECK_EQ(rs.back().verified, std::string("image"));
 
     // Cancelled during the second: the first stays imported, nothing after it starts.
     fs::path croot = dir / L"all-cancel";
@@ -452,31 +675,55 @@ int main(int argc, char** argv) {
 
   // ---- the built-in copies -------------------------------------------------------------------
   {
-    CHECK(downloadable_packages() == std::vector<std::string>({"deluxe", "ad10", "ad32", "tt", "simpsons"}));
+    CHECK(downloadable_packages() ==
+          std::vector<std::string>({"deluxe", "ad10", "ad32", "tt", "simpsons", "swse", "startrek"}));
     for (const Package& p : builtin_packages()) {
       CHECK(!p.downloads.empty());
       std::map<std::string, std::wstring> name_of_md5;
       std::map<std::wstring, std::string> md5_of_name;
       for (const Download& d : p.downloads) {
-        const std::string url = d.url, md5 = d.md5, kind = d.kind;
-        const std::wstring file = d.file_name;
-        fprintf(stderr, "  %s: %s (%llu bytes, %s)\n", p.id, url.c_str(), (unsigned long long)d.size, kind.c_str());
-        CHECK(url.rfind("https://archive.org/download/", 0) == 0);
-        CHECK(url.find_first_of(" \"<>[]()") == std::string::npos);  // percent-encoded as published
-        CHECK(is_md5(md5));
-        CHECK(d.size > 0);
-        CHECK(!file.empty() && file.find_first_of(L"<>:\"/\\|?*") == std::wstring::npos);
+        const std::string kind = d.kind;
+        fprintf(stderr, "  %s: %s (%llu bytes, %s)\n", p.id, d.url, (unsigned long long)download_size(d), kind.c_str());
         CHECK(kind == "image" || kind == "zip");
-        // A disc image is the package's known image (verified: image); a ZIP
-        // never is.
-        bool known = false;
-        for (const KnownImage& k : p.images) known = known || (md5 == k.md5 && d.size == k.size);
-        CHECK_EQ(known, kind == "image");
-        // Same bytes, same name (a transfer resumes across copies); other bytes, another name.
-        if (name_of_md5.count(md5)) CHECK(name_of_md5[md5] == file);
-        if (md5_of_name.count(file)) CHECK_EQ(md5_of_name[file], md5);
-        name_of_md5[md5] = file;
-        md5_of_name[file] = md5;
+        // Every file of the copy: the first, and the images of further disks.
+        std::vector<DownloadPart> parts = {{d.url, d.file_name, d.size, d.md5}};
+        parts.insert(parts.end(), d.more_images.begin(), d.more_images.end());
+        CHECK(d.more_images.empty() || kind == "image");
+        std::vector<int> disks;
+        uint64_t total = 0;
+        for (const DownloadPart& q : parts) {
+          const std::string url = q.url, md5 = q.md5;
+          const std::wstring file = q.file_name;
+          CHECK(url.rfind("https://archive.org/download/", 0) == 0);
+          CHECK(url.find_first_of(" \"<>[]()") == std::string::npos);  // percent-encoded as published
+          CHECK(is_md5(md5));
+          CHECK(q.size > 0);
+          CHECK(!file.empty() && file.find_first_of(L"<>:\"/\\|?*") == std::wstring::npos);
+          // An image is one of the package's known images (verified: image);
+          // a ZIP never is.
+          const KnownImage* known = nullptr;
+          for (const KnownImage& k : p.images)
+            if (md5 == k.md5 && q.size == k.size) known = &k;
+          CHECK_EQ(known != nullptr, kind == "image");
+          if (known) disks.push_back(known->disk);
+          // Same bytes, same name (a transfer resumes across copies); other bytes, another name.
+          if (name_of_md5.count(md5)) CHECK(name_of_md5[md5] == file);
+          if (md5_of_name.count(file)) CHECK_EQ(md5_of_name[file], md5);
+          name_of_md5[md5] = file;
+          md5_of_name[file] = md5;
+          total += q.size;
+        }
+        CHECK_EQ(download_size(d), total);
+        // An image copy is a whole release: one whole-release image, or every
+        // install disk of the package exactly once.
+        if (kind == "image") {
+          std::sort(disks.begin(), disks.end());
+          int n = 0;
+          for (const KnownImage& k : p.images) n = std::max(n, k.disk);
+          std::vector<int> want(size_t(n ? n : 1), 0);
+          for (int i = 0; i < n; i++) want[size_t(i)] = i + 1;
+          CHECK(disks == want);
+        }
       }
     }
     // The Simpsons ZIPs checked on 2026-09-26 (research/win/pkg/sources).
@@ -490,6 +737,46 @@ int main(int argc, char** argv) {
     }
     CHECK_EQ(find_package("ad32")->downloads.size(), size_t(3));
     CHECK_EQ(std::string(find_package("deluxe")->downloads[0].url), std::string(kDeluxeIsoUrl));
+    // Star Wars Screen Entertainment (verified 2026-09-28, research/win/pkg/swse):
+    // the exact ISO, the Redump BIN of the same pressing (both known images),
+    // then a flat ZIP of the disc's files.
+    const Package* sw = find_package("swse");
+    CHECK(sw && sw->downloads.size() == 3 && sw->images.size() == 2);
+    if (sw && sw->downloads.size() == 3 && sw->images.size() == 2) {
+      CHECK_EQ(std::string(sw->downloads[0].md5), std::string("bfa63c1bce15dcbea965dfd7c2ed44e8"));
+      CHECK_EQ(sw->downloads[0].size, uint64_t(7227392));
+      CHECK_EQ(std::string(sw->downloads[1].md5), std::string("ce51614a3484b9269b5ed9e61510e971"));
+      CHECK_EQ(sw->downloads[1].size, uint64_t(9005808));
+      CHECK_EQ(std::string(sw->downloads[2].kind), std::string("zip"));
+      CHECK_EQ(std::string(sw->downloads[2].md5), std::string("c7a4c5322a784a3e88964c5a7f499226"));
+      CHECK_EQ(sw->downloads[2].size, uint64_t(7013137));
+      CHECK_EQ(std::string(sw->images[0].volume_id), std::string("SWSE"));
+      // Not "floppy": the GUI says "disc" for it (the medium is a CD).
+      CHECK(std::string_view(sw->images[0].medium).find("floppy") == std::string_view::npos);
+    }
+    // Star Trek: The Screen Saver (verified 2026-09-29, research/win/pkg/
+    // startrek/importer/sources.json): the two images of item
+    // afterdark-20b_startrek, then those of item
+    // startrektosscreensaver1992win (the same disks as a Windows 9x copy
+    // wrote to them); the four known disk images; "floppy" media, so the GUI
+    // says "disks".
+    const Package* st = find_package("startrek");
+    CHECK(st && st->downloads.size() == 2 && st->images.size() == 4);
+    if (st && st->downloads.size() == 2 && st->images.size() == 4) {
+      const Download &a = st->downloads[0], &b = st->downloads[1];
+      CHECK_EQ(std::string(a.url),
+               std::string("https://archive.org/download/afterdark-20b_startrek/afterdark-20b_startrek_disk1.img"));
+      CHECK_EQ(std::string(a.md5), std::string("28e33608b8d3bafa28585472c4a7a9ac"));
+      CHECK(a.more_images.size() == 1 && std::string(a.more_images[0].md5) == "c630da5f6839303b599947f56fdd7c25");
+      CHECK_EQ(std::string(b.url), std::string("https://archive.org/download/startrektosscreensaver1992win/startrek1.img"));
+      CHECK_EQ(std::string(b.md5), std::string("6ee71b45e32b07001d46ab8c80af589d"));
+      CHECK(b.more_images.size() == 1 && std::string(b.more_images[0].md5) == "af9d29a7ddea2c03618899c1c5733c67");
+      CHECK_EQ(download_size(a), uint64_t(2 * 1474560));
+      for (const KnownImage& k : st->images) {
+        CHECK(k.size == 1474560 && (k.disk == 1 || k.disk == 2));
+        CHECK(std::string_view(k.medium).find("floppy") != std::string_view::npos);
+      }
+    }
   }
 
   // ---- adimport.exe ---------------------------------------------------------------------------
@@ -511,6 +798,9 @@ int main(int argc, char** argv) {
     CHECK_EQ(cli({L"--list-packages", L"--dest", (dir / L"cli-empty").wstring()}, "--list-packages", &out), 0);
     CHECK(out.find("download 2.6 MB (ZIP of the install files)") != std::string::npos);
     CHECK(out.find("download 381.7 MB (disc image)") != std::string::npos);
+    CHECK(out.find("download 6.9 MB (disc image)") != std::string::npos);  // swse
+    CHECK(out.find("  startrek  Star Trek: The Screen Saver    not installed; download 2.8 MB (2 floppy images)") !=
+          std::string::npos);
     CHECK(!fs::exists(dir / L"cli-empty"));
 
     // The built-in manifests are the real ones: the synthetic files need --no-verify.

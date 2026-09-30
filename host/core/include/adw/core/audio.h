@@ -18,9 +18,11 @@ namespace adw::audio {
 
 // Guest time: virtual microseconds on VirtualClock's scale, as a guest clock
 // read would see it at the moment of the call (pe32: rt.clock().now_us();
-// ne16: Runtime16::peek_us()). Never read_us() or any read that nudges time:
-// audio calls must not move the clock. Times passed to one Engine never go
-// backwards; a value earlier than the latest seen is taken as the latest seen.
+// ne16: Runtime16::peek_us(), or for a call a callback or timer procedure
+// makes, the procedure's due time plus what it has run, win16/sound16.hh).
+// Never read_us() or any read that nudges time: audio calls must not move the
+// clock. Times passed to one Engine should not go backwards: a value earlier
+// than the latest seen is taken as the latest seen.
 using Time = uint64_t;
 
 // ---- configuration ----------------------------------------------------------
@@ -192,6 +194,32 @@ class Engine {
   virtual bool song_playing(SongId s, Time t) = 0;
   virtual void close_song(SongId s, Time t) = 0;         // stops; its pending events are dropped
 
+  // Raw MIDI on the MIDI bus: messages the guest sends itself (Win16 midiOut*,
+  // which MEMMIDI sequences from a timer), stamped with t, into the .mid log and
+  // the live synth as song events are. The bus gain applies as it does to songs
+  // (AUDIO.md §6.4): the guest's CC7 is sent scaled, a channel's first message
+  // is preceded by its scaled default CC7 when that differs, and a gain change
+  // re-sends the CC7 of every channel used. (Added after the freeze, AUDIO.md
+  // §5: the bodies here are a disabled engine's, so an Engine written before
+  // them — a lane's test double — still builds. A method added this way must
+  // also be forwarded by host.cc's LaneEngine, which run_host wraps every
+  // lane's engine in: a body here compiles without it, and the lanes' calls
+  // would reach this disabled one.)
+  // midiOutShortMsg's DWORD: status in the low byte, then its data bytes (only
+  // those the status implies are read); a data byte first is running status.
+  virtual void midi_short(uint32_t msg, Time t) {
+    (void)msg;
+    (void)t;
+  }
+  // midiOutLongMsg's buffer: SysEx (F0 … F7), or any stream of MIDI messages.
+  virtual void midi_long(std::span<const uint8_t> bytes, Time t) {
+    (void)bytes;
+    (void)t;
+  }
+  // midiOutReset: note-off for every note the guest left sounding, then sustain
+  // off (CC64 0) and all notes off (CC123) on every channel it has used.
+  virtual void midi_reset(Time t) { (void)t; }
+
   // The guest's device volumes: wave = waveOutSetVolume; midi = midiOutSetVolume, auxSetVolume(1).
   virtual void set_bus_gain(Bus b, Gain g, Time t) = 0;
   virtual Gain bus_gain(Bus b) const = 0;
@@ -202,7 +230,9 @@ class Engine {
   // The time of the earliest event not yet polled; 0 = none.
   virtual Time next_event_time() = 0;
 
-  // Render up to t. run_host calls it after every step; lanes may call it too.
+  // Render up to t. After each step run_host calls it with the step's time,
+  // unless the lane called it during that step (host.cc LaneEngine): a lane
+  // that calls it owns its steps' ends.
   virtual void advance(Time t) = 0;
   // Stop audible output now (QUIT, stdin EOF, ADFRAMES, lane end): live PCM
   // stops, MIDI all-notes-off, captures are finalized. Later calls are accepted

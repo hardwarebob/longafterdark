@@ -1,7 +1,8 @@
 // PKZIP + ZipCrypto + raw inflate (zip.h) and the archive password's
 // derivation from an InstallShield script (PACKAGES.md §8.3, §8.4), on
 // archives from tests/zip_builder.h: round trips, the header check byte,
-// wrong passwords, damaged and foreign archives, hostile names, and the
+// wrong passwords, damaged and foreign archives, hostile names, member names
+// as UTF-8 (bit 11, UTF-8 without it, else code page 437), and the
 // candidate order of the password search.
 #include <memory>
 
@@ -238,6 +239,77 @@ int main(int argc, char** argv) {
     b.add("TWICE.AD", {1});
     b.add("twice.ad", {2});
     CHECK(refused(b.build(), "duplicate names"));
+    // Case outside ASCII too: u-umlaut and U-umlaut are one name to Windows.
+    test::ZipBuilder u;
+    u.add("M\xC3\xBCSIK.AD", {1});
+    u.add("M\xC3\x9CSIK.AD", {2});
+    CHECK(refused(u.build(), "duplicate names, u-umlaut and U-umlaut"));
+    test::ZipBuilder two;
+    two.add("M\xC3\xBCSIK.AD", {1});
+    two.add("M\xC3\xB6SIK.AD", {2});  // o-umlaut: another name
+    CHECK_EQ(ZipArchive(own(two.build()), "T.ZIP").members().size(), size_t(2));
+  }
+
+  // ---- member names: UTF-8, or code page 437 ---------------------------------------------------
+  // Without general-purpose bit 11 a name that is UTF-8 stays UTF-8 (above:
+  // M\xC3\xBCSIK.AD, as ZipBuilder never sets the bit), and any other is code
+  // page 437, as Explorer and 7-Zip on an English Windows write a name that
+  // fits it (0x81 u-umlaut, 0x94 o-umlaut, 0x9A U-umlaut, 0xE0 alpha, 0xA0
+  // a-acute). With the bit, a byte that is not UTF-8 is U+FFFD. Every name
+  // is UTF-8 afterwards.
+  {
+    test::ZipBuilder b;
+    b.password = "";
+    b.add("TREK\x81.IMG", {1}, false, false);
+    b.add("TREK\x94.IMG", {2}, true, false);  // another letter: another name
+    b.add("DISK\x81\x94" "1.IMG", {3}, false, false);
+    b.add("\xE0\xA0.AD", {4}, false, false);  // a UTF-8 sequence cut short: not UTF-8
+    b.add("M\xC3\x9CSIK.AD", {5}, false, false);
+    b.add("FLAG\xC3\xA9.AD", {6}, false, false);
+    b.members.back().extra_flags = 0x800;
+    b.add("FLAG\xFF\x81.AD", {7}, false, false);
+    b.members.back().extra_flags = 0x800;
+    std::unique_ptr<ZipArchive> z;
+    try {
+      z = std::make_unique<ZipArchive>(own(b.build()), "NAMES.ZIP");
+    } catch (const ZipError& e) {
+      fprintf(stderr, "  names: refused, should have been read -> %s\n", e.what());
+    }
+    CHECK(z != nullptr);
+    std::vector<std::string> names;
+    if (z)
+      for (const ZipMember& m : z->members()) {
+        names.push_back(m.name);
+        CHECK(test::strict_utf8(m.name));
+      }
+    CHECK((names == std::vector<std::string>{"TREK\xC3\xBC.IMG", "TREK\xC3\xB6.IMG", "DISK\xC3\xBC\xC3\xB6" "1.IMG",
+                                            "\xCE\xB1\xC3\xA1.AD", "M\xC3\x9CSIK.AD", "FLAG\xC3\xA9.AD",
+                                            "FLAG\xEF\xBF\xBD\xEF\xBF\xBD.AD"}));
+    // The data is found as before: the local header's own name is not read.
+    const ZipMember* o = z ? z->find("TREK\xC3\xB6.IMG") : nullptr;
+    CHECK(o && extract_all(*z, *o, "") == std::vector<uint8_t>{2});
+    // Code page 437's u-umlaut and U-umlaut are one name to Windows; the
+    // message names the second as UTF-8.
+    auto refusal = [&](const std::vector<uint8_t>& archive) {
+      try {
+        ZipArchive(own(archive), "T.ZIP");
+      } catch (const ZipError& e) {
+        fprintf(stderr, "  -> %s\n", e.what());
+        return std::string(e.what());
+      }
+      return std::string("accepted");
+    };
+    test::ZipBuilder pair;
+    pair.add("\x81.AD", {1});
+    pair.add("\x9A.AD", {2});
+    CHECK_EQ(refusal(pair.build()), std::string("T.ZIP: two members are named \xC3\x9C.AD"));
+    // Two flagged names whose bytes differ only where they are not UTF-8 read
+    // alike (U+FFFD), as Windows reads them: one name.
+    test::ZipBuilder bad;
+    bad.add("X\xFF.AD", {1});
+    bad.add("X\xFE.AD", {2});
+    for (auto& m : bad.members) m.extra_flags = 0x800;
+    CHECK_EQ(refusal(bad.build()), std::string("T.ZIP: two members are named X\xEF\xBF\xBD.AD"));
   }
 
   // ---- the password's candidates (§8.4) --------------------------------------------------------

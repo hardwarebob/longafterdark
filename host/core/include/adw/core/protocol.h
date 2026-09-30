@@ -29,6 +29,7 @@ struct Command {
     set,      // SET <idx> <val>         a = idx, b = val
     key,      // KEY <vk> <0|1>          a = Windows virtual-key code, b = down
     caps,     // CAPS <0|1>              a = on
+    numlock,  // NUMLOCK <0|1>           a = on (the Num Lock toggle, as CAPS is Caps Lock's)
     mouse,    // MOUSE <x> <y> <buttons> a = x, b = y, c = button bitmask (frame-local)
     quit,     // QUIT
     eof,      // (synthetic) stdin ended
@@ -37,12 +38,18 @@ struct Command {
   Kind kind = Kind::unknown;
   int32_t a = 0, b = 0, c = 0;
   std::string text;
-  // Input-line number (INTERACTION.md §3.2): KEY, CAPS and MOUSE lines are
-  // numbered 1, 2, 3 ... per process in the order run_host() reads them; 0 for
-  // every other command (and for anything parse_command() returns — the host
-  // assigns it).
+  // Input-line number (INTERACTION.md §3.2): KEY, CAPS, NUMLOCK and MOUSE
+  // lines are numbered 1, 2, 3 ... per process in the order run_host() reads
+  // them; 0 for every other command (and for anything parse_command() returns
+  // — the host assigns it).
   uint64_t seq = 0;
 };
+
+// The input lines: the commands numbered with a seq (above).
+inline bool is_input_line(Command::Kind k) {
+  return k == Command::Kind::key || k == Command::Kind::caps || k == Command::Kind::numlock ||
+         k == Command::Kind::mouse;
+}
 
 // MOUSE button bits (INTERACTION.md §3.2). The old 0/1 keep their meaning.
 inline constexpr uint32_t kMouseLeft = 1, kMouseRight = 2, kMouseMiddle = 4, kMouseButtonMask = 7;
@@ -58,7 +65,8 @@ const char* command_name(Command::Kind k);
 struct InputState {
   std::map<int, int32_t> controls;  // SET / ADCVSET
   std::bitset<256> keys;            // VK down state
-  bool caps = false;
+  bool caps = false;                // CAPS / ADCAPS
+  bool numlock = false;             // NUMLOCK / ADNUMLOCK
   int32_t mouse_x = 0, mouse_y = 0;
   bool mouse_button = false;        // left button (= mouse_buttons & kMouseLeft)
   uint32_t mouse_buttons = 0;       // bitmask: 1 left, 2 right, 4 middle

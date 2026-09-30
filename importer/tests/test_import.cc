@@ -4,7 +4,8 @@
 // lists the modules of exactly the installed tree, a re-import replaces the
 // tree atomically, and failures (bad source, missing engine, cancel,
 // known-file mismatch) leave the previous tree, record and catalog exactly
-// as they were.
+// as they were. And the UTF-8 the records are written in: winutil.h's test
+// and repair of it against Windows' own decoder, and json_escape.
 #include <phosg/JSON.hh>
 
 #include <functional>
@@ -15,6 +16,7 @@
 #include "fixture.h"
 #include "importer.h"
 #include "md5.h"
+#include "minijson.h"
 #include "module_builder.h"
 
 using namespace adw::import;
@@ -530,6 +532,7 @@ int main(int argc, char** argv) {
     std::string msvc = test::build_pe(pe);
     test::NeSpec ne;
     ne.module_refs = {"KERNEL", "ADXPL300"};
+    ne.exports = {"MODULE"};
     ne.resources = {{2000, "", 20, std::string("Synthetic Three") + '\0'},
                     {1000, "", 1, test::popup_record("Mode", {"A", "B"}, 1)}};
     std::string classic = test::build_ne(ne);
@@ -697,6 +700,93 @@ int main(int argc, char** argv) {
     test::set_env(L"LOCALAPPDATA", localappdata);
     test::sandbox_data_root(lad);
     CHECK(!fs::exists(lad) && !fs::exists(other));
+  }
+
+  // ---- the records are UTF-8 whatever they are given ---------------------------
+  // winutil.h's utf8_sequence_length draws the line Windows' strict decoder
+  // draws: every string of one or two bytes, every three-byte string that
+  // starts past 0xBF, four-byte strings around every edge. to_valid_utf8
+  // keeps UTF-8 as it is and makes U+FFFD of every other byte; json_escape
+  // (every string of import.json) writes what phosg reads back as the input,
+  // or as the input so repaired, and never a byte that is not UTF-8.
+  {
+    auto hex = [](const std::string& s) {
+      std::string h;
+      char b[4];
+      for (unsigned char c : s) snprintf(b, sizeof(b), "%02x", c), h += b;
+      return h;
+    };
+    size_t tried = 0, differ = 0;
+    auto against_windows = [&](const std::string& s) {
+      tried++;
+      if (is_utf8(s) != test::strict_utf8(s) && differ++ < 10)
+        fprintf(stderr, "  is_utf8(%s) differs from Windows' decoder\n", hex(s).c_str());
+    };
+    for (int a = 0; a < 256; a++) {
+      against_windows(std::string(1, char(a)));
+      for (int b2 = 0; b2 < 256; b2++) {
+        against_windows({char(a), char(b2)});
+        if (a >= 0xC0)
+          for (int c = 0; c < 256; c++) against_windows({char(a), char(b2), char(c)});
+        if (a >= 0xF0)
+          for (int c : {0x00, 0x7F, 0x80, 0x9F, 0xA0, 0xBF, 0xC0, 0xFF})
+            for (int d : {0x00, 0x7F, 0x80, 0x8F, 0x90, 0xBF, 0xC0, 0xFF}) against_windows({char(a), char(b2), char(c), char(d)});
+      }
+    }
+    fprintf(stderr, "  UTF-8: %zu strings against Windows' decoder, %zu differ\n", tried, differ);
+    CHECK(tried > 4000000);
+    CHECK_EQ(differ, size_t(0));
+    // The edges one by one: the first and last code point of each length,
+    // around the surrogates; overlong forms, surrogates, past U+10FFFF, bytes
+    // that never start a sequence, a sequence cut short — also where the
+    // string ends inside a sequence whose next bytes lie just past it.
+    struct Edge {
+      std::string_view bytes;
+      size_t length;
+    };
+    for (const Edge& e : std::initializer_list<Edge>{
+             {"\x7F", 1}, {"\xC2\x80", 2}, {"\xDF\xBF", 2}, {"\xE0\xA0\x80", 3}, {"\xED\x9F\xBF", 3}, {"\xEE\x80\x80", 3},
+             {"\xEF\xBF\xBF", 3}, {"\xF0\x90\x80\x80", 4}, {"\xF4\x8F\xBF\xBF", 4}, {"\xC0\xAF", 0}, {"\xC1\xBF", 0},
+             {"\xE0\x9F\xBF", 0}, {"\xED\xA0\x80", 0}, {"\xF0\x8F\xBF\xBF", 0}, {"\xF4\x90\x80\x80", 0},
+             {"\xF5\x80\x80\x80", 0}, {"\x80", 0}, {"\xFF", 0}, {"\xE2\x82", 0}, {"\xC3\x28", 0},
+             {std::string_view("\xE2\x82\xAC", 2), 0}, {std::string_view("\xF0\x9F\x98\x80", 3), 0},
+             {std::string_view("\xC3\xBC", 1), 0}}) {
+      if (utf8_sequence_length(e.bytes, 0) != e.length) {
+        test::g_failures++;
+        fprintf(stderr, "  utf8_sequence_length(%s) = %zu, not %zu\n", hex(std::string(e.bytes)).c_str(),
+                utf8_sequence_length(e.bytes, 0), e.length);
+      }
+    }
+    CHECK_EQ(to_valid_utf8("M\xC3\xBCSIK \xE2\x82\xAC \xF0\x9F\x98\x80"), std::string("M\xC3\xBCSIK \xE2\x82\xAC \xF0\x9F\x98\x80"));
+    CHECK_EQ(to_valid_utf8("DISK\x81\x94" "1.IMG"), std::string("DISK\xEF\xBF\xBD\xEF\xBF\xBD" "1.IMG"));
+    // An overlong '/' and a cut sequence: a U+FFFD for each byte, never a '/'.
+    CHECK_EQ(to_valid_utf8("\xC0\xAF\xE2\x82"), std::string("\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD"));
+    CHECK_EQ(json_escape("q\"b\\s\n\r\t\x01\x1F\x7F"), std::string("q\\\"b\\\\s\\n\\r\\t\\u0001\\u001f\x7F"));
+    CHECK_EQ(json_escape("C:\\x.zip!DISK\x81\x94" "1.IMG"), std::string("C:\\\\x.zip!DISK\xEF\xBF\xBD\xEF\xBF\xBD" "1.IMG"));
+    CHECK_EQ(json_escape("TREK\xC3\xBC.IMG"), std::string("TREK\xC3\xBC.IMG"));
+    size_t bad = 0, strings = 0;
+    auto round_trip = [&](const std::string& in) {
+      strings++;
+      const std::string esc = json_escape(in);
+      std::string back = "(no parse)";
+      try {
+        back = phosg::JSON::parse("\"" + esc + "\"").as_string();
+      } catch (const std::exception&) {
+      }
+      const std::string want = test::strict_utf8(in) ? in : to_valid_utf8(in);
+      if ((!test::strict_utf8(esc) || back != want) && bad++ < 10)
+        fprintf(stderr, "  json_escape(%s) = %s\n", hex(in).c_str(), hex(esc).c_str());
+    };
+    for (int a = 0; a < 256; a++) {
+      round_trip(std::string(1, char(a)));
+      for (int b2 = 0; b2 < 256; b2++) round_trip({char(a), char(b2)});
+    }
+    for (uint32_t k = 0; k < 4000; k++) {
+      auto p = test::pattern(1 + k % 40, k);
+      round_trip(std::string(p.begin(), p.end()));
+    }
+    fprintf(stderr, "  json_escape: %zu strings read back, %zu wrong\n", strings, bad);
+    CHECK_EQ(bad, size_t(0));
   }
 
   // ---- the built-in manifest is well formed ----------------------------------

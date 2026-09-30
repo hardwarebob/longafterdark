@@ -26,11 +26,95 @@ namespace {
 // What gathering a frame's input decided.
 enum class Gate { run, quit, stdin_closed };
 
+// The run's audio engine as its lane sees it (LaneContext::audio): every call
+// goes to the engine, and an advance() the lane makes is noted. After a step
+// run_host renders the engine up to the step's time, unless the lane advanced
+// it during the step: that lane owns its steps' ends. The ne16 lane does (its
+// guest time runs ahead of the core clock, and it stops short of a timer
+// period it has not yet delivered to the guest, whose calls are dated at the
+// period's due time: ne16/lane.hh "Sound"), and an advance to the core clock
+// after it could render past such a period — a frame with no delivery point,
+// resumed inside a synchronous sndPlaySound or a retrace-port loop — and
+// bunch the period's notes. The pe32 lane never advances its engine, so
+// run_host renders after each of its steps as before.
+class LaneEngine final : public audio::Engine {
+ public:
+  explicit LaneEngine(std::unique_ptr<audio::Engine> e) : e_(std::move(e)) {}
+  // Around each step (run_frames).
+  void begin_step() { lane_advanced_ = false; }
+  void end_step(audio::Time t) {
+    if (!lane_advanced_) e_->advance(t);
+    lane_advanced_ = false;
+  }
+
+  // Every method of audio::Engine, forwarded (a method audio.h gains must be added here too).
+  const audio::Config& config() const override { return e_->config(); }
+  audio::BufferId create_buffer(const audio::WaveFormat& pcm, uint32_t bytes) override {
+    return e_->create_buffer(pcm, bytes);
+  }
+  void write_buffer(audio::BufferId b, uint32_t offset, std::span<const uint8_t> bytes, audio::Time t) override {
+    e_->write_buffer(b, offset, bytes, t);
+  }
+  void release_buffer(audio::BufferId b) override { e_->release_buffer(b); }
+  const audio::WaveFormat* buffer_format(audio::BufferId b) const override { return e_->buffer_format(b); }
+  uint32_t buffer_size(audio::BufferId b) const override { return e_->buffer_size(b); }
+  audio::VoiceId create_voice(audio::BufferId b, audio::Bus bus) override { return e_->create_voice(b, bus); }
+  void destroy_voice(audio::VoiceId v, audio::Time t) override { e_->destroy_voice(v, t); }
+  void play(audio::VoiceId v, bool loop, audio::Time t) override { e_->play(v, loop, t); }
+  void stop(audio::VoiceId v, audio::Time t) override { e_->stop(v, t); }
+  void set_cursor(audio::VoiceId v, uint32_t byte_offset, audio::Time t) override { e_->set_cursor(v, byte_offset, t); }
+  uint32_t cursor(audio::VoiceId v, audio::Time t) override { return e_->cursor(v, t); }
+  bool playing(audio::VoiceId v, audio::Time t) override { return e_->playing(v, t); }
+  bool looping(audio::VoiceId v, audio::Time t) override { return e_->looping(v, t); }
+  audio::Time end_time(audio::VoiceId v, audio::Time t) override { return e_->end_time(v, t); }
+  void set_gain(audio::VoiceId v, audio::Gain g, audio::Time t) override { e_->set_gain(v, g, t); }
+  void set_rate(audio::VoiceId v, uint32_t hz, audio::Time t) override { e_->set_rate(v, hz, t); }
+  uint32_t rate(audio::VoiceId v) const override { return e_->rate(v); }
+  audio::StreamId open_stream(const audio::WaveFormat& pcm, audio::Bus bus, audio::Time t) override {
+    return e_->open_stream(pcm, bus, t);
+  }
+  void stream_write(audio::StreamId s, std::span<const uint8_t> bytes, uint64_t cookie, audio::Time t) override {
+    e_->stream_write(s, bytes, cookie, t);
+  }
+  void stream_pause(audio::StreamId s, audio::Time t) override { e_->stream_pause(s, t); }
+  void stream_restart(audio::StreamId s, audio::Time t) override { e_->stream_restart(s, t); }
+  void stream_reset(audio::StreamId s, audio::Time t) override { e_->stream_reset(s, t); }
+  uint64_t stream_position(audio::StreamId s, audio::Time t) override { return e_->stream_position(s, t); }
+  bool stream_paused(audio::StreamId s) const override { return e_->stream_paused(s); }
+  void set_stream_gain(audio::StreamId s, audio::Gain g, audio::Time t) override { e_->set_stream_gain(s, g, t); }
+  void close_stream(audio::StreamId s, audio::Time t) override { e_->close_stream(s, t); }
+  audio::SongId load_song(std::span<const uint8_t> smf, std::string* error) override { return e_->load_song(smf, error); }
+  void song_play(audio::SongId s, audio::Time t) override { e_->song_play(s, t); }
+  void song_stop(audio::SongId s, audio::Time t) override { e_->song_stop(s, t); }
+  void song_seek(audio::SongId s, uint64_t position_us, audio::Time t) override { e_->song_seek(s, position_us, t); }
+  uint64_t song_position(audio::SongId s, audio::Time t) override { return e_->song_position(s, t); }
+  uint64_t song_length(audio::SongId s) const override { return e_->song_length(s); }
+  bool song_playing(audio::SongId s, audio::Time t) override { return e_->song_playing(s, t); }
+  void close_song(audio::SongId s, audio::Time t) override { e_->close_song(s, t); }
+  void midi_short(uint32_t msg, audio::Time t) override { e_->midi_short(msg, t); }
+  void midi_long(std::span<const uint8_t> bytes, audio::Time t) override { e_->midi_long(bytes, t); }
+  void midi_reset(audio::Time t) override { e_->midi_reset(t); }
+  void set_bus_gain(audio::Bus b, audio::Gain g, audio::Time t) override { e_->set_bus_gain(b, g, t); }
+  audio::Gain bus_gain(audio::Bus b) const override { return e_->bus_gain(b); }
+  void poll(audio::Time t, std::vector<audio::Event>& out) override { e_->poll(t, out); }
+  audio::Time next_event_time() override { return e_->next_event_time(); }
+  void advance(audio::Time t) override {
+    lane_advanced_ = true;
+    e_->advance(t);
+  }
+  void shutdown(audio::Time t) override { e_->shutdown(t); }
+  audio::Stats stats() const override { return e_->stats(); }
+
+ private:
+  std::unique_ptr<audio::Engine> e_;
+  bool lane_advanced_ = false;
+};
+
 // The loop after a successful init: input gating, step, present, pace. Fills
 // in `r` as it goes, so an exception escaping it leaves an accurate count.
 using Publish = std::function<void(uint64_t frames, uint64_t input_applied)>;
 
-void run_frames(Lane& lane, LaneContext& ctx, InputState& input, const Env& env, HostIo& io,
+void run_frames(Lane& lane, LaneContext& ctx, LaneEngine& audio, InputState& input, const Env& env, HostIo& io,
                 HostResult& r, const Publish& publish) {
   Screen& screen = ctx.screen;
   VirtualClock& clock = ctx.clock;
@@ -57,18 +141,15 @@ void run_frames(Lane& lane, LaneContext& ctx, InputState& input, const Env& env,
     }
   }
 
-  // Input lines (INTERACTION.md §3.2). Each KEY/CAPS/MOUSE gets the next
-  // sequence number as it is read. A release whose down no completed step has
-  // seen yet is held, with every input line after it (order is kept), and
+  // Input lines (INTERACTION.md §3.2). Each KEY/CAPS/NUMLOCK/MOUSE gets the
+  // next sequence number as it is read. A release whose down no completed step
+  // has seen yet is held, with every input line after it (order is kept), and
   // applied right after the next step, so a tap batched into one GO still
   // shows "down" to pollers for exactly one step.
   uint64_t next_seq = 0;
   std::deque<Command> held;
   std::bitset<256> key_down_unseen;
   uint32_t mouse_down_unseen = 0;
-  auto is_input = [](Command::Kind k) {
-    return k == Command::Kind::key || k == Command::Kind::caps || k == Command::Kind::mouse;
-  };
   auto must_hold = [&](const Command& c) {
     if (c.kind == Command::Kind::key)
       return c.b == 0 && c.a >= 0 && c.a < 256 && key_down_unseen.test(size_t(c.a));
@@ -125,7 +206,7 @@ void run_frames(Lane& lane, LaneContext& ctx, InputState& input, const Env& env,
         }
         return Handled::more;
       default: {
-        if (!is_input(c.kind)) {  // SET: not an input line, never held
+        if (!is_input_line(c.kind)) {  // SET: not an input line, never held
           apply_input(c);
           return Handled::more;
         }
@@ -208,10 +289,12 @@ void run_frames(Lane& lane, LaneContext& ctx, InputState& input, const Env& env,
 
     clock.begin_frame();
     const uint64_t applied_before_step = input.input_seq;
+    audio.begin_step();
     StepResult sr = lane.step();
     // The audio engine renders (and the live sinks get) everything up to the
-    // end of this step's virtual time.
-    if (ctx.audio) ctx.audio->advance(clock.now_us());
+    // end of this step's virtual time — unless the lane advanced it itself
+    // during the step (LaneEngine).
+    audio.end_step(clock.now_us());
     if (sr == StepResult::failed) {
       r.exit_code = kExitError;
       r.reason = "lane step failed";
@@ -266,17 +349,18 @@ void run_frames(Lane& lane, LaneContext& ctx, InputState& input, const Env& env,
   }
 }
 
-// The run's audio engine. It stays alive until the process exits: a lane is
-// destroyed after run_host returns, and its destructor may still release
-// voices or songs, which a shut-down engine accepts silently.
-audio::Engine& start_audio(const Env& env) {
+// The run's audio engine, as its lane sees it (LaneEngine). It stays alive
+// until the process exits: a lane is destroyed after run_host returns, and its
+// destructor may still release voices or songs, which a shut-down engine
+// accepts silently.
+LaneEngine& start_audio(const Env& env) {
   static std::mutex mu;
-  static std::vector<std::unique_ptr<audio::Engine>> engines;
+  static std::vector<std::unique_ptr<LaneEngine>> engines;
   std::vector<std::string> warnings;
   audio::Config cfg = audio::Config::from_env(env, &warnings);
   for (const std::string& w : warnings) log("%s", w.c_str());
-  std::unique_ptr<audio::Engine> made = audio::make_engine(cfg);
-  audio::Engine& e = *made;
+  auto made = std::make_unique<LaneEngine>(audio::make_engine(cfg));
+  LaneEngine& e = *made;
   {
     std::lock_guard<std::mutex> lock(mu);
     engines.push_back(std::move(made));
@@ -321,6 +405,7 @@ int configure_module(Lane& lane, const std::string& module_path, const Env& env,
       InputState input;
       for (const auto& [idx, val] : env.cvset) input.controls[idx] = val;
       input.caps = env.caps_at_start;
+      input.numlock = env.numlock_at_start;
       // Dialogs run on the real clock: a module's timers must tick while the
       // user looks at its dialog.
       VirtualClock clock(VirtualClock::Mode::realtime, 33333);
@@ -363,8 +448,10 @@ HostResult run_host(Lane& lane, const std::string& module_path, const Env& env, 
   InputState input;
   for (const auto& [idx, val] : env.cvset) input.controls[idx] = val;
   // ADCAPS: modules latch the Caps Lock toggle when they are created
-  // (INTERACTION.md §1.2), so it must be in place before init.
+  // (INTERACTION.md §1.2), so it must be in place before init; ADNUMLOCK the
+  // same for Num Lock's (Final Exam starts its exam when it changes).
   input.caps = env.caps_at_start;
+  input.numlock = env.numlock_at_start;
 
   // Headless time is a pure function of the frame number; stream time follows
   // the wall clock so on-screen clocks and timed animations run at true speed.
@@ -372,7 +459,7 @@ HostResult run_host(Lane& lane, const std::string& module_path, const Env& env, 
                      33333, io.wall_us);
   LaneContext ctx{env, screen, clock, input};
   // The audio engine (AUDIO.md §3): disabled unless ADSOUND=1 or ADAUDIOOUT.
-  audio::Engine& engine = start_audio(env);
+  LaneEngine& engine = start_audio(env);
   ctx.audio = &engine;
   bool started = false;
   try {
@@ -411,7 +498,7 @@ HostResult run_host(Lane& lane, const std::string& module_path, const Env& env, 
 
   try {
     publish(0, input.input_seq);
-    run_frames(lane, ctx, input, env, io, r, publish);
+    run_frames(lane, ctx, engine, input, env, io, r, publish);
   } catch (...) {
     // Almost always the lane (step / on_command); bad_alloc while encoding a
     // huge frame lands here too, so the message does not assume.

@@ -15,14 +15,20 @@
 #include <utility>
 
 #include "adw/core/data_root.h"
+#include "arj.h"
 #include "cancel.h"
 #include "catalog.h"
 #include "covers_internal.h"
 #include "download.h"
 #include "install.h"
+#include "kwaj.h"
+#include "loader/image.hh"
+#include "loader/ne.hh"
 #include "md5.h"
+#include "minijson.h"
 #include "names.h"
 #include "source.h"
+#include "szdd.h"
 #include "winutil.h"
 #include "zip.h"
 
@@ -132,7 +138,7 @@ std::string join(const std::string& a, const std::string& b) { return a.empty() 
 
 struct Identified {
   const Package* pkg = nullptr;
-  SourceNode dir;        // tree: the FILES dir; ad3zip: the install dir
+  SourceNode dir;        // tree: the FILES dir; ad3zip and intermission: the install dir
   std::string dir_path;  // its path in the source ("ADE/FILES", "INSTALL", "")
 };
 
@@ -177,6 +183,137 @@ std::optional<Identified> install_location(const SourceFs& fs) {
   return std::nullopt;
 }
 
+// Presage's INSTALL.DAT is a small text file: the real one is 3.6 KB.
+constexpr uint64_t kMaxInstallDat = 64 * 1024;
+
+// The value of `key` in `[section]` of an INI-style text (Windows-1252; keys
+// and section names compared without case; both sides trimmed); nullopt
+// when there is none.
+std::optional<std::string> ini_value(const std::vector<uint8_t>& text, std::string_view section,
+                                     std::string_view key) {
+  auto trim = [](std::string_view v) {
+    while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.remove_prefix(1);
+    while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.remove_suffix(1);
+    return v;
+  };
+  std::string_view all(reinterpret_cast<const char*>(text.data()), text.size());
+  bool in_section = false;
+  while (!all.empty()) {
+    size_t eol = all.find_first_of("\r\n");
+    std::string_view line = trim(all.substr(0, eol));
+    all.remove_prefix(eol == std::string_view::npos ? all.size() : eol + 1);
+    if (line.empty() || line.front() == ';') continue;
+    if (line.front() == '[') {
+      size_t close = line.find(']');
+      in_section = close != std::string_view::npos && iequals(trim(line.substr(1, close - 1)), section);
+      continue;
+    }
+    size_t eq = line.find('=');
+    if (in_section && eq != std::string_view::npos && iequals(trim(line.substr(0, eq)), key))
+      return std::string(trim(line.substr(eq + 1)));
+  }
+  return std::nullopt;
+}
+
+// intermission: the [data] shortname of the Presage installer script at the
+// source's root (the CD copy of the install disks, disk 1 itself, a flat ZIP
+// or a copy of one). Only a plain file of plausible size is read, so a large
+// unrelated INSTALL.DAT is simply no match.
+std::optional<std::string> presage_shortname(const SourceFs& fs) {
+  auto n = fs.child(fs.root(), "INSTALL.DAT");
+  if (!n || n->is_dir || n->size > kMaxInstallDat) return std::nullopt;
+  return ini_value(fs.read_all(*n, kMaxInstallDat), "data", "shortname");
+}
+
+// Microsoft Setup's SETUP.LST is a small text file: the real one is 654 bytes.
+constexpr uint64_t kMaxSetupLst = 64 * 1024;
+
+// ad2kwaj: the [Params] WndTitle of the Microsoft Setup file list at the
+// source's root (install disk 1 itself, a copy of it, or the disks together),
+// in Windows-1252 as the file holds it ("Star Trek\xAE: The Screen Saver").
+// Its CmdLine is not used: it is the same for every Berkeley After Dark 2.0
+// setup. Only a plain file of plausible size is read.
+std::optional<std::string> mssetup_title(const SourceFs& fs) {
+  auto n = fs.child(fs.root(), "SETUP.LST");
+  if (!n || n->is_dir || n->size > kMaxSetupLst) return std::nullopt;
+  return ini_value(fs.read_all(*n, kMaxSetupLst), "Params", "WndTitle");
+}
+
+// What the images' md5s say (PACKAGES.md §3, step 1): the package a known
+// image names — one whole-release image, or install disks of a release on
+// several — and whether that is the whole release.
+struct ImageMatch {
+  const Package* pkg = nullptr;
+  // One whole-release image; or several images that are every install disk
+  // of `pkg` exactly once (either copy of a disk alike), and nothing else.
+  bool complete = false;
+  // Several images among which is every install disk of `pkg` (not
+  // `complete`: other images besides — a second copy of a disk, an unknown
+  // image).
+  bool every_disk = false;
+  std::vector<int> disks;  // the install disks among them, sorted
+};
+
+// A package's install disks (0 for a release on one image).
+int disk_count(const Package& p) {
+  int n = 0;
+  for (const KnownImage& k : p.images) n = std::max(n, k.disk);
+  return n;
+}
+
+ImageMatch by_image(std::span<const Package> registry, const std::vector<ImagePart>& parts) {
+  ImageMatch m;
+  auto known = [&](const ImagePart& q) -> std::pair<const Package*, const KnownImage*> {
+    for (const Package& p : registry)
+      for (const KnownImage& k : p.images)
+        if (q.md5 == k.md5) return {&p, &k};
+    return {nullptr, nullptr};
+  };
+  if (parts.size() == 1) {
+    auto [p, k] = known(parts.front());
+    if (!p) return m;
+    m.pkg = p;
+    m.complete = k->disk == 0;
+    if (k->disk) m.disks.push_back(k->disk);
+    return m;
+  }
+  // Several images: a whole-release image among them names nothing (as
+  // before disk sets), and neither does an unknown one; install disks of one
+  // package do, complete only as its whole set.
+  bool only_disks = !parts.empty();
+  for (const ImagePart& q : parts) {
+    auto [p, k] = known(q);
+    if (!p || !k->disk) {
+      only_disks = false;
+      continue;
+    }
+    if (m.pkg && m.pkg != p) return {};  // two releases (run_import refuses them before)
+    m.pkg = p;
+    m.disks.push_back(k->disk);
+  }
+  if (!m.pkg) return m;
+  std::sort(m.disks.begin(), m.disks.end());
+  const int n = disk_count(*m.pkg);
+  bool each_once = int(m.disks.size()) == n;
+  for (int i = 0; each_once && i < n; i++) each_once = m.disks[size_t(i)] == i + 1;
+  m.complete = only_disks && each_once;
+  // Disk numbers run 1..n, so n distinct ones are every disk.
+  std::vector<int> distinct = m.disks;
+  distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
+  m.every_disk = int(distinct.size()) == n;
+  return m;
+}
+
+// "install disk 2 of 2", "install disks 1 and 3 of 4"; `disks` sorted (both
+// copies of a disk are that disk).
+std::string disks_text(std::vector<int> disks, int of) {
+  disks.erase(std::unique(disks.begin(), disks.end()), disks.end());
+  std::string s = disks.size() == 1 ? "install disk " : "install disks ";
+  for (size_t i = 0; i < disks.size(); i++)
+    s += (i == 0 ? "" : i + 1 == disks.size() ? " and " : ", ") + std::to_string(disks[i]);
+  return s + " of " + std::to_string(of);
+}
+
 std::shared_ptr<ZipArchive> load_zip(const SourceFs& fs, const SourceNode& n, const std::string& where) {
   auto data = std::make_shared<std::vector<uint8_t>>(fs.read_all(n, 64ull << 20));
   try {
@@ -186,7 +323,9 @@ std::shared_ptr<ZipArchive> load_zip(const SourceFs& fs, const SourceNode& n, co
   }
 }
 
-Identified identify(const SourceFs& fs, std::span<const Package> registry, const std::string& image_md5,
+// `image`: what the source's images' md5s say (by_image; nothing for a
+// folder); `images`: how many there are (for the wording).
+Identified identify(const SourceFs& fs, std::span<const Package> registry, const ImageMatch& image, size_t images,
                     const std::string& want) {
   std::vector<Identified> matches;
   auto inst = install_location(fs);
@@ -195,27 +334,56 @@ Identified identify(const SourceFs& fs, std::span<const Package> registry, const
     // Central-directory names are not encrypted: no password needed here.
     modmisc = load_zip(fs, *fs.child(inst->dir, "MODMISC.ZIP"), inst->dir_path);
   }
+  auto uses = [&](Recipe r) {
+    return std::any_of(registry.begin(), registry.end(), [r](const Package& p) { return p.recipe == r; });
+  };
+  std::optional<std::string> shortname, setup_title;
+  if (uses(Recipe::intermission)) shortname = presage_shortname(fs);
+  if (uses(Recipe::ad2kwaj)) setup_title = mssetup_title(fs);
   for (const Package& p : registry) {
     if (p.recipe == Recipe::tree) {
       if (auto loc = tree_location(fs, p)) matches.push_back(std::move(*loc));
+    } else if (p.recipe == Recipe::intermission) {
+      // The script names the product; its first archive (disk 1's) must be
+      // beside it.
+      if (!shortname || !p.install_name || !iequals(*shortname, p.install_name) || p.required_archives.empty())
+        continue;
+      SourceNode root = fs.root();
+      auto first = fs.child(root, p.required_archives[0]);
+      if (first && !first->is_dir) matches.push_back(Identified{&p, std::move(root), ""});
+    } else if (p.recipe == Recipe::ad2kwaj) {
+      // The setup window's title names the product; disk 1's tag file must
+      // be beside SETUP.LST.
+      if (!setup_title || !p.setup_title || !iequals(*setup_title, p.setup_title) || p.required_archives.empty())
+        continue;
+      SourceNode root = fs.root();
+      auto first = fs.child(root, p.required_archives[0]);
+      if (first && !first->is_dir) matches.push_back(Identified{&p, std::move(root), ""});
     } else if (inst && modmisc && p.engine_dll && modmisc->find(p.engine_dll)) {
       Identified id = *inst;
       id.pkg = &p;
       matches.push_back(std::move(id));
     }
   }
-  const Package* by_md5 = nullptr;
-  if (!image_md5.empty())
-    for (const Package& p : registry)
-      for (const KnownImage& k : p.images)
-        if (image_md5 == k.md5) by_md5 = &p;
+  const Package* by_md5 = image.pkg;
   const Package* wanted = want.empty() ? nullptr : find_package(want, registry);
   if (by_md5) {
+    const bool one = images <= 1;
     if (wanted && wanted != by_md5)
-      invalid("this image is " + std::string(by_md5->title) + " (by its md5), not " + wanted->title);
+      invalid(std::string(one ? "this image is " : "these images are ") + by_md5->title +
+              (one ? " (by its md5)" : " (by their md5s)") + ", not " + wanted->title);
+    // Its contents make it that release; an incomplete set of its install
+    // disks too, and the recipe then says which disk is missing.
     for (Identified& m : matches)
       if (m.pkg == by_md5) return std::move(m);
-    invalid("the image has the md5 of " + std::string(by_md5->title) + " but not its contents");
+    if (!image.complete) {
+      const std::string disks = disks_text(image.disks, disk_count(*by_md5));
+      invalid(std::string(one ? "this image is " : "these images hold ") + disks + " of " + by_md5->title +
+              (one ? " (by its md5)" : " (by their md5s) but not the rest of it") +
+              "; import every disk together (--image … --image …, or the ZIP they came in)");
+    }
+    invalid(std::string(one ? "the image has the md5 of " : "the images have the md5s of ") + by_md5->title +
+            " but not its contents");
   }
   if (wanted) {
     std::vector<Identified> keep;
@@ -228,7 +396,7 @@ Identified identify(const SourceFs& fs, std::span<const Package> registry, const
       invalid("the source is not " + std::string(wanted->title) + (others.empty() ? "" : " (it looks like " + others + ")"));
     matches = std::move(keep);
   }
-  if (matches.empty()) invalid("not a known After Dark disc; known: " + known_releases(registry));
+  if (matches.empty()) invalid("not a known release; known: " + known_releases(registry));
   if (matches.size() > 1) {
     std::string names;
     for (auto& m : matches) names += std::string(names.empty() ? "" : " and ") + m.pkg->title;
@@ -242,7 +410,7 @@ Identified identify(const SourceFs& fs, std::span<const Package> registry, const
 const Package* identify_folder(const fs::path& dir, std::string* why, std::span<const Package> registry) {
   try {
     auto src = open_folder(dir);
-    return identify(*src, registry_or_builtin(registry), "", "").pkg;
+    return identify(*src, registry_or_builtin(registry), ImageMatch{}, 0, "").pkg;
   } catch (const std::exception& e) {
     if (why) *why = e.what();
     return nullptr;
@@ -272,6 +440,49 @@ constexpr const char* kNeverBesideModules[] = {"AD_SND.DLL", "OLDMOD16.DLL", "OL
 // module tasker (the AD palettes), the host and its INI (kept for later), and
 // EcoLogic. The rest is the AD 3.x host's own machinery.
 constexpr const char* kEngineMembers[] = {"AD_SND.DLL", "ADTASK.DLL", "ADW30.EXE", "ADW30.INI", "ECOLOGIC.DLL"};
+
+// intermission: the archive members that go to <root>\ENGINE (the guest's
+// C:\WINDOWS\SYSTEM): Intermission itself (replaced by the host, kept for
+// reference) and its IMX reader.
+constexpr const char* kIntermissionEngine[] = {"INTERMIS.EXE", "IMIMXPLY.IMQ"};
+
+// intermission: Intermission's own members the modules never use, listed but
+// never decoded — the readers of other products' formats (among them the
+// After Dark reader IMAD_PLY.IMQ and its sound support AD_SND.DLL, which on
+// any search path would break the After Dark bridge), the IMXX_IWR
+// extension library and the help file.
+bool intermission_skips(const std::string& upper) {
+  return (ends_with_i(upper, ".IMQ") && upper != "IMIMXPLY.IMQ") || upper == "AD_SND.DLL" || upper == "IWLIB.DLL" ||
+         ends_with_i(upper, ".HLP");
+}
+
+// intermission (as ad3zip): a source that lacks an install disk is not the
+// whole release.
+[[noreturn]] void needs_every_disk(const Package& p, const std::string& missing) {
+  invalid("the source is missing " + missing + "; importing " + p.title + " needs every install disk");
+}
+
+// Libraries the 16-bit lane supplies itself, beyond the catalog's system
+// list: what the DLLs beside the Intermission and After Dark 2.0 modules may
+// import without shipping (STRESS.DLL imports TOOLHELP; INTERMIS.EXE
+// LZEXPAND; WinG VER).
+bool lane16_system_dll(const std::string& upper) {
+  return is_system_dll(upper) || upper == "TOOLHELP" || upper == "LZEXPAND" || upper == "VER" || upper == "WING";
+}
+
+// A staged file whole (for a header check), at most 64 MB; nullopt when it
+// cannot be read.
+std::optional<std::string> read_staged(const fs::path& p) {
+  Handle h(CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN,
+                       nullptr));
+  LARGE_INTEGER size{};
+  if (!h.valid() || !GetFileSizeEx(h.get(), &size) || size.QuadPart > (64ll << 20)) return std::nullopt;
+  std::string data(size_t(size.QuadPart), '\0');
+  DWORD got = 0;
+  if (!data.empty() && (!ReadFile(h.get(), data.data(), DWORD(data.size()), &got, nullptr) || got != data.size()))
+    return std::nullopt;
+  return data;
+}
 
 class Importer {
  public:
@@ -306,18 +517,26 @@ class Importer {
   // so a source that lists far more than any release is refused before a
   // byte is written and before the plan itself grows large.
   void add(Planned p) {
-    std::string key = ascii_upper(p.rel);
+    // Two paths Windows takes for one file (code page 437's letters fold too:
+    // names.h) are a source that cannot be installed as it is, found here
+    // rather than when the second file cannot be created.
+    std::string key = name_key(p.rel);
     if (!seen_.insert(key).second) throw ImportError(Status::source_invalid, "two source files map to " + p.rel);
     if (plan_.size() >= o_.max_files)
       invalid("the source lists more than " + std::to_string(o_.max_files) +
-              " files to copy; no After Dark release has that many (a damaged or crafted source?)");
-    if (p.size > o_.max_bytes - std::min(planned_bytes_, o_.max_bytes))
-      invalid("the source's files add up to more than " +
-              (o_.max_bytes % (1 << 20) ? std::to_string(o_.max_bytes) + " bytes"
-                                        : std::to_string(o_.max_bytes >> 20) + " MB") +
-              " (at " + p.from + "); no After Dark release is that large (a damaged or crafted source?)");
+              " files to copy; no known release has that many (a damaged or crafted source?)");
+    if (p.size > budget_left()) over_budget(p.from);
     planned_bytes_ += p.size;
     plan_.push_back(std::move(p));
+  }
+
+  // The bytes the staging budget (ImportOptions::max_bytes) still allows.
+  uint64_t budget_left() const { return o_.max_bytes - std::min(planned_bytes_, o_.max_bytes); }
+  [[noreturn]] void over_budget(const std::string& at) const {
+    invalid("the source's files add up to more than " +
+            (o_.max_bytes % (1 << 20) ? std::to_string(o_.max_bytes) + " bytes"
+                                      : std::to_string(o_.max_bytes >> 20) + " MB") +
+            " (at " + at + "); no known release is that large (a damaged or crafted source?)");
   }
 
   // ---- recipe "tree": copy the FILES dir's copy dirs byte for byte ----
@@ -442,11 +661,188 @@ class Importer {
     }
   }
 
+  // ---- recipe "intermission": Presage's installer, flattened (PACKAGES.md) ----
+  // The archives' members go to the module folder M, but for Intermission
+  // itself and its IMX reader (E = ENGINE) and the members the modules never
+  // use; the loose files (the registry's, from INSTALL.DAT) go where the
+  // registry says, SZDD ones expanded. Only INSTALL.DAT (read to identify),
+  // the archives and the loose files are ever opened (I5).
+  void plan_intermission(const SourceFs& fs, const Identified& id) {
+    const Package& p = *pkg_;
+    const std::string M = root_ + "/" + p.module_dir, E = root_ + "/ENGINE";
+    std::string missing;
+    for (const char* a : p.required_archives) {
+      auto n = fs.child(id.dir, a);
+      if (!n || n->is_dir) missing += std::string(missing.empty() ? "" : ", ") + a;
+    }
+    if (!missing.empty()) needs_every_disk(p, missing);
+
+    // Each archive is the chain of volumes that starts at one of the
+    // registry's .ARJ names, followed for as long as a volume's main header
+    // says another one follows (X.ARJ, X.A01, X.A02, ...) — and only through
+    // the registry's archives: a volume that says it goes on to one the
+    // registry does not list (SWSE2.A03 naming a SWSE2.A04) is damaged or
+    // foreign, and the file it names is never opened (I5), whether or not
+    // the source has one.
+    auto listed = [&](std::string_view name) {
+      for (const char* a : p.required_archives)
+        if (iequals(name, a)) return true;
+      return false;
+    };
+    std::vector<std::shared_ptr<const ArjArchive>> archives;
+    for (const char* first : p.required_archives) {
+      if (!ends_with_i(first, ".ARJ")) continue;
+      std::vector<ArjVolume> volumes;
+      std::string name = first;
+      for (;;) {
+        auto n = fs.child(id.dir, name);
+        if (!n || n->is_dir) needs_every_disk(p, name);
+        const std::string where = join(id.dir_path, n->name);
+        auto data = std::make_shared<std::vector<uint8_t>>(fs.read_all(*n, 64ull << 20));
+        bool more = false;
+        try {
+          more = arj_continues(*data, where);
+        } catch (const ArjError& e) {
+          invalid(e.what());
+        }
+        volumes.push_back({where, std::move(data)});
+        if (!more) break;
+        auto next = arj_next_volume(n->name);
+        if (!next) invalid(where + " continues on another volume, but ARJ names none after it");
+        if (!listed(*next))
+          invalid(where + " says the archive continues on " + *next + ", which is not one of " + p.title +
+                  "'s install disks (a damaged or foreign volume?)");
+        name = *next;
+      }
+      try {
+        archives.push_back(std::make_shared<const ArjArchive>(std::move(volumes)));
+      } catch (const ArjError& e) {
+        invalid(e.what());  // a damaged archive is a corrupt source, never a verify failure
+      }
+    }
+    // Any other archive on the source is not the release's (never opened).
+    for (const SourceNode& n : fs.list(id.dir)) {
+      if (n.is_dir || !ends_with_i(n.name, ".ARJ")) continue;
+      if (!listed(n.name)) log("skipped " + join(id.dir_path, n.name) + " (not in the recipe of " + p.title + ")");
+    }
+
+    std::string skipped;
+    for (const auto& a : archives) {
+      for (const ArjMember& m : a->members()) {
+        const std::string upper = ascii_upper(m.name);
+        if (intermission_skips(upper)) {
+          skipped += std::string(skipped.empty() ? "" : ", ") + m.volumes + "!" + m.name;
+          continue;
+        }
+        bool engine = false;
+        for (const char* e : kIntermissionEngine) engine = engine || upper == e;
+        Planned pl;
+        pl.rel = (engine ? E : M) + "/" + upper;
+        pl.size = m.size;
+        pl.from = m.volumes + "!" + m.name;
+        std::shared_ptr<const ArjArchive> arc = a;
+        const ArjMember* member = &m;  // the archive's member list never changes
+        pl.read = [arc, member](const Sink& sink) {
+          try {
+            arc->extract(*member, sink);
+          } catch (const ArjError& e) {
+            invalid(e.what());  // a damaged member is a corrupt source, never a verify failure
+          }
+        };
+        if (auto t = dos_filetime(uint16_t(m.dos_datetime >> 16), uint16_t(m.dos_datetime & 0xFFFF)))
+          pl.has_mtime = true, pl.mtime = *t;
+        add(std::move(pl));
+      }
+    }
+    if (!skipped.empty()) log("skipped " + skipped + " (Intermission's own; the modules never use them)");
+    plan_loose_files(fs, id);
+  }
+
+  // ---- recipe "ad2kwaj": Microsoft Setup's table, flattened (PACKAGES.md) ----
+  // Every install disk's tag file must be there; then the registry's loose
+  // files, KWAJ-expanded under their installed names. Only SETUP.LST (read to
+  // identify) and the table's files are ever opened (I5): the setup files,
+  // the PC-speaker and network drivers, the help file and the rest are never
+  // read.
+  void plan_ad2kwaj(const SourceFs& fs, const Identified& id) {
+    const Package& p = *pkg_;
+    std::string missing;
+    for (const char* a : p.required_archives) {
+      auto n = fs.child(id.dir, a);
+      if (!n || n->is_dir) missing += std::string(missing.empty() ? "" : ", ") + a;
+    }
+    if (!missing.empty()) needs_every_disk(p, missing);
+    plan_loose_files(fs, id);
+  }
+
+  // The registry's loose files (intermission, ad2kwaj), under the names the
+  // installer gave them, expanded when compressed. One the source lacks is not
+  // planned: the manifest then reports it missing.
+  void plan_loose_files(const SourceFs& fs, const Identified& id) {
+    for (const LooseFile& lf : pkg_->loose_files) {
+      auto n = fs.child(id.dir, lf.from);
+      if (!n || n->is_dir) {
+        log("the source has no " + join(id.dir_path, lf.from));
+        continue;
+      }
+      Planned pl;
+      pl.rel = root_ + "/" + lf.to;
+      pl.from = join(id.dir_path, n->name);
+      if (n->mtime) pl.has_mtime = true, pl.mtime = *n->mtime;  // neither SZDD nor KWAJ records one of its own
+      const std::string what = pl.from;
+      if (lf.codec == Codec::szdd) {
+        // Small (the disc's largest is 87 KB); its header's size is what is
+        // budgeted and checked against the manifest before anything is written.
+        auto bytes = std::make_shared<const std::vector<uint8_t>>(fs.read_all(*n, 16ull << 20));
+        try {
+          pl.size = szdd_header(*bytes, pl.from).size;
+        } catch (const SzddError& e) {
+          invalid(e.what());
+        }
+        pl.read = [bytes, what](const Sink& sink) {
+          try {
+            szdd_expand(*bytes, what, sink);
+          } catch (const SzddError& e) {
+            invalid(e.what());
+          }
+        };
+      } else if (lf.codec == Codec::kwaj) {
+        // KWAJ records no size: expanding the file once gives it, bounded by
+        // what is left of the staging budget. That size is what is budgeted
+        // and checked against the manifest before anything is written (a
+        // file cut on a token boundary expands cleanly to a shorter one), and
+        // the copy expands no more than it. The largest real file is 835 KB.
+        auto bytes = std::make_shared<const std::vector<uint8_t>>(fs.read_all(*n, 16ull << 20));
+        try {
+          pl.size = kwaj_expand(*bytes, what, budget_left(), [](const uint8_t*, size_t) {});
+        } catch (const KwajTooLarge&) {
+          over_budget(pl.from);
+        } catch (const KwajError& e) {
+          invalid(e.what());
+        }
+        const uint64_t size = pl.size;
+        pl.read = [bytes, what, size](const Sink& sink) {
+          try {
+            kwaj_expand(*bytes, what, size, sink);
+          } catch (const KwajError& e) {
+            invalid(e.what());
+          }
+        };
+      } else {
+        pl.size = n->size;
+        const SourceFs* src = &fs;
+        SourceNode node = *n;
+        pl.read = [src, node](const Sink& sink) { src->read(node, sink); };
+      }
+      add(std::move(pl));
+    }
+  }
+
   void check_required() const {
     std::vector<std::string> missing;
     for (const char* req : pkg_->required) {
       std::string rel = root_ + "/" + req;
-      if (!seen_.count(ascii_upper(rel))) missing.push_back(rel);
+      if (!seen_.count(name_key(rel))) missing.push_back(rel);
     }
     if (missing.empty()) return;
     std::string m = "source is missing required file(s):";
@@ -612,7 +1008,7 @@ class Importer {
         log("fix-up " + dst_rel + " skipped: " + src_rel + " is not the release's");
         continue;
       }
-      if (seen_.count(ascii_upper(dst_rel))) {
+      if (seen_.count(name_key(dst_rel))) {
         log("fix-up " + dst_rel + " skipped: the source already has that file");
         continue;
       }
@@ -620,7 +1016,7 @@ class Importer {
       fs::create_directories(to.parent_path());
       if (!CopyFileW(from.c_str(), to.c_str(), TRUE))
         throw ImportError(Status::error, "cannot create " + to_utf8(to.wstring()) + ": " + win_error_string(GetLastError()));
-      seen_.insert(ascii_upper(dst_rel));
+      seen_.insert(name_key(dst_rel));
       ImportedFile f;
       f.path = dst_rel;
       f.size = src->size;
@@ -632,9 +1028,16 @@ class Importer {
     return out;
   }
 
-  // §4.2 I1–I4 over the staged package (not Deluxe, whose layout is its own).
+  // §4.2 I1–I4 over the staged package (not Deluxe, whose layout is its own);
+  // for Intermission packages their own I1 and I3, the DLLs' imports in I2,
+  // and every MIDI directly beside the modules in I4; for After Dark 2.0
+  // packages (ad2kwaj) AD.EXE out of the module folders in I1, their own I3,
+  // the DLLs' and drivers' imports in I2, and the sound database in ST_RES\
+  // in I4.
   void check_invariants(const fs::path& stage) const {
     const Package& p = *pkg_;
+    const bool imx = p.recipe == Recipe::intermission;
+    const bool ad2 = p.recipe == Recipe::ad2kwaj;
     std::set<std::string> have;  // upper case, relative to the package root
     for (const ImportedFile& f : r_.files) have.insert(ascii_upper(f.path.substr(root_.size() + 1)));
     std::vector<std::string> folders;
@@ -645,12 +1048,53 @@ class Importer {
         if (c == '/') c = '\\';
       invalid("the layout of " + std::string(p.title) + " breaks " + inv + ": " + what);
     };
-    for (const std::string& d : folders)
+    // The files directly in a module folder `d`, by name.
+    auto names_in = [&](const std::string& d) {
+      std::vector<std::string> out;
+      const std::string prefix = d + "/";
+      for (const std::string& f : have)
+        if (f.size() > prefix.size() && f.compare(0, prefix.size(), prefix) == 0 &&
+            f.find('/', prefix.size()) == std::string::npos)
+          out.push_back(f.substr(prefix.size()));
+      return out;
+    };
+    for (const std::string& d : folders) {
       for (const char* n : kNeverBesideModules)
         if (have.count(d + "/" + n)) fail("I1", d + "\\" + n + " would shadow the engine's");
-    if (!have.count("ENGINE/AD_SND.DLL")) fail("I3", "no ENGINE\\AD_SND.DLL");
-    if (!(have.count("ENGINE/OLDMOD16.DLL") && have.count("ENGINE/AFTERDAR.SCR")) && !have.count("ENGINE/ADTASK.DLL"))
-      fail("I3", "no ENGINE\\OLDMOD16.DLL + AFTERDAR.SCR, and no ENGINE\\ADTASK.DLL");
+      // Intermission and its readers live in ENGINE: the module folder holds
+      // only the modules and what they load.
+      if (imx)
+        for (const std::string& n : names_in(d))
+          if (n == "INTERMIS.EXE" || ends_with_i(n, ".IMQ")) fail("I1", d + "\\" + n + " belongs in ENGINE");
+      // After Dark 2.0's own host too (the host replaces it; nothing loads it).
+      if (ad2 && have.count(d + "/AD.EXE")) fail("I1", d + "\\AD.EXE belongs in ENGINE");
+    }
+    if (imx) {
+      // The IMX reader and the installer's C:\WINDOWS files; and nothing that
+      // would make the 16-bit lane take the package for an After Dark one.
+      if (!have.count("ENGINE/IMIMXPLY.IMQ")) fail("I3", "no ENGINE\\IMIMXPLY.IMQ");
+      for (const LooseFile& lf : p.loose_files)
+        if (std::string_view(lf.to).rfind("WINDOWS/", 0) == 0 && !have.count(ascii_upper(lf.to)))
+          fail("I3", "no " + std::string(lf.to));
+      for (const char* n : {"OLDMOD16.DLL", "ADTASK.DLL", "AD_SND.DLL"})
+        if (have.count(std::string("ENGINE/") + n)) fail("I3", std::string("ENGINE\\") + n + " is After Dark's");
+    } else if (ad2) {
+      // Its own AD_SND (1.0, which the native bridge loads); nothing that
+      // would make the 16-bit lane take it for an After Dark 3.x/4.x package;
+      // and no WINDOWS folder: the lane's profile seeds are its settings, and
+      // a file there (the disk's AD_PREFS.INI, whose PC-speaker driver hangs
+      // the emulator) would win over them.
+      if (!have.count("ENGINE/AD_SND.DLL")) fail("I3", "no ENGINE\\AD_SND.DLL");
+      for (const char* n : {"OLDMOD16.DLL", "ADTASK.DLL", "AFTERDAR.SCR"})
+        if (have.count(std::string("ENGINE/") + n))
+          fail("I3", std::string("ENGINE\\") + n + " belongs to After Dark 3.x and 4.x");
+      for (const std::string& f : have)
+        if (f.rfind("WINDOWS/", 0) == 0) fail("I3", f + ": an After Dark 2.0 package has no WINDOWS folder");
+    } else {
+      if (!have.count("ENGINE/AD_SND.DLL")) fail("I3", "no ENGINE\\AD_SND.DLL");
+      if (!(have.count("ENGINE/OLDMOD16.DLL") && have.count("ENGINE/AFTERDAR.SCR")) && !have.count("ENGINE/ADTASK.DLL"))
+        fail("I3", "no ENGINE\\OLDMOD16.DLL + AFTERDAR.SCR, and no ENGINE\\ADTASK.DLL");
+    }
     CatalogTree t;
     t.package = &p;
     t.dir = stage;
@@ -664,16 +1108,51 @@ class Importer {
           fail("I2", rel + " needs " + need + ", which is not beside it");
       }
     }
+    // Intermission's DLLs load theirs from beside the modules too
+    // (INTRMLIB.DLL imports ANTSW), and so do After Dark 2.0's DLLs and sound
+    // drivers (AD_MOD.DLL imports AD_RSRC; AD_SND, as for the modules, is
+    // ENGINE's). A file that is no NE image has nothing to check.
+    if (imx || ad2)
+      for (const std::string& d : folders)
+        for (const std::string& n : names_in(d)) {
+          if (!ends_with_i(n, ".DLL") && !(ad2 && ends_with_i(n, ".DRV"))) continue;
+          auto data = read_staged(stage / to_wide(d + "/" + n));
+          if (!data || loader::detect_format(*data) != loader::Format::ne) continue;
+          std::vector<std::string> refs;
+          try {
+            refs = loader::ne::Image(std::move(*data)).module_refs();
+          } catch (const std::exception&) {
+            continue;
+          }
+          for (const std::string& ref : refs) {
+            std::string r = ascii_upper(loader::latin1_to_utf8(ref));
+            if (lane16_system_dll(r) || (ad2 && r == "AD_SND") || have.count(d + "/" + r) ||
+                have.count(d + "/" + r + ".DLL"))
+              continue;
+            fail("I2", d + "/" + n + " needs " + r + ", which is not beside it");
+          }
+        }
     for (const std::string& f : have) {
       std::string name = f.substr(f.rfind('/') + 1);
       if (ends_with_i(name, "_SND.DLL") && name != "AD_SND.DLL") {
-        bool beside = false;
-        for (const std::string& d : folders) beside = beside || have.count(d + "/" + name);
-        if (!beside) fail("I4", "the sound database " + name + " is not in a module folder");
+        if (ad2) {
+          // After Dark 2.0's AD_MOD.DLL opens it from <Path>ST_RES\ only.
+          bool in_res = false;
+          for (const std::string& d : folders) in_res = in_res || f == d + "/ST_RES/" + name;
+          if (!in_res) fail("I4", "the sound database " + f + " is not in " + p.module_dir + "\\ST_RES");
+        } else {
+          bool beside = false;
+          for (const std::string& d : folders) beside = beside || have.count(d + "/" + name);
+          if (!beside) fail("I4", "the sound database " + name + " is not in a module folder");
+        }
       }
       if (p.recipe == Recipe::ad3zip && ends_with_i(name, ".MID") &&
           f.rfind(ascii_upper(std::string(p.module_dir)) + "/MUSIC/", 0) != 0)
         fail("I4", f + " is not in " + p.module_dir + "\\MUSIC");
+      // The Intermission modules open their music by bare name.
+      if (imx && ends_with_i(name, ".MID") &&
+          std::find(folders.begin(), folders.end(), f.substr(0, f.rfind('/'))) == folders.end())
+        fail("I4", f + " is not directly in a module folder");
     }
   }
 
@@ -686,33 +1165,11 @@ class Importer {
   const Package* pkg_ = nullptr;
   std::string root_, title_;
   std::vector<Planned> plan_;
-  std::set<std::string> seen_;
+  std::set<std::string> seen_;       // name_key of every planned path
   std::set<std::string> dirs_seen_;  // SourceFs::dir_key of every folder walked
   uint64_t planned_bytes_ = 0;
   std::string password_;  // in memory only
 };
-
-std::string json_escape(const std::string& s) {
-  std::string o;
-  for (unsigned char c : s) {
-    switch (c) {
-      case '"': o += "\\\""; break;
-      case '\\': o += "\\\\"; break;
-      case '\n': o += "\\n"; break;
-      case '\r': o += "\\r"; break;
-      case '\t': o += "\\t"; break;
-      default:
-        if (c < 0x20) {
-          char b[8];
-          snprintf(b, sizeof(b), "\\u%04x", c);
-          o += b;
-        } else {
-          o += char(c);
-        }
-    }
-  }
-  return o;
-}
 
 std::string utc_now_iso8601() {
   SYSTEMTIME st;
@@ -789,7 +1246,7 @@ std::string render_import_json_v2(const Source& src, const Package& p, const Imp
   j += "  \"tool\": \"" + std::string(kToolName) + "\",\n";
   j += "  \"importedUtc\": \"" + utc + "\",\n";
   j += "  \"package\": {\"id\": \"" + json_escape(p.id) + "\", \"title\": \"" + json_escape(p.title) +
-       "\", \"recipe\": \"" + (p.recipe == Recipe::tree ? "tree" : "ad3zip") + "\", \"root\": \"" +
+       "\", \"recipe\": \"" + recipe_name(p.recipe) + "\", \"root\": \"" +
        json_escape(p.root) + "\"},\n";
   j += "  \"source\": {\n";
   j += "    \"kind\": \"" + std::string(kind) + "\",\n";
@@ -870,53 +1327,70 @@ std::wstring download_file_name(const std::string& url) {
   return w;
 }
 
-// One copy of a download: where it is published and what it must be.
+// One copy of a download: where it is published and what it must be — one
+// file, or the images of every install disk of a release on several, which
+// are used only together.
 struct Mirror {
-  std::string url;
-  std::wstring file_name;
-  uint64_t size = 0;    // 0 = not enforced
-  std::string md5;      // "" = unchecked
+  struct Part {
+    std::string url;
+    std::wstring file_name;
+    uint64_t size = 0;    // 0 = not enforced
+    std::string md5;      // "" = unchecked
+  };
+  std::vector<Part> parts;
 };
 
+// A fetched copy: every part's file and md5, in order; the URL fetched is the
+// first part's.
 struct Fetched {
-  fs::path path;
-  std::string url, final_url, md5;
+  std::vector<fs::path> paths;
+  std::vector<std::string> md5s;
+  std::string url, final_url;
   bool md5_checked = false;
 };
 
 // Downloads `src` (the package's registry copies, or its custom URL) into
-// the downloads directory. A copy whose file is already there, complete, is
-// tried first, so nothing is fetched for a package downloaded before, from
-// whichever copy. Each copy is checked against its published size and md5;
-// when one cannot be fetched (network) or is not the published file
-// (verify_failed), the next is tried. Anything else (cancel, local I/O, the
-// download lock) ends it at once.
+// the downloads directory. A copy whose files are all already there,
+// complete, is tried first, so nothing is fetched for a package downloaded
+// before, from whichever copy. Each part of a copy is checked against its
+// published size and md5; when one cannot be fetched (network) or is not the
+// published file (verify_failed), the next copy is tried. Anything else
+// (cancel, local I/O, the download lock) ends it at once.
 Fetched fetch_download(const Source& src, std::span<const Package> registry, Importer& imp) {
   const Package* pkg = find_package(src.package.empty() ? "deluxe" : src.package, registry);
   // A custom URL names no package until the source is identified.
   if (pkg && (src.url.empty() || !src.package.empty())) imp.set_title(pkg->title);
   std::vector<Mirror> mirrors;
   if (!src.url.empty()) {
-    mirrors.push_back({src.url, download_file_name(src.url), 0, src.expected_md5});
+    mirrors.push_back({{{src.url, download_file_name(src.url), 0, src.expected_md5}}});
   } else {
     if (!pkg || pkg->downloads.empty())
       throw ImportError(Status::error, "no Internet Archive copy of " + std::string(pkg ? pkg->title : src.package) +
                                            " is known; import it from its disc with --image or --from");
-    // --md5 replaces the published md5, and with it the published size.
-    for (const Download& d : pkg->downloads)
-      mirrors.push_back({d.url, d.file_name, src.expected_md5.empty() ? d.size : 0,
+    // --md5 replaces the published md5, and with it the published size, of
+    // each copy's own file (a further disk's image keeps its own).
+    for (const Download& d : pkg->downloads) {
+      Mirror m;
+      m.parts.push_back({d.url, d.file_name, src.expected_md5.empty() ? d.size : 0,
                          src.expected_md5.empty() ? std::string(d.md5) : src.expected_md5});
+      for (const DownloadPart& q : d.more_images) m.parts.push_back({q.url, q.file_name, q.size, q.md5});
+      mirrors.push_back(std::move(m));
+    }
   }
   const fs::path dir = src.path.empty() ? default_download_dir() : src.path;
   std::error_code ec;
   std::stable_partition(mirrors.begin(), mirrors.end(), [&](const Mirror& m) {
-    return m.size && fs::is_regular_file(dir / m.file_name, ec) && fs::file_size(dir / m.file_name, ec) == m.size;
+    return std::all_of(m.parts.begin(), m.parts.end(), [&](const Mirror::Part& q) {
+      return q.size && fs::is_regular_file(dir / q.file_name, ec) && fs::file_size(dir / q.file_name, ec) == q.size;
+    });
   });
 
-  auto report = [&imp](Progress::Phase ph) {
-    return [&imp, ph](uint64_t done, uint64_t total) {
+  // Progress over the whole copy: a part's bytes come after the earlier
+  // parts' (`base`), out of every part's published size when all are known.
+  auto report = [&imp](Progress::Phase ph, uint64_t base, uint64_t whole) {
+    return [&imp, ph, base, whole](uint64_t done, uint64_t total) {
       try {
-        imp.progress(ph, done, total);
+        imp.progress(ph, base + done, whole ? whole : total ? base + total : 0);
         return true;
       } catch (const ImportError&) {
         return false;
@@ -927,30 +1401,50 @@ Fetched fetch_download(const Source& src, std::span<const Package> registry, Imp
   std::string failures;
   for (size_t i = 0; i < mirrors.size(); i++) {
     const Mirror& m = mirrors[i];
-    DownloadOptions d;
-    d.url = m.url;
-    d.dest = dir / m.file_name;
-    d.expected_md5 = m.md5;
-    d.expected_size = m.size;
-    d.cancel = imp.options().cancel;
-    d.log = [&imp](const std::string& s) { imp.log(s); };
-    d.progress = report(Progress::Phase::download);
-    // Hashing an already-downloaded file (or the finished transfer) is the
-    // same work as checking a local image, and should read that way.
-    d.hash_progress = report(Progress::Phase::check_image);
-    if (i) imp.log("trying another copy: " + m.url);
+    // Every part's published size, for a copy of several whose sizes are all
+    // known; a single file reports the download's own total, as it always did.
+    uint64_t whole = 0;
+    if (m.parts.size() > 1 &&
+        std::all_of(m.parts.begin(), m.parts.end(), [](const Mirror::Part& q) { return q.size != 0; }))
+      for (const Mirror::Part& q : m.parts) whole += q.size;
+    if (i) imp.log("trying another copy: " + m.parts.front().url);
+    const Mirror::Part* at = &m.parts.front();
     try {
-      DownloadResult dr = download(d);
-      imp.log(dr.reused ? "using the already-downloaded " + to_utf8(d.dest.wstring())
-                        : "downloaded " + std::to_string(dr.size) + " bytes from " + m.url + " to " +
-                              to_utf8(d.dest.wstring()));
-      return Fetched{d.dest, m.url, dr.final_url, dr.md5, !m.md5.empty()};
+      Fetched f;
+      uint64_t base = 0;
+      for (const Mirror::Part& q : m.parts) {
+        at = &q;
+        DownloadOptions d;
+        d.url = q.url;
+        d.dest = dir / q.file_name;
+        d.expected_md5 = q.md5;
+        d.expected_size = q.size;
+        d.cancel = imp.options().cancel;
+        d.log = [&imp](const std::string& s) { imp.log(s); };
+        d.progress = report(Progress::Phase::download, base, whole);
+        // Hashing an already-downloaded file (or the finished transfer) is the
+        // same work as checking a local image, and should read that way.
+        d.hash_progress = report(Progress::Phase::check_image, base, whole);
+        DownloadResult dr = download(d);
+        imp.log(dr.reused ? "using the already-downloaded " + to_utf8(d.dest.wstring())
+                          : "downloaded " + std::to_string(dr.size) + " bytes from " + q.url + " to " +
+                                to_utf8(d.dest.wstring()));
+        if (f.paths.empty()) {
+          f.url = q.url;
+          f.final_url = dr.final_url;
+        }
+        f.paths.push_back(d.dest);
+        f.md5s.push_back(dr.md5);
+        base += dr.size;
+      }
+      f.md5_checked = !m.parts.front().md5.empty();
+      return f;
     } catch (const ImportError& e) {
       if (e.status() != Status::network && e.status() != Status::verify_failed) throw;
       if (e.status() == Status::verify_failed) worst = Status::verify_failed;
       if (!src.url.empty()) throw;  // a custom URL fails as it always has
-      imp.log(m.url + ": " + e.what());
-      failures += std::string(failures.empty() ? "" : "; ") + m.url + ": " + e.what();
+      imp.log(at->url + ": " + e.what());
+      failures += std::string(failures.empty() ? "" : "; ") + at->url + ": " + e.what();
     }
   }
   // The Internet Archive does withdraw items (ad10th was dark for a while).
@@ -1007,48 +1501,88 @@ ImportResult run_import(const Source& src, const ImportOptions& opts) {
     if (!src.package.empty() && !find_package(src.package, registry))
       throw ImportError(Status::error, "unknown package \"" + src.package + "\" (known: " + known_releases(registry) + ")");
     std::string final_url;
-    std::vector<fs::path> images;
-    std::string download_md5;
+    // The image files, each with its md5 when that is known already (a
+    // download's, checked as it was fetched).
+    struct ImageFile {
+      fs::path path;
+      std::string md5;
+    };
+    std::vector<ImageFile> images;
 
     if (src.kind == Source::Kind::download) {
       Fetched f = fetch_download(src, registry, imp);
       final_url = f.final_url;
-      images.push_back(f.path);
-      download_md5 = f.md5;
+      for (size_t i = 0; i < f.paths.size(); i++) images.push_back({f.paths[i], f.md5s[i]});
       r.url = f.url;
       r.final_url = f.final_url;
       r.download_md5_checked = f.md5_checked;
     } else if (src.kind == Source::Kind::iso) {
-      images.push_back(src.path);
-      for (const fs::path& p : src.more_images) images.push_back(p);
+      images.push_back({src.path, ""});
+      for (const fs::path& p : src.more_images) images.push_back({p, ""});
     }
 
     std::unique_ptr<SourceFs> sfs;
     if (!images.empty()) {
       std::error_code ec;
       uint64_t total = 0;
-      for (const fs::path& p : images) {
+      for (const ImageFile& f : images) {
         // Checked before fs::absolute, which throws on an empty path.
-        if (!fs::is_regular_file(p, ec))
-          throw ImportError(Status::source_invalid, "no such image file: " + to_utf8(p.wstring()));
-        total += fs::file_size(p, ec);
+        if (!fs::is_regular_file(f.path, ec))
+          throw ImportError(Status::source_invalid, "no such image file: " + to_utf8(f.path.wstring()));
+        total += fs::file_size(f.path, ec);
       }
       std::vector<std::unique_ptr<SourceFs>> parts;
       uint64_t base = 0;
+      // A copy of an image already given adds nothing either.
+      auto already = [&](const ImagePart& part) {
+        for (const ImagePart& q : r.parts)
+          if (q.md5 == part.md5 && q.size == part.size) {
+            imp.log("ignoring " + part.path + ": the same image as " + q.path);
+            return true;
+          }
+        return false;
+      };
       for (size_t i = 0; i < images.size(); i++) {
-        const fs::path& p = images[i];
+        const fs::path& p = images[i].path;
         // The same file named twice is one image, not two floppies.
         bool again = false;
-        for (size_t k = 0; k < i && !again; k++) again = fs::equivalent(images[k], p, ec);
+        for (size_t k = 0; k < i && !again; k++) again = fs::equivalent(images[k].path, p, ec);
         if (again) {
           imp.log("ignoring " + to_utf8(fs::absolute(p).make_preferred().wstring()) + ": it was already given");
           continue;
         }
+        const std::string where = to_utf8(fs::absolute(p).make_preferred().wstring());
+        // A ZIP of floppy images (the Internet Archive's ZIP of a release's
+        // disks): each image in it is a part of its own, "<zip>!<member>",
+        // identified by its own md5 (the ZIP's changes with every download).
+        std::vector<std::string> ignored;
+        std::vector<ZippedImage> zipped = floppy_images_in_zip(p, &ignored);
+        if (!zipped.empty()) {
+          imp.log("reading the " + std::to_string(zipped.size()) + " floppy image" + (zipped.size() == 1 ? "" : "s") +
+                  " in " + where);
+          if (!ignored.empty()) {
+            std::string names;
+            for (const std::string& n : ignored) names += (names.empty() ? "" : ", ") + n;
+            imp.log("ignoring the rest of " + where + ": " + names);
+          }
+          for (ZippedImage& z : zipped) {
+            ImagePart part;
+            part.path = where + "!" + z.name;
+            part.size = z.bytes->size();
+            part.md5 = md5_hex(z.bytes->data(), z.bytes->size());
+            if (already(part)) continue;
+            parts.push_back(open_fat_image(z.bytes, part.path));
+            r.parts.push_back(std::move(part));
+          }
+          base += fs::file_size(p, ec);
+          imp.progress(Progress::Phase::check_image, base, total);
+          continue;
+        }
         ImagePart part;
-        part.path = to_utf8(fs::absolute(p).make_preferred().wstring());
+        part.path = where;
         part.size = fs::file_size(p, ec);
-        if (!download_md5.empty()) {
-          part.md5 = download_md5;
+        if (!images[i].md5.empty()) {
+          part.md5 = images[i].md5;
         } else {
           part.md5 = md5_file_hex(p, [&](uint64_t done, uint64_t) {
             try {
@@ -1060,14 +1594,7 @@ ImportResult run_import(const Source& src, const ImportOptions& opts) {
           });
         }
         base += part.size;
-        // A copy of an image already given adds nothing either.
-        const ImagePart* same = nullptr;
-        for (const ImagePart& q : r.parts)
-          if (q.md5 == part.md5 && q.size == part.size) same = &q;
-        if (same) {
-          imp.log("ignoring " + part.path + ": the same image as " + same->path);
-          continue;
-        }
+        if (already(part)) continue;
         parts.push_back(open_image(p));
         r.parts.push_back(std::move(part));
       }
@@ -1111,24 +1638,38 @@ ImportResult run_import(const Source& src, const ImportOptions& opts) {
     }
     r.joliet = r.format == "iso9660+joliet";
 
-    Identified id = identify(*sfs, registry, r.iso_md5, src.package);
+    const ImageMatch image = by_image(registry, r.parts);
+    Identified id = identify(*sfs, registry, image, r.parts.size(), src.package);
     const Package& pkg = *id.pkg;
     deluxe = pkg.is_deluxe();
     imp.set_package(pkg);
     r.package_id = pkg.id;
     r.package_title = pkg.title;
-    for (const KnownImage& k : pkg.images)
-      if (!r.iso_md5.empty() && r.iso_md5 == k.md5) r.iso_md5_known = true;
+    // A known image of the release, or every one of its install disks.
+    r.iso_md5_known = image.complete && image.pkg == &pkg;
     imp.log("identified " + std::string(pkg.title) + (id.dir_path.empty() ? "" : " (" + id.dir_path + ")"));
     if (r.format == "zip")
       imp.log("a ZIP of install files, not an image of the original disks" +
               std::string(opts.check_known ? ": checking every file against the release" : ""));
+    else if (r.iso_md5_known && r.parts.size() > 1)
+      imp.log("the images are the known install disks of " + std::string(pkg.title));
+    else if (image.pkg == &pkg && !image.complete && image.every_disk) {
+      // The whole set, and more: a second copy of a disk, or another image.
+      const size_t others = r.parts.size() - size_t(disk_count(pkg));
+      imp.log("the images hold every install disk of " + std::string(pkg.title) + " (by md5) and " +
+              (others == 1 ? std::string("another image") : std::to_string(others) + " other images") + " besides" +
+              (opts.check_known ? "; checking files individually" : ""));
+    } else if (image.pkg == &pkg && !image.complete)
+      imp.log("the source holds " + disks_text(image.disks, disk_count(pkg)) + " of " + pkg.title +
+              " (by md5), not the whole set" + (opts.check_known ? "; checking files individually" : ""));
     else if (!r.iso_md5.empty() && !r.iso_md5_known)
       imp.log("image md5 " + r.iso_md5 + " is not a known image of " + pkg.title +
               (opts.check_known ? "; checking files individually" : ""));
 
     if (pkg.recipe == Recipe::tree) imp.plan_tree(*sfs, id);
-    else imp.plan_ad3zip(*sfs, id);
+    else if (pkg.recipe == Recipe::ad3zip) imp.plan_ad3zip(*sfs, id);
+    else if (pkg.recipe == Recipe::intermission) imp.plan_intermission(*sfs, id);
+    else imp.plan_ad2kwaj(*sfs, id);
     imp.check_required();
     imp.check_sizes();
 

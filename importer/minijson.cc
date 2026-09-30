@@ -2,7 +2,10 @@
 
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+
+#include "winutil.h"
 
 namespace adw::import {
 
@@ -221,6 +224,28 @@ std::optional<JsonValue> parse_json(std::string_view text) {
   Parser p(text);
   if (!p.parse(v)) return std::nullopt;
   return v;
+}
+
+std::string json_escape(std::string_view s) {
+  std::string o;
+  for (unsigned char c : to_valid_utf8(s)) {
+    switch (c) {
+      case '"': o += "\\\""; break;
+      case '\\': o += "\\\\"; break;
+      case '\n': o += "\\n"; break;
+      case '\r': o += "\\r"; break;
+      case '\t': o += "\\t"; break;
+      default:
+        if (c < 0x20) {
+          char b[8];
+          snprintf(b, sizeof(b), "\\u%04x", c);
+          o += b;
+        } else {
+          o += char(c);
+        }
+    }
+  }
+  return o;
 }
 
 }  // namespace adw::import

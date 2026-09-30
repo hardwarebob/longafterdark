@@ -1,11 +1,14 @@
 # host/core — `adw_core` and `adhostwin.exe`
 
 `adhostwin.exe` is the host process of **Long After Dark**. It runs one
-module of any of the five After Dark releases the importer takes: After
-Dark 4.0 Deluxe, After Dark 3.2, Totally Twisted, After Dark 10th
-Anniversary and The Simpsons Screen Saver (202 modules). Modules built as
+module of any of the seven releases the importer takes: the six After Dark
+releases (After Dark 4.0 Deluxe, After Dark 3.2, Totally Twisted, After Dark
+10th Anniversary, The Simpsons Screen Saver and Star Trek: The Screen Saver,
+the After Dark 2.0 one) and LucasArts' Star Wars Screen Entertainment, whose
+modules run on Delrina's Intermission engine (232 modules). Modules built as
 32-bit PE images go to the `pe32` lane, and 16-bit NE modules go to the
-`ne16` (Classic) lane.
+`ne16` (Classic) lane, which speaks both After Dark 2.x/3.x's module
+protocol and Intermission's (`host/ne16/lane.hh`).
 
 This component is the protocol half of that host (DESIGN.md §1 and §4): the
 emulated 8-bit display, the frame stream, the stdin command channel, the
@@ -23,12 +26,13 @@ AD_BUILD_DIR=build/win-core AD_COMPONENTS="host/core" bash tools/build.sh
 Tests: `core.unit` (in-process: encoding, hash, env and its win-dir rule,
 commands, clock, pacer, pipes, the frame loop with fake I/O; and the
 interaction contract of `docs/INTERACTION.md` §3: the `MOUSE`
-bitmask, input-line numbers, held releases, `ADCAPS` at init, the status
+bitmask, input-line numbers (`NUMLOCK` among them), held releases, `ADCAPS`
+and `ADNUMLOCK` at init, the status
 record's seqlock under a concurrent writer, `ADSTATUSHANDLE`/`STATUS` lines,
 the `--configure` driver's exit codes and JSON, the `ADSTATE` resolution and
 package names; and the data folder's path: the base rule, blanks, a trailing
 separator, no base, and `Env` agreeing with `data_root.h`), `core.e2e`
-(spawns `adhostwin.exe` over real pipes and parses frames with a strict reference frame reader; also `STATUS` lines, the status record through an
+(spawns `adhostwin.exe` over real pipes and parses frames with a strict reference frame reader; also `STATUS` lines, a `NUMLOCK` line and `ADNUMLOCK`, the status record through an
 inherited handle, `--capabilities` and `--configure`'s usage/lane exit codes,
 where a module run finds the default assets root, and that no run creates the
 data folder; the test pattern's sound captured, and
@@ -36,7 +40,7 @@ sound on changing no frame), `core.lane_detect_assets` (probes every
 real module; skips with 77 when the assets are absent), `core.audio` (the
 audio engine, below: formats, the ADPCM decoders byte for byte against the
 host's own `msacm32` codecs, gains, a golden mixer hash, timing, streams,
-SMF, captures, config) and `core.audio_assets` (real modules' sound, AUDIO.md
+SMF, raw MIDI, captures, config) and `core.audio_assets` (real modules' sound, AUDIO.md
 §10.3; opt-in, below). No test opens a sound device, and none touches the
 real `%LOCALAPPDATA%`: every host the suites spawn gets a scratch
 `AD_LOCALAPPDATA` (`tests/test_paths.h`), and the installed assets are found
@@ -59,27 +63,37 @@ adhostwin.exe --configure <module> --button <slot> [--owner <hwnd>] [NAME=VALUE 
   variable of the same name — `adhostwin x.AD ADFRAMES=10 ADFBHASH=1` equals
   setting those in the environment.
 * The lane is chosen from the header: `MZ` + `PE\0\0` + i386 → `pe32`;
-  `MZ` + `NE` → `ne16`. Anything else is refused.
+  `MZ` + `NE` → `ne16`. Anything else is refused. Inside `ne16` the
+  module's exports choose the protocol: `MODULE` is an After Dark module,
+  `SAVERINIT` + `SAVERDRAW` an Intermission `.IMX`; an NE file with neither
+  fails the lane's init (exit 1).
 
 Exit codes: **0** ADFRAMES reached / QUIT / stdin EOF after a GO / the reader
-closed stdout / module finished · **1** lane init or step failure (including
+closed stdout / module finished (a headless run whose After Dark 2.0 module
+woke the saver: `host/ne16/lane.hh`) · **1** lane init or step failure (including
 an exception escaping the lane), stdout I/O error · **2** bad arguments (a
 module together with `--test-pattern` included), unreadable or non-AD file,
 refused stream target · **3** a valid module whose lane is not built into
 this `adhostwin` yet.
 
 **`--capabilities`** prints one line on stdout and exits 0: what this build
-has, e.g. `lanes=pe32,ne16 configure=pe32,ne16 status=1 state=1 seed=1 audio=1`
-(`lanes=` lists the linked lanes, `configure=` those whose
-`Lane::can_configure()` is true; `status`, `state`, `seed`, `audio` are the
-core features below). It takes no other argument. The settings dialog asks it
-once instead of probing a module.
+has, e.g. `lanes=pe32,ne16 configure=pe32,ne16 abis=afterdark,intermission
+status=1 state=1 seed=1 audio=1 numlock=1` (`lanes=` lists the linked lanes,
+`configure=` those whose `Lane::can_configure()` is true, `abis=` the union
+of their `Lane::abis()` in lane order — the module ABIs this build runs:
+`afterdark` (pe32 and ne16) and `intermission` (ne16), the catalog's
+`"abi"`, absent meaning `afterdark`; `status`, `state`, `seed`, `audio` are
+the core features below; `numlock=1`: the `NUMLOCK` line and `ADNUMLOCK`
+are understood, so a front-end sends Num Lock's toggle as it sends Caps
+Lock's). It takes no other argument, and readers ignore
+keys they do not know. The settings dialog asks it once instead of probing a
+module.
 
 **`--configure <module> --button <slot> [--owner <hwnd>]`** runs a module's
 own button handler once (INTERACTION.md §6.1): `<slot>` is the catalog index
 of a `button` control, `--owner` the real HWND (decimal or `0x` hex) that
 owns the module's dialogs (0/absent = none). `AD_ASSETS_DIR`, `ADCVSET` (the
-dialog's current values), `ADCAPS` and `ADSTATE` are read as usual; with
+dialog's current values), `ADCAPS`, `ADNUMLOCK` and `ADSTATE` are read as usual; with
 `ADSTATE` unset the state is `%LOCALAPPDATA%\LongAfterDark\state` (not
 memory; see [The data folder](#the-data-folder)), and `ADSTATE=:memory:`
 keeps it in memory. Nothing is streamed;
@@ -137,10 +151,11 @@ blank lines ignored; a final line without a newline still counts):
 | `SET <idx> <val>` | control value (`idx` 0..65535, `val` int32) — same slots as `ADCVSET` |
 | `KEY <vk> <0\|1>` | **Windows virtual-key code** (0..255) down/up |
 | `CAPS <0\|1>` | caps-lock toggle state |
+| `NUMLOCK <0\|1>` | num-lock toggle state (`InputState::numlock`; the Classic lane's `GetKeyState(VK_NUMLOCK)` bit 0 — Final Exam starts its exam when it changes) |
 | `MOUSE <x> <y> <buttons>` | frame-local pointer position; `buttons` a bitmask 0..7: 1 left, 2 right, 4 middle (0/1 keep their old meaning) |
 | `QUIT` | exit 0 before the next frame |
 
-**Input lines** (INTERACTION.md §3.2). `KEY`, `CAPS` and `MOUSE` are
+**Input lines** (INTERACTION.md §3.2). `KEY`, `CAPS`, `NUMLOCK` and `MOUSE` are
 numbered 1, 2, 3 … in the order the host reads them (`Command::seq`; 0 for
 every other command); a front-end that counts the lines it sends knows every
 line's number without an acknowledgement. `InputState::input_seq` is the
@@ -206,12 +221,13 @@ values fall back to the default with a warning on stderr.
 | `ADSTREAMP6=1` | off | *(host-local)* P6 frames instead of P8 |
 | `ADGOWAITMS=<ms>` | 250 | *(host-local)* pre-frame-0 wait for the first stdin line (0 disables) |
 | `ADCAPS=0\|1` | 0 | Caps Lock toggle at start, in `InputState.caps` **before** `Lane::init` (modules latch it when they are created) |
+| `ADNUMLOCK=0\|1` | 0 | Num Lock toggle at start, in `InputState.numlock` **before** `Lane::init` (Final Exam latches it as it starts, and a change starts its exam); logged as `num lock on` |
 | `ADSTATE=<dir>\|:memory:` | in memory | per-user state root (`Env::state_root`, INTERACTION.md §7). Unset or `:memory:` = the lanes keep their writable overlay in memory, so headless runs never read or write user state; `--configure` with it unset uses `%LOCALAPPDATA%\LongAfterDark\state`. `package_state_name()` / `package_state_dir()` give a module's package: `deluxe` for `…\FILES\<dir>\<module>`, `<id>` for `…\packages\<id>\<dir>\<module>`, `legacy-<fnv32 of the lower-cased module dir, 8 hex>` otherwise |
 | `ADSTATUSHANDLE=<n>` | — | decimal or `0x` value of an **inherited** handle to a pagefile section (≥ 4096 bytes): the status record is published there (below). A value that does not map is logged once and ignored |
 | `ADSTATUSLOG=1` | off | also print `STATUS <frame> flags=0x<hex> applied=<n> eaten=<n> src=<s>` on stderr at frame 0 and whenever flags, `applied` or `eaten` change |
 | `ADSOUND=1` | off | **guest sound on** (AUDIO.md §4): the lanes give the modules their sound devices. In a streamed run it also plays on the real device (WASAPI; MIDI through the MIDI mapper). A headless run never opens a device |
 | `ADAUDIOOUT=<file.wav>` | — | sound on (as `ADSOUND=1`) and **captured**: the mix to `<file.wav>` (16-bit stereo at `ADAUDIORATE`), the MIDI messages to `<file>.mid` (the extension replaced; a name without one, or ending in `.mid`, gets `.mid` appended). Never plays by itself; with `ADSOUND=1 ADSTREAM=1` too, both |
-| `ADVOLUME=0..100` | 50 | After Dark's volume slider, handed to the modules (AD4 block `+0x3C`, the Classic bridge). The host adds no gain of its own. Out of range is clamped (warning) |
+| `ADVOLUME=0..100` | 50 | After Dark's volume slider, handed to the modules (AD4 block `+0x3C`, the Classic bridge; for an Intermission module, `ANTSW.INI [Intermission] Volume`, 0 while sound is off). The host adds no gain of its own. Out of range is clamped (warning) |
 | `ADAUDIORATE=<hz>` | 44100 | mixer and capture rate, 8000..96000 (clamped). Nothing the guest sees depends on it |
 | `ADAUDIOLATENCYMS=<ms>` | 80 | live PCM ring target and MIDI delay, 20..500 (clamped) |
 | `ADAUDIOLIVE=0` | on | with `ADSOUND=1 ADSTREAM=1`: open no device (tests of streamed runs) |
@@ -220,7 +236,11 @@ values fall back to the default with a warning on stderr.
 | `ADMIDIBASE=1` | off | keep channels 13–16 of MPC dual-mode songs (AUDIO.md §6.4) |
 | `ADTESTAUDIO=1` | off | `--test-pattern` with sound on: a 440 Hz blip every second, a MIDI note every second second (below) |
 
-Lanes read their own knobs from the same snapshot: `env.get("ADFOO")`.
+Lanes read their own knobs from the same snapshot: `env.get("ADFOO")`. They
+are listed in the lanes' headers: `host/pe32/lane.hh` and `host/ne16/lane.hh`
+(`ADNE16KIND=auto|ad3|imx` forces the Classic lane's module protocol,
+`ADNE16READER=auto|imq|native` its Intermission reader, `ADNE16BRIDGE` its
+After Dark bridge, …).
 
 ## The data folder
 
@@ -265,7 +285,7 @@ frame arrives sees that step's verdict:
 
 | Field | From |
 |---|---|
-| `flags` | `Lane::status()`: `ADWS_INTERACTIVE` 0x01, `ADWS_CURSOR` 0x02, `ADWS_ROTATE_OK` 0x04, `ADWS_KEY_FILTER` 0x08, `ADWS_WAKE` 0x10; the host adds `ADWS_READY` 0x20 |
+| `flags` | `Lane::status()`: `ADWS_INTERACTIVE` 0x01, `ADWS_CURSOR` 0x02, `ADWS_ROTATE_OK` 0x04, `ADWS_KEY_FILTER` 0x08, `ADWS_WAKE` 0x10 (the module asked the saver to end: `WM_CLOSE`/`SC_CLOSE` to the saver window, or an After Dark 2.0 module's result 5); the host adds `ADWS_READY` 0x20 |
 | `frames` | steps completed |
 | `input_applied` | the last input line applied **before** the last completed step, kept below `LaneStatus::unsettled` (a line the guest may still take from a queue: the Classic lane's saver-window queue while a long DRAWFRAME is suspended) |
 | `input_eaten` | `LaneStatus::eaten`: the highest input line the module consumed |
@@ -315,7 +335,12 @@ DirectSound, ACM, WINMM and MMSYSTEM onto it.
 `audio::Config::from_env(env)` and puts it in `LaneContext::audio`: a
 disabled engine when sound is off (no `ADSOUND=1`, no `ADAUDIOOUT`), and
 `audio::null_engine()` for `--configure`. After every step it calls
-`advance(clock.now_us())`; when the loop ends (QUIT, stdin EOF, `ADFRAMES`,
+`advance(clock.now_us())` — unless the lane advanced the engine during the
+step: the lane sees its engine through `LaneEngine` (`src/host.cc`), which
+forwards every method and notes that, and then the step's end is the
+lane's (ne16's guest time runs ahead of the core clock, and it stops short
+of a timer period it has not yet delivered: `host/ne16/lane.hh` "Sound";
+a method `audio.h` gains must be forwarded there too); when the loop ends (QUIT, stdin EOF, `ADFRAMES`,
 the lane's end or failure) it calls `shutdown(now)` **before**
 `Lane::shutdown()`, then prints one line when sound is on:
 
@@ -356,6 +381,18 @@ can observe is a function of its calls and their times, independent of
   channels used; a play after a seek first re-sends the program, controller
   and pitch-bend state in force there (bank select, program, controllers,
   bend). A natural end sends note-offs for anything still sounding.
+* Raw MIDI (`midi_short`/`midi_long`/`midi_reset`, added after the freeze
+  for a guest that sequences itself through Win16 `midiOut*`, AUDIO.md §5 and
+  §6.4): the guest's messages on the same bus, stamped with their time
+  (song events due by then go first). A short message is the DWORD
+  `midiOutShortMsg` takes, running status included; a long one is SysEx or a
+  message stream; system messages reach the log as `F7` escapes. The bus
+  gain follows the songs' CC7 rule (the guest's CC7 scaled, re-sent on a gain
+  change, a channel's scaled default first when not at unity). A reset sends
+  note-offs for what the port left sounding, then CC64 0 and CC123 on every
+  channel it used; `shutdown` silences it like a playing song. The bodies in
+  the header do nothing (a disabled engine's answer), so older `Engine`
+  implementations — the lanes' test doubles — still build.
 * Events (`voice_end`, `chunk_done`, `song_end`) carry their exact times and
   are polled in (time, issue) order. A cancelled cause removes its future
   event (a stop before the end); `close_song` drops the song's unpolled
@@ -444,7 +481,7 @@ that nothing underran after the prefill.
 |---|---|
 | `screen.h` | `Screen` (8-bit fb + `std::array<RGBQUAD,256>` palette + dirty flag; `attach()` to external memory, negative stride = bottom-up DIB), `encode_p8/p6`, `fbhash`, `write_ppm`, `kStaticColors` (Win95 20 static colours) |
 | `protocol.h` | `Command` + `parse_command`, `InputState`, `CommandSource`/`StdinReader`, `FrameSink`/`StdoutSink`, `write_all` |
-| `env.h` | `Env` (typed §1 fields + `vars` snapshot + `get`/`flag`/`traced`/`win_assets_dir`; `state_root`, `caps_at_start`; `data_root`), `package_state_name`/`package_state_dir` |
+| `env.h` | `Env` (typed §1 fields + `vars` snapshot + `get`/`flag`/`traced`/`win_assets_dir`; `state_root`, `caps_at_start`, `numlock_at_start`; `data_root`), `package_state_name`/`package_state_dir` |
 | `data_root.h` | the data folder (above), header-only: `data_root_base`, `data_root_path`, `kDataDirName` / `kDataRootBaseVar` |
 | `clock.h` | `VirtualClock` |
 | `pacer.h` | `Pacer` |
@@ -464,7 +501,7 @@ class Pe32Lane : public adw::Lane {
   const char* name() const override { return "pe32"; }
   bool init(const std::string& module, adw::LaneContext& ctx) override;  // ctx.input has ADCVSET
   uint32_t frame_interval_us() const override;   // the module's natural rate
-  void on_command(const adw::Command& c) override; // SET/KEY/CAPS/MOUSE, in order, before the step
+  void on_command(const adw::Command& c) override; // SET/KEY/CAPS/NUMLOCK/MOUSE, in order, before the step
   adw::StepResult step() override;                 // draw into ctx.screen, mark_dirty() if changed
   void shutdown() override;
 };
@@ -479,8 +516,9 @@ eaten}`, where `eaten` is the highest `seq` the module consumed as its own.
 implemented; that entry point runs on a fresh lane object **instead of**
 `init`/`step` (no `shutdown()` afterwards), returns `shown`/`nothing`/
 `unsupported`/`failed` (exit 0/4/5/1) and may fill the JSON line with
-`configure_json()`. All four have defaults (nothing to report, no
-configure).
+`configure_json()`. `abis()` names the module ABIs the lane runs, for
+`--capabilities` (pe32 `{"afterdark"}`, ne16 `{"afterdark", "intermission"}`).
+All five have defaults (nothing to report, no configure, no ABI).
 
 A lane should catch its emulator's exceptions and return `false` /
 `StepResult::failed`; one that escapes `init`, `on_command` or `step` is

@@ -1,9 +1,11 @@
 # adw_import + adimport.exe — the Windows asset importer (DESIGN.md §6,
-# PACKAGES.md) and the catalog generator (§6a). The library depends on Win32
-# (WinHTTP, CNG, shell), on adw_loader, whose PE/NE readers the catalog uses,
-# and on zlib (raw inflate for the AD 3.x installers' PKZIP archives); phosg
-# is used by the tests alone, to parse import.json and the catalog
-# independently of the code writing them.
+# PACKAGES.md) and the catalog generator (§6a), for the seven releases of its
+# registry (packages.h). The library depends on Win32 (WinHTTP, CNG, shell),
+# on adw_loader, whose PE/NE readers the catalog uses, and on zlib (raw
+# inflate for the AD 3.x installers' PKZIP archives, CRC-32 for them and for
+# Presage's ARJ archives); its own readers expand the ARJ, SZDD and KWAJ files
+# of the floppy-based installers. phosg is used by the tests alone, to parse
+# import.json and the catalog independently of the code writing them.
 enable_language(RC)
 
 # The catalog reads the modules with adw::loader. host/loader precedes the
@@ -22,6 +24,9 @@ add_library(adw_import STATIC
   iso9660.cc
   fat.cc
   zip.cc
+  arj.cc
+  szdd.cc
+  kwaj.cc
   source.cc
   packages.cc
   download.cc
@@ -67,7 +72,7 @@ target_link_libraries(adimport PRIVATE adw_import adw_import_gui)
 # only runs with AD_E2E=1, import.download_real, which fetches every
 # package's Internet Archive copy (or reuses a verified local copy) and also
 # only runs with AD_E2E=1, import.covers_real, which fetches every registry
-# cover (AD_E2E=1), and import.pkg_real, which imports the four real package
+# cover (AD_E2E=1), and import.pkg_real, which imports the five real package
 # images and only runs with AD_E2E_PKG=1 (exit 77 = skipped otherwise).
 function(adw_import_test name)
   add_executable(test_import_${name} tests/test_${name}.cc)
@@ -85,6 +90,9 @@ adw_import_test(cli)
 adw_import_test(e2e)
 adw_import_test(catalog)
 adw_import_test(zip)
+adw_import_test(arj)
+adw_import_test(szdd)
+adw_import_test(kwaj)
 adw_import_test(fat)
 adw_import_test(packages)
 adw_import_test(pkg_real)
@@ -101,6 +109,13 @@ add_test(NAME import.download COMMAND test_import_download ${_scratch}/download)
 add_test(NAME import.cli COMMAND test_import_cli $<TARGET_FILE:adimport> ${_scratch}/cli)
 add_test(NAME import.catalog COMMAND test_import_catalog unit ${_scratch}/catalog)
 add_test(NAME import.zip COMMAND test_import_zip ${_scratch}/zip)
+# Presage's ARJ archives and COMPRESS's SZDD files (Star Wars Screen
+# Entertainment), and the Setup Toolkit's KWAJ files (Star Trek: The Screen
+# Saver), on synthetic archives, the research encoders' fixed vectors and
+# streams written token by token (nothing is compressed).
+add_test(NAME import.arj COMMAND test_import_arj ${_scratch}/arj)
+add_test(NAME import.szdd COMMAND test_import_szdd ${_scratch}/szdd)
+add_test(NAME import.kwaj COMMAND test_import_kwaj ${_scratch}/kwaj)
 add_test(NAME import.fat COMMAND test_import_fat ${_scratch}/fat)
 add_test(NAME import.packages COMMAND test_import_packages $<TARGET_FILE:adimport> ${_scratch}/packages)
 add_test(NAME import.pkg_download COMMAND test_import_pkg_download $<TARGET_FILE:adimport> ${_scratch}/pkg-download)
@@ -118,8 +133,9 @@ add_test(NAME import.covers_real COMMAND test_import_covers_real $<TARGET_FILE:a
 add_test(NAME import.catalog_real COMMAND test_import_catalog real ${_scratch}/catalog-real
          $<TARGET_FILE:adimport> ${AD_REPO_ROOT}/research/win/catalog-win.json)
 add_test(NAME import.e2e COMMAND test_import_e2e $<TARGET_FILE:adimport> ${CMAKE_CURRENT_BINARY_DIR}/e2e-assets)
-# The four package images (AD_SOURCE_ISO_DIR, default <repo>/source_iso),
-# identified by md5; skipped (77) unless AD_E2E_PKG=1 and they are present.
+# The five package images (AD_SOURCE_ISO_DIR, default <repo>/source_iso, and
+# the folders directly in it; or a ';'-separated list), identified by md5;
+# skipped (77) unless AD_E2E_PKG=1 and they are present.
 add_test(NAME import.pkg_real COMMAND test_import_pkg_real $<TARGET_FILE:adimport> ${_scratch}/pkg-real
          ${AD_REPO_ROOT}/source_iso)
 # Every package's Internet Archive copy into a scratch downloads folder and a

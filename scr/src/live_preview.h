@@ -7,6 +7,9 @@
 #include <windows.h>
 
 #include <string>
+#include <vector>
+
+#include "catalog.h"
 
 namespace adw::ui {
 struct Palette;
@@ -17,12 +20,20 @@ namespace adw::scr {
 using adw::ui::Palette;
 
 // Posted to the parent: wParam = kLiveLaneMissing when the host said the
-// module's lane is not in this adhostwin (exit 3); kLiveThumbSaved when a
-// thumbnail was written to the target's thumb_path.
+// module's lane is not built into this adhostwin (exit 3 before a frame,
+// host.h: kExitLaneMissing; live_preview_take_cant_run() names the module);
+// kLiveThumbSaved when a thumbnail was written to the target's thumb_path.
 inline constexpr UINT WM_APP_LIVE_STATUS = WM_APP + 30;
 inline constexpr WPARAM kLiveLaneMissing = 1, kLiveThumbSaved = 2;
 
 struct LiveTarget {
+  std::string id;                // the module's catalog id (what an exit 3 is reported for)
+  // Its catalog ABI and "screen" (catalog.h Module::screen), which size its
+  // screen (geometry.h: own_screen, module_screen): an After Dark module's is
+  // 480 lines at the preview's aspect, an Intermission or a Star Trek
+  // module's its own 640x480.
+  std::string abi = kAfterDarkAbi;
+  SizeI screen;
   std::wstring host_exe;         // adhostwin.exe
   std::wstring module_path;      // absolute
   std::wstring win_dir;          // <assets>\win (working directory)
@@ -55,5 +66,8 @@ void live_preview_pause(HWND preview, bool paused);
 void live_preview_restart(HWND preview);
 // Frames shown so far by the current module (the screenshot hook waits on it).
 unsigned long long live_preview_frames(HWND preview);
+// The ids of the modules whose host exited 3 before a frame since the last
+// call (each kLiveLaneMissing names one), oldest first; the list is emptied.
+std::vector<std::string> live_preview_take_cant_run(HWND preview);
 
 } // namespace adw::scr

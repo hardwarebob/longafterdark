@@ -5,6 +5,7 @@
 #include <cmath>
 #include <memory>
 #include <thread>
+#include <utility>
 
 #include "../res/resource.h"
 #include "adw/ui/capture.h"
@@ -38,7 +39,8 @@ struct Bitmapinfo256 {
 };
 
 bool same_target(const LiveTarget& a, const LiveTarget& b) {
-  return a.host_exe == b.host_exe && a.module_path == b.module_path && a.win_dir == b.win_dir && a.cvset == b.cvset;
+  return a.id == b.id && a.abi == b.abi && a.screen == b.screen && a.host_exe == b.host_exe &&
+         a.module_path == b.module_path && a.win_dir == b.win_dir && a.cvset == b.cvset;
 }
 
 class Preview {
@@ -120,6 +122,7 @@ class Preview {
     run(t);
   }
   unsigned long long frames() const { return shown_; }
+  std::vector<std::string> take_cant_run() { return std::exchange(cant_run_, {}); }
 
   LRESULT handle(UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -179,8 +182,12 @@ class Preview {
     RECT cr{};
     GetClientRect(hwnd_, &cr);
     double aspect = cr.bottom > 0 ? (double)cr.right / cr.bottom : 16.0 / 9.0;
-    // A full-size screen, shown scaled down: the preview looks like the saver.
-    SizeI emu = emulated_screen_size(std::max(aspect, 4.0 / 3.0), 1.0);
+    // A full-size screen, shown scaled down: the preview looks like the
+    // saver. The module's own rule (module_screen): an After Dark module's is
+    // 480 lines at the preview's aspect (whatever the Resolution setting), a
+    // module's own screen (an Intermission or a Star Trek module's 640x480)
+    // that, pillarboxed in the wide preview as on a widescreen monitor.
+    const SizeI emu = module_screen(own_screen(target_.abi, target_.screen), std::max(aspect, 4.0 / 3.0), 1.0).emu;
     HostSpec spec;
     spec.exe = target_.host_exe;
     spec.module_path = target_.module_path;
@@ -210,8 +217,8 @@ class Preview {
     pacer_.add(host_.get());
     started_ = Clock::now();
     starting_shown_ = false;
-    log_line("live preview: spawn %s size=%dx%d cvset=%s pid=%lu", narrow(spec.module_path).c_str(), emu.w, emu.h,
-             target_.cvset.c_str(), host_->pid());
+    log_line("live preview: spawn %s size=%dx%d abi=%s screen=%dx%d cvset=%s pid=%lu", narrow(spec.module_path).c_str(),
+             emu.w, emu.h, target_.abi.c_str(), target_.screen.w, target_.screen.h, target_.cvset.c_str(), host_->pid());
   }
 
   void stop_host(bool wait) {
@@ -235,15 +242,21 @@ class Preview {
     stop_host(false);
     log_line("live preview: host exited code=%lu frames=%llu", (unsigned long)code, (unsigned long long)frames);
     if (code == 3 && frames == 0) {
-      // adhostwin: "valid module whose lane is not built into this adhostwin".
+      // adhostwin: "valid module whose lane is not built into this adhostwin"
+      // (host.h: kExitLaneMissing; a module ABI it lacks fails with 1, as a
+      // damaged module does, and its --capabilities abis= is what says so).
+      // It speaks for this module only (the dialog marks just it:
+      // config_dialog.cc).
+      cant_run_.push_back(target_.id);
       message(L"Coming soon", L"Modules like this one will run in a future version.");
       PostMessageW(GetParent(hwnd_), WM_APP_LIVE_STATUS, kLiveLaneMissing, 0);
       return;
     }
     if (++restarts_ > kMaxRestarts) {
-      // The exit code is for the log (above); the user gets what to do next.
+      // The exit code is for the log (above); the user gets what to do next,
+      // in words that fit every release (whatever it came on).
       message((target_.name.empty() ? std::wstring(L"This module") : target_.name) + L" couldn’t start",
-              L"Try another module, or re-import your CD.");
+              L"Try another module, or import its disc again.");
       return;
     }
     SetTimer(hwnd_, kTimerRespawn, 800, nullptr);
@@ -442,6 +455,7 @@ class Preview {
   std::unique_ptr<Frame> current_;
   LiveTarget target_;
   bool have_target_ = false, pending_ = false, starting_shown_ = false;
+  std::vector<std::string> cant_run_;   // ids that exited 3 before a frame, not yet taken
   int restarts_ = 0;
   Clock::time_point started_{};
   std::wstring title_, detail_;
@@ -515,6 +529,11 @@ void live_preview_restart(HWND preview) {
 unsigned long long live_preview_frames(HWND preview) {
   Preview* p = of(preview);
   return p ? p->frames() : 0;
+}
+
+std::vector<std::string> live_preview_take_cant_run(HWND preview) {
+  Preview* p = of(preview);
+  return p ? p->take_cant_run() : std::vector<std::string>{};
 }
 
 } // namespace adw::scr

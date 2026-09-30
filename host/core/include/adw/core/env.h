@@ -72,6 +72,10 @@ struct Env {
   // ADCAPS=0|1: the Caps Lock toggle at start, applied to InputState.caps
   // before Lane::init.
   bool caps_at_start = false;
+  // ADNUMLOCK=0|1: the Num Lock toggle at start, applied to
+  // InputState.numlock before Lane::init (Final Exam latches it as it
+  // starts, and a change starts its exam).
+  bool numlock_at_start = false;
 
   // Every AD*-prefixed variable (and command-line override), verbatim.
   std::map<std::string, std::string> vars;

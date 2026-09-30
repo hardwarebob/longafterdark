@@ -277,6 +277,11 @@ class Runtime16 {
   uint64_t work_insns() const;
   // GDI shims: a blit or fill wrote n pixels (the destination area).
   void charge_pixels(int64_t n) { if (n > 0) pix_charged_ += uint64_t(n); }
+  // Real GDI batches drawing per thread. A surface the guest also reads and
+  // writes with its own code — a DIB driver DC's bits (gdi16.hh) — must be
+  // finished before the guest runs on: a shim that touched one calls this,
+  // and the batch is flushed (GdiFlush) as the API call returns.
+  void flush_gdi_after_call() { gdi_flush_ = true; }
   // Scanout: the emulated VGA shows the screen once per 70 Hz refresh (the
   // same timing as the 0x3DA retrace bit). At the first API call after each
   // refresh boundary of virtual time the hook runs, so a lane can see what a
@@ -387,6 +392,7 @@ class Runtime16 {
   uint64_t rt_offset_ = 0;       // realtime clock: the modeled time init took
   uint64_t api_charged_ = 0;  // API calls charged (work_insns)
   uint64_t pix_charged_ = 0;  // pixels charged (work_insns)
+  bool gdi_flush_ = false;    // flush_gdi_after_call
   bool time_base_set_ = false;
   std::function<void()> scanout_;
   uint64_t next_scanout_us_ = 0;

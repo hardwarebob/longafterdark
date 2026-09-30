@@ -5,6 +5,7 @@
 #pragma once
 
 #include <functional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -51,6 +52,46 @@ struct RotationPlan {
 // present copy stands in for a missing one.
 RotationPlan effective_rotation(const Settings& s, const Catalog& c,
                                 const std::function<bool(const std::string&)>& available = nullptr);
+
+// Whether what Random plays for `s` depends on the host's --capabilities:
+// the saver rotates, and its rotation (effective_rotation, over `available`)
+// holds a module of another module ABI than After Dark's, which a host too
+// old for it can't run. The saver then waits for the host's answer before
+// its first host starts, and leaves out what that host can't run (saver.cc,
+// rotation_for_host); any other rotation never waits.
+bool rotation_needs_capabilities(const Settings& s, const Catalog& c,
+                                 const std::function<bool(const std::string&)>& available = nullptr);
+
+// What Random plays on a host that may not run every module (the saver, with
+// the host's answer: `runs` says whether it lists a module's lane and ABI).
+// `plan` is effective_rotation over the modules both `available` and `runs`:
+// a Randomize list of only modules the host can't run gives way to every
+// module it can, and a lead it can't run is left out. `left_out` counts the
+// modules the rotation would have held without `runs` (effective_rotation
+// over `available`: its ids and its lead) that `runs` rejects, which is what
+// the saver's log says it left out. An empty plan means the host can run
+// none of the modules available (then `left_out` is never 0).
+struct HostRotation {
+  RotationPlan plan;
+  size_t left_out = 0;
+};
+HostRotation rotation_for_host(const Settings& s, const Catalog& c,
+                               const std::function<bool(const std::string&)>& available,
+                               const std::function<bool(const std::string&)>& runs);
+
+// The own screens (geometry.h: own_screen; {0, 0} for a module that follows
+// the display) the first module a /s window plays may have, known before its
+// rotation is built (the saver takes the desktop seed at their screens, three
+// at most, geometry.h: module_screen, plan_seed_shots): the chosen module's when it
+// plays alone (every available module's when it is gone: the saver picks
+// one); a rotation's modules' (and its lead's); every available module's
+// when the host's answer may change what Random plays
+// (rotation_needs_capabilities: a list of only modules a host can't run
+// gives way to every one it can). Modules of one own screen share it: an
+// Intermission and a Star Trek module (640x480 both) are one screen.
+// Empty when nothing is available.
+std::set<SizeI> first_module_screens(const Settings& s, const Catalog& c,
+                                     const std::function<bool(const std::string&)>& available = nullptr);
 
 // ---- the module list, by release (COVERS.md §1.7) ------------------------------------
 

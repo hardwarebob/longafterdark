@@ -436,6 +436,14 @@ class LiveMidi : public MidiSink {
   void out(const std::vector<uint8_t>& m) {
     if (m.empty()) return;
     reap_long(false);
+    if (m[0] == 0xF7 && m.size() >= 2 && m.size() <= 4 && m[1] >= 0xF1 && m[1] != 0xF7) {
+      // An escape holding one system common or real-time message (the raw
+      // MIDI port's, AUDIO.md §6.4): a short message, with no header to wait on.
+      DWORD packed = 0;
+      for (size_t i = 1; i < m.size(); i++) packed |= DWORD(m[i]) << (8 * (i - 1));
+      midiOutShortMsg(hmo_, packed);
+      return;
+    }
     if (m[0] == 0xF0 || m[0] == 0xF7) {
       // SysEx (F0 …) goes as is; an escape's raw bytes follow its F7.
       auto l = std::make_unique<LongMsg>();

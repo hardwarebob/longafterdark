@@ -18,14 +18,30 @@
 //   * Files go through DosFiles (dos16.hh) over the Vfs overlays: reads from
 //     the upper or lower layer, writes copied up.
 //   * GetCurrentTask: DX is the first task of the task list, this one
-//     (NONSENSE walks the list for the Notepad it started).
+//     (NONSENSE walks the list for the Notepad it started). The synthetic
+//     desktop's Program Manager belongs to another task (kernel16_shell_task,
+//     GetWindowTask), which the list never shows.
+//   * Resources are counted as Win16 counted them: LoadResource of a loaded
+//     resource returns the same block and counts one more use, FreeResource
+//     counts one less and frees the block at zero, and the next LoadResource
+//     reads a fresh copy from the image (POSTERS appends to its locked
+//     caption every frame and relies on that). AccessResource opens the
+//     module file at the resource's data.
+//   * GetTempFileName with uUnique 0 creates the (empty) file, as Windows did;
+//     C:\WINDOWS\TEMP is an in-memory overlay.
+//   * GlobalWire/GlobalUnWire are GlobalLock/GlobalUnlock (the arena never
+//     moves a block, so there is nothing to move low).
+//   * GetModuleHandle finds the system DLLs Windows 95 always has loaded
+//     (KERNEL, USER, GDI, SYSTEM, KEYBOARD, DISPLAY, SOUND and MMSYSTEM, which
+//     SYSTEM.INI's [boot] drivers= line loads) before anything imports them.
 //
-// Known gaps, deliberately left (no module of the 202 in the five releases
-// needs more; API_SURFACE.md §2 KERNEL):
-//   * GetTempFileName creates nothing on disk (C:\WINDOWS\TEMP is an in-memory
-//     overlay; the file appears on first open for writing).
+// Known gaps, deliberately left (no module of the 202 in the five releases,
+// nor Star Wars Screen Entertainment's 14, needs more; API_SURFACE.md §2
+// KERNEL):
 //   * WinExec refuses (error 2), except "notepad <file>" in configure mode
 //     (dialogs16.cc).
+//   * SetHandleCount reports the task's file handle table size, but the DOS
+//     handle table (dos16.hh) holds 250 files whatever it says.
 #include <windows.h>
 
 #include <algorithm>
@@ -66,14 +82,20 @@ struct KernelState : RuntimeState16 {
   Runtime16& rt;
   uint16_t error_mode = 0;
   uint16_t task = 0;
+  uint16_t shell_task = 0;  // the synthetic desktop's (kernel16_shell_task)
+  // SetHandleCount: the size of the task's file handle table (the PDB's
+  // JFN length): Windows' default 20, grown up to 255.
+  uint16_t handle_count = 20;
   // Resources: HRSRC = index + 1 into this table. Each row keeps its image
   // alive: the module may be freed (and another loaded at the same address)
   // while the guest still holds an HRSRC or a loaded copy.
   struct Res {
     std::shared_ptr<loader::ne::Image> image;
-    std::string module;  // for traces
+    std::string module;      // for traces
+    std::string guest_path;  // the module's file (AccessResource opens it)
     const loader::ne::Resource* res;
-    uint16_t hglobal = 0;
+    uint16_t hglobal = 0;    // the loaded copy, 0 while not loaded
+    uint16_t usage = 0;      // LoadResource count (Win16's NE_NAMEINFO usage)
   };
   std::vector<Res> resources;
   // SwitchStackTo/Back.
@@ -85,6 +107,16 @@ struct KernelState : RuntimeState16 {
 };
 
 KernelState& ks(Runtime16& rt) { return rt.state<KernelState>(); }
+
+// A task database block: the handle only has to be a stable, valid selector.
+uint16_t make_tdb(Runtime16& rt, const char* tag) {
+  GlobalBlock* b = rt.global().alloc_block(0x200, false, 0, 0);
+  if (!b) return 0;
+  b->owner = 0xFFFF;
+  rt.ldt().set_tag(b->sel, tag);
+  rt.mem().write_u16l(b->base + 0xFA, 0x4454);  // 'TD' signature at TDB+0xFA
+  return b->sel;
+}
 
 std::string profile_path(Runtime16& rt, const std::string& name) {
   if (name.find_first_of("\\/:") == std::string::npos) return upper16(rt.options().windows_dir + "\\" + name);
@@ -239,7 +271,36 @@ void huge_copy(Runtime16& rt, uint32_t dst, uint32_t src, uint32_t n) {
 
 Module16* caller_module(Call16& c) { return c.rt.modules().containing(c.ret_cs()); }
 
+// The system DLLs Windows 95 always had loaded, whether or not anything had
+// imported them yet: KRNL386's boot modules, and MMSYSTEM (SYSTEM.INI [boot]
+// drivers=mmsystem.dll). Here a system DLL is a pseudo module made when an
+// import or LoadLibrary first names it, so GetModuleHandle makes these on
+// demand: INTRMLIB's and ANTSW's LibEntry ask for MMSYSTEM before the Star
+// Wars modules' later imports (SWSE) bring it in, and would otherwise pick
+// the PC speaker (INTRMLIB 4:0044..4:0075).
+bool resident_system_module(std::string_view name) {
+  size_t slash = name.find_last_of("\\/:");
+  std::string base = upper16(slash == std::string_view::npos ? name : name.substr(slash + 1));
+  base = base.substr(0, base.find('.'));
+  for (const char* m : {"KERNEL", "USER", "GDI", "SYSTEM", "KEYBOARD", "DISPLAY", "SOUND", "MMSYSTEM"}) {
+    if (base == m) return true;
+  }
+  return false;
+}
+
 }  // namespace
+
+uint16_t kernel16_current_task(Runtime16& rt) {
+  KernelState& s = ks(rt);
+  if (!s.task) s.task = make_tdb(rt, "task database");
+  return s.task;
+}
+
+uint16_t kernel16_shell_task(Runtime16& rt) {
+  KernelState& s = ks(rt);
+  if (!s.shell_task) s.shell_task = make_tdb(rt, "shell task database");
+  return s.shell_task;
+}
 
 // ---- shared helpers ------------------------------------------------------------------------------------
 
@@ -287,22 +348,17 @@ void register_kernel16(Runtime16& rt) {
   r.impl(K, "GetWinFlags", [](Call16& c) { c.ret32(kWinFlags); });
   r.impl(K, "InitTask", [](Call16& c) { c.rt.cpu().registers().w_ax(1); });
   r.impl(K, "GetCurrentTask", [](Call16& c) {
-    KernelState& s = ks(c.rt);
-    if (!s.task) {
-      // A task database block: the handle only has to be a stable, valid selector.
-      if (GlobalBlock* b = c.rt.global().alloc_block(0x200, false, 0, 0)) {
-        b->owner = 0xFFFF;
-        s.task = b->sel;
-        c.rt.ldt().set_tag(b->sel, "task database");
-        c.rt.mem().write_u16l(b->base + 0xFA, 0x4454);  // 'TD' signature at TDB+0xFA
-      }
-    }
+    uint16_t task = kernel16_current_task(c.rt);
     // DX: the first task of the task list (TDB+0 links the next, +1Ch is the
     // task's hInstance): NONSENSE walks it to find the Notepad it started.
-    // This task is the only one; nothing follows it.
-    c.ret32((uint32_t(s.task) << 16) | s.task);
+    // This task is the only one listed; nothing follows it.
+    c.ret32((uint32_t(task) << 16) | task);
   });
-  r.impl(K, "IsTask", [](Call16& c) { c.ret_bool(c.w() == ks(c.rt).task && ks(c.rt).task); });
+  r.impl(K, "IsTask", [](Call16& c) {
+    uint16_t h = c.w();
+    KernelState& s = ks(c.rt);
+    c.ret_bool(h && (h == s.task || h == s.shell_task));
+  });
   r.impl(K, "SetErrorMode", [](Call16& c) {
     uint16_t m = c.w();
     uint16_t old = ks(c.rt).error_mode;
@@ -369,6 +425,14 @@ void register_kernel16(Runtime16& rt) {
     c.w();
     c.ret(0);
   });
+  // GlobalWire: move the block low and lock it — nothing moves here, so a
+  // GlobalLock (SWSE PLAYMIDIFILE wires the song image, 1:642C);
+  // GlobalUnWire: GlobalUnlock, TRUE once the block is unlocked.
+  r.impl(K, "GlobalWire", [](Call16& c) { c.ret32(c.rt.global().lock(c.w())); });
+  r.impl(K, "GlobalUnWire", [](Call16& c) {
+    uint16_t h = c.w();
+    c.ret_bool(c.rt.global().find(h) && !c.rt.global().unlock(h));
+  });
   r.impl(K, "GlobalLRUOldest", [](Call16& c) { c.ret(c.w()); });
   r.impl(K, "hmemcpy", [](Call16& c) {
     uint32_t dst = c.ptr(), src = c.ptr(), n = c.l();
@@ -418,7 +482,17 @@ void register_kernel16(Runtime16& rt) {
   });
   r.impl(K, "GetModuleHandle", [](Call16& c) {
     uint32_t p = c.ptr();
-    Module16* m = (p >> 16) ? c.rt.modules().by_name(c.rt.read_str(p)) : c.rt.modules().by_handle(uint16_t(p));
+    Module16* m = nullptr;
+    if (p >> 16) {
+      std::string name = c.rt.read_str(p);
+      m = c.rt.modules().by_name(name);
+      if (!m && resident_system_module(name)) {
+        m = c.rt.modules().load(name);
+        trace("mod16", "GetModuleHandle(\"%s\"): a system module Windows 95 always has loaded", name.c_str());
+      }
+    } else {
+      m = c.rt.modules().by_handle(uint16_t(p));
+    }
     // HIWORD = the instance handle as well, as Windows returned it.
     c.ret32(m ? (uint32_t(m->hinstance) << 16) | m->hmodule : 0);
   });
@@ -469,33 +543,77 @@ void register_kernel16(Runtime16& rt) {
     for (size_t i = 0; i < s.resources.size(); i++) {
       if (s.resources[i].res == res && s.resources[i].image == m->image) return c.ret(uint16_t(i + 1));
     }
-    s.resources.push_back({m->image, m->name, res, 0});
+    s.resources.push_back({m->image, m->name, m->guest_path, res, 0, 0});
     c.ret(uint16_t(s.resources.size()));
   });
+  // LoadResource counts: a resource already loaded (its block still there,
+  // not discarded) comes back as the same block with one more use; else a
+  // fresh copy is read from the image (Win16's NE_NAMEINFO usage count).
   r.impl(K, "LoadResource", [](Call16& c) {
     c.w();
     uint16_t hr = c.w();
     KernelState& s = ks(c.rt);
     if (!hr || hr > s.resources.size()) return c.ret(0);
     auto& e = s.resources[hr - 1];
-    // Loaded once and kept (FreeResource is a no-op), unless the guest
-    // GlobalFree'd the copy itself.
-    if (!e.hglobal || !c.rt.global().find(e.hglobal)) {
-      std::string_view data = e.image->resource_data(*e.res);
-      uint16_t h = c.rt.global().alloc(GlobalHeap16::kMoveable, uint32_t(std::max<size_t>(data.size(), 1)));
-      GlobalBlock* b = c.rt.global().find(h);
-      if (!b) return c.ret(0);
-      c.rt.mem().memcpy(b->base, data.data(), data.size());
-      c.rt.ldt().set_tag(b->sel, "resource of " + e.module);
-      e.hglobal = h;
+    GlobalBlock* have = e.hglobal ? c.rt.global().find(e.hglobal) : nullptr;
+    if (have && have->base) {
+      e.usage++;
+      trace("res16", "LoadResource(%s %s): loaded, %u uses", e.module.c_str(), e.res->name.to_string().c_str(), e.usage);
+      return c.ret(e.hglobal);
     }
+    std::string_view data = e.image->resource_data(*e.res);
+    uint16_t h = c.rt.global().alloc(GlobalHeap16::kMoveable, uint32_t(std::max<size_t>(data.size(), 1)));
+    GlobalBlock* b = c.rt.global().find(h);
+    if (!b) return c.ret(0);
+    c.rt.mem().memcpy(b->base, data.data(), data.size());
+    c.rt.ldt().set_tag(b->sel, "resource of " + e.module);
+    e.hglobal = h;
+    e.usage = 1;
+    trace("res16", "LoadResource(%s %s): read from the image -> %04X", e.module.c_str(), e.res->name.to_string().c_str(), h);
     c.ret(e.hglobal);
   });
   r.impl(K, "LockResource", [](Call16& c) { c.ret32(c.rt.global().lock(c.w())); });
-  // Resources stay loaded for the run (FALSE = freed, in Win16's sense).
+  // FreeResource: one use less; at none the block is freed, so the next
+  // LoadResource reads the resource afresh (POSTERS appends a space to its
+  // locked caption every frame, SWSE 1:6A63..1:6AE6, and the edits must not
+  // pile up). FALSE is success. A block that is no loaded resource is
+  // GlobalFree'd, as KERNEL handed it on to USER's DestroyIcon32, which frees it.
   r.impl(K, "FreeResource", [](Call16& c) {
+    uint16_t h = c.w();
+    if (!h) return c.ret(0);
+    KernelState& s = ks(c.rt);
+    for (auto& e : s.resources) {
+      if (!e.hglobal || (e.hglobal | 1) != (h | 1)) continue;
+      if (e.usage) e.usage--;
+      if (!e.usage) {
+        c.rt.global().free(e.hglobal);
+        e.hglobal = 0;
+      }
+      trace("res16", "FreeResource(%s %s): %u uses left", e.module.c_str(), e.res->name.to_string().c_str(), e.usage);
+      return c.ret(0);
+    }
+    c.ret(c.rt.global().free(h) == 0 ? 0 : 1);
+  });
+  // AccessResource(hInstance, hResInfo): a DOS handle on the module's file,
+  // opened read-only and positioned at the resource's data — SWSE
+  // (_CREATEMEMRESOURCE, LOADRESTOMEM) and READJPG read pictures, palettes,
+  // shapes and WAVE sounds through it with _hread. HFILE_ERROR (-1) when
+  // there is no such resource or the file cannot be opened.
+  r.impl(K, "AccessResource", [](Call16& c) {
     c.w();
-    c.ret(0);
+    uint16_t hr = c.w();
+    KernelState& s = ks(c.rt);
+    if (!hr || hr > s.resources.size()) return c.ret(kHfileError);
+    auto& e = s.resources[hr - 1];
+    DosFiles& d = c.rt.state<DosFiles>();
+    int h = e.guest_path.empty() ? -1 : d.open(e.guest_path, 0, false);
+    if (h >= 0 && d.seek(uint16_t(h), int32_t(e.res->file_offset), 0) < 0) {
+      d.close(uint16_t(h));
+      h = -1;
+    }
+    trace("res16", "AccessResource(%s %s) -> %s at %u", e.module.c_str(), e.res->name.to_string().c_str(),
+          h < 0 ? "HFILE_ERROR" : std::to_string(h).c_str(), e.res->file_offset);
+    c.ret(h < 0 ? kHfileError : uint16_t(h));
   });
   r.impl(K, "SizeofResource", [](Call16& c) {
     c.w();
@@ -604,6 +722,12 @@ void register_kernel16(Runtime16& rt) {
     int32_t got = c.rt.state<DosFiles>().read(h, buf, n);
     c.ret32(got < 0 ? 0xFFFFFFFF : uint32_t(got));
   });
+  r.impl(K, "_hwrite", [](Call16& c) {
+    uint16_t h = c.w();
+    uint32_t buf = c.ptr(), n = c.l();
+    int32_t put = c.rt.state<DosFiles>().write(h, buf, n);
+    c.ret32(put < 0 ? 0xFFFFFFFF : uint32_t(put));
+  });
   r.impl(K, "_llseek", [](Call16& c) {
     uint16_t h = c.w();
     int32_t off = c.sl();
@@ -611,16 +735,72 @@ void register_kernel16(Runtime16& rt) {
     int64_t p = c.rt.state<DosFiles>().seek(h, off, whence);
     c.ret32(p < 0 ? 0xFFFFFFFF : uint32_t(p));
   });
+  // GetTempFileName(bDriveLetter, lpPrefix, uUnique, lpTempFileName):
+  // "<TEMP>\~<prefix, 3 characters><uUnique, 4 hex digits>.TMP". With
+  // TF_FORCEDRIVE (0x80) the file goes in the current directory of
+  // bDriveLetter's drive instead (0: the current drive), whatever TEMP says —
+  // the rule the Windows 3.1 SDK documents for the flag (Wine's
+  // GetTempFileName16 ends at the drive's root only because it hands "C:" to
+  // Win32's GetTempFileName, which adds a '\'). Here that is that drive's own
+  // current directory (win32::Vfs::drive_cwd: on the current drive the
+  // module folder, C:\SAVER or C:\AFTERDRK, writable; on another its root
+  // until a chdir there); a drive the guest's disk does not have falls back
+  // to TEMP, as Wine does for an invalid drive.
+  // With uUnique 0 Windows picks a number no file has yet and CREATES the
+  // empty file: STRESS (LibEntry, and GETFREEFILEHANDLES at every Star Wars
+  // module's start) opens it until the handles run out, and each module
+  // refuses to start below 10. Windows took the first number from the clock;
+  // here it is 1234h, counting up past taken names, so runs stay
+  // deterministic. A nonzero uUnique makes no file. Returns the number used,
+  // also when the file could not be made (logged), as Wine does.
   r.impl(K, "GetTempFileName", [](Call16& c) {
-    c.w();
+    uint16_t drive = c.w();
     std::string prefix = c.rt.read_str(c.ptr());
     uint16_t unique = c.w();
     uint32_t buf = c.ptr();
-    if (!unique) unique = 0x1234;
-    char name[32];
-    snprintf(name, sizeof(name), "~%.3s%04X.TMP", prefix.c_str(), unique);
-    c.rt.write_str(buf, c.rt.options().windows_dir + "\\TEMP\\" + name, 144);
+    std::string dir = c.rt.options().windows_dir + "\\TEMP";
+    if (drive & 0x80) {
+      win32::Vfs& vfs = c.rt.vfs();
+      char letter = char(toupper(drive & 0x7F));
+      if (letter < 'A' || letter > 'Z') letter = vfs.cwd()[0];
+      std::string forced = vfs.drive_cwd(letter);
+      if (vfs.is_dir(forced)) dir = forced.size() == 3 ? forced.substr(0, 2) : forced;  // a root: "C:" (name_for adds the '\')
+    }
+    auto name_for = [&](uint16_t n) {
+      char name[32];
+      snprintf(name, sizeof(name), "~%.3s%04X.TMP", prefix.c_str(), n);
+      return dir + "\\" + name;
+    };
+    std::string path;
+    if (unique) {
+      path = name_for(unique);
+    } else {
+      DosFiles& d = c.rt.state<DosFiles>();
+      uint16_t n = 0x1234;
+      for (uint32_t tries = 0; tries < 0xFFFF; tries++, n = uint16_t(n == 0xFFFF ? 1 : n + 1)) {
+        path = name_for(n);
+        if (!d.exists(path)) break;
+      }
+      unique = n;
+      int h = d.open(path, 2, true, /*exclusive=*/true);
+      if (h >= 0) {
+        d.close(uint16_t(h));
+        trace("file16", "GetTempFileName -> %s (created)", path.c_str());
+      } else {
+        log("win16: GetTempFileName could not create %s (DOS error %d)", path.c_str(), -h);
+      }
+    }
+    c.rt.write_str(buf, path, 144);
     c.ret(unique);
+  });
+  // SetHandleCount(n): the task's file handle table grows to n entries (at
+  // most 255; it never shrinks below Windows' default 20); the result is its
+  // size. STRESS.DLL's LibEntry asks for 255 (STRESS 5:017C).
+  r.impl(K, "SetHandleCount", [](Call16& c) {
+    uint16_t n = std::min<uint16_t>(c.w(), 255);
+    KernelState& s = ks(c.rt);
+    if (n > s.handle_count) s.handle_count = n;
+    c.ret(s.handle_count);
   });
 
   // ---- Catch/Throw ----

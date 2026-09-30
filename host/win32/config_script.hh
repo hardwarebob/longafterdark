@@ -19,6 +19,9 @@
 //   TEXT <id> <text…>          WM_SETTEXT on an edit control (+ EN_CHANGE)
 //   CHECK <id> <0|1|2>         BM_SETCHECK + BN_CLICKED
 //   SELECT <id> <index>        LB/CB current selection + LBN_/CBN_SELCHANGE
+//   PICK <id> <text…>          the same for the item whose text this is (any
+//                              case; LB_/CB_FINDSTRINGEXACT), wherever a sorted
+//                              list holds it: "PICK 204 [-h-]"
 //   MULTI <id> <i,j,…>         multi-select list box selection + LBN_SELCHANGE
 //   CLICK <id>                 BN_CLICKED (1 = IDOK, 2 = IDCANCEL)
 //   FILE <host path>           answer the next file dialog without showing it
@@ -57,11 +60,11 @@ namespace adw::win32 {
 class ConfigScript {
  public:
   struct Action {
-    enum class Kind { text, check, select, multi, click } kind = Kind::click;
+    enum class Kind { text, check, select, pick, multi, click } kind = Kind::click;
     int id = 0;
     int value = 0;           // CHECK state, SELECT index
     std::vector<int> items;  // MULTI
-    std::wstring text;       // TEXT
+    std::wstring text;       // TEXT, PICK
     int line = 0;            // script line (for logs)
   };
 
@@ -101,7 +104,8 @@ class ConfigScript {
   std::optional<std::wstring> file_dialog();
 
   // One action on a dialog, through its real controls. False when the
-  // control is missing or the action does not fit its class.
+  // control is missing or the action does not fit its class (PICK: or no
+  // item has that text).
   static bool apply(HWND dlg, const Action& a);
   // Logs the dialog's controls on stderr.
   static void dump_dialog(HWND dlg);
