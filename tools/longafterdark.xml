@@ -2,27 +2,47 @@
 
 <screensaver name="longafterdark" _label="Long After Dark">
 
-  <command arg="-root"/>
+  <command arg="--root"/>
 
-  <video href="https://github.com/hardwarebob/longafterdark"/>
+  <!-- An option rather than a bare name: XScreenSaver keeps what a field
+       gives when it saves the settings, and drops a word it doesn't know.
+       Empty (the default) puts nothing on the command line. -->
+  <string id="module" arg="--module %"
+          _label="Module (an id from longafterdark --list; empty: all in turn)"/>
 
-  <number id="cycle" type="spinbutton" low="10" high="3600"
-          _label="Rotate interval (seconds)" default="300"
-          arg="--cycle %"/>
+  <!-- XScreenSaver's spin button steps by (high - low) / 100 and snaps to
+       those steps: 30 s here, so the player's default, 300, stays 300. -->
+  <number id="cycle" type="spinbutton" arg="--cycle %"
+          _label="Change module every (seconds; 0: never)"
+          low="0" high="3000" default="300"/>
 
-  <boolean id="random" _label="Random module"
-           arg-set="-r"/>
+  <select id="lines">
+    <option id="480" _label="Resolution: Classic (480 lines)"/>
+    <option id="720" _label="Resolution: Sharp (720 lines)" arg-set="--lines 720"/>
+  </select>
 
-  <boolean id="sound" _label="Sound effects"
-           arg-unset="--no-sound"/>
+  <boolean id="sound" _label="Sound" arg-unset="--no-sound"/>
+
+  <number id="volume" type="slider" arg="--volume %"
+          _label="Volume" _low-label="Quiet" _high-label="Loud"
+          low="0" high="100" default="50"/>
 
   <_description>
-Long After Dark brings back the original Berkeley Systems After Dark
-screen savers from the 1990s (Flying Toasters, Boris, Simpsons, and more),
-running original modules under x86 emulation on modern Linux.
+The original After Dark screen savers of the 1990s (Flying Toasters, Fish,
+The Simpsons, Star Trek and more) and LucasArts' Star Wars Screen
+Entertainment: their own modules, run unchanged by Long After Dark's x86
+emulator under Wine. Import your releases first (longafterdark --import).
+It shows every imported module in turn, or only the one whose id you give
+under Module (longafterdark --list shows the ids).
 
-Caps Lock starts interactive games (e.g. Rodger Dodger, Trivia).
+The Resolution applies to After Dark modules; Star Wars and Star Trek
+modules always draw at 640x480, keeping their shape. Only the primary
+monitor plays sound, and the preview is always silent. XScreenSaver ends
+it on any key or mouse move, so the modules' Caps Lock games are played in
+longafterdark's own full-screen mode.
 
-https://github.com/hardwarebob/longafterdark
+https://github.com/starrlord/longafterdark
+
+Written by the Long After Dark contributors; 2026.
   </_description>
 </screensaver>
